@@ -26,6 +26,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 from comfyui_scheduled_queue import scheduler, workflow_format  # noqa: E402
 from comfyui_scheduled_queue.workflow_format import (  # noqa: E402
     convert_ui_to_api,
+    get_node_title,
     is_api_format,
 )
 
@@ -474,6 +475,135 @@ class TestRandomizeEndToEnd(unittest.TestCase):
             self.assertIsInstance(s, int)
             self.assertGreaterEqual(s, 0)
             self.assertLessEqual(s, 0xFFFFFFFFFFFFFFFF)
+
+
+# ---------------------------------------------------------------------------
+# Coverage for the workflow nickname pipeline.
+#
+# Each ComfyUI editor node carries a ``title`` field (e.g. "positive KSampler",
+# "Detailer", "VAE Decode") which the UI uses as the visible label on the
+# canvas. When we convert UI-format → API-format we now preserve that label on
+# the resulting node entry as ``_meta.title``. The tests below pin down both
+# directions of the pipeline and the ``get_node_title`` helper.
+# ---------------------------------------------------------------------------
+
+class TestMetaPreservation(unittest.TestCase):
+    """``_meta.title`` is carried through the converter, not invented."""
+
+    def test_api_format_passthrough_preserves_meta_if_present(self):
+        """An API-format dict that *already* carries ``_meta`` must come out
+        byte-identical -- the converter must not strip or rewrite nicknames
+        upstream callers added."""
+        api_in = {
+            "28": {
+                "class_type": "KSampler",
+                "inputs": {"seed": 1, "steps": 20},
+                "_meta": {"title": "positive KSampler"},
+            }
+        }
+        out = convert_ui_to_api(api_in)
+        self.assertEqual(out, api_in)
+        # And is detected as API format (key check) despite carrying _meta.
+        self.assertTrue(is_api_format(out))
+
+    def test_ui_format_conversion_populates_meta_title(self):
+        """UI nodes with ``title`` must round-trip into ``_meta.title`` on the
+        API-format output. Nodes *without* a title must not gain a phantom
+        ``_meta`` block."""
+        ui = {
+            "nodes": [
+                {
+                    "id": 4,
+                    "type": "KSampler",
+                    "title": "positive KSampler",
+                    "widgets_values": [1, "fixed", 20, 7, "euler", "karras", 1],
+                    "widgets_values_named": {
+                        "seed": 1, "control_after_generate": "fixed",
+                        "steps": 20, "cfg": 7, "sampler_name": "euler",
+                        "scheduler": "karras", "denoise": 1,
+                    },
+                    "inputs": [
+                        {"name": "model", "type": "MODEL", "link": None},
+                        {"name": "positive", "type": "CONDITIONING", "link": None},
+                        {"name": "negative", "type": "CONDITIONING", "link": None},
+                        {"name": "latent_image", "type": "LATENT", "link": None},
+                    ],
+                },
+                {
+                    # title-less node -- e.g. a freshly created untitled node.
+                    "id": 5,
+                    "type": "VAEDecode",
+                    "widgets_values": [],
+                    "inputs": [
+                        {"name": "samples", "type": "LATENT", "link": None},
+                        {"name": "vae", "type": "VAE", "link": None},
+                    ],
+                },
+            ],
+            "links": [],
+        }
+        out = convert_ui_to_api(ui)
+        # Titled node carries _meta.title verbatim.
+        self.assertEqual(out["4"].get("_meta"), {"title": "positive KSampler"})
+        # Untitled node must not be polluted with an empty _meta dict.
+        self.assertNotIn("_meta", out["5"])
+
+    def test_api_format_without_meta_not_polluted_with_empty_meta(self):
+        """Converter must not invent ``_meta`` on API-format input that lacks
+        it -- that would inject invalid keys into payloads upstream callers
+        never asked for, breaking serializers / round-trip equivalence."""
+        api_in = {
+            "28": {
+                "class_type": "KSampler",
+                "inputs": {"seed": 1, "steps": 20},
+                # no _meta
+            }
+        }
+        out = convert_ui_to_api(api_in)
+        self.assertEqual(out, api_in)
+        self.assertNotIn("_meta", out["28"])
+
+
+class TestGetNodeTitle(unittest.TestCase):
+    """``get_node_title`` resolves ``_meta.title`` then falls back to
+    ``class_type``, returning ``None`` for missing nodes."""
+
+    def test_get_node_title_returns_meta_title_first(self):
+        """When both ``_meta.title`` and ``class_type`` are present, the title
+        wins -- that's the user-visible label and is what the sidebar will
+        display."""
+        api = {
+            "28": {
+                "class_type": "KSampler",
+                "inputs": {},
+                "_meta": {"title": "Detailer (cfg=7)"},
+            }
+        }
+        self.assertEqual(get_node_title(api, "28"), "Detailer (cfg=7)")
+        # Numeric id is stringified internally so callers can pass either.
+        self.assertEqual(get_node_title(api, 28), "Detailer (cfg=7)")
+
+    def test_get_node_title_falls_back_to_class_type(self):
+        """Nodes produced before the nickname pipeline existed -- or by tools
+        that don't emit ``_meta`` -- still need a usable label. Fall back to
+        ``class_type`` rather than returning ``None``."""
+        api = {
+            "28": {"class_type": "KSampler", "inputs": {}},
+        }
+        self.assertEqual(get_node_title(api, "28"), "KSampler")
+
+    def test_get_node_title_returns_none_for_missing_node(self):
+        """Unknown node_id → ``None``. Also covers non-dict inputs to the
+        helper: a string id passed where a dict was expected should not
+        explode."""
+        api = {"28": {"class_type": "KSampler", "inputs": {}}}
+        self.assertIsNone(get_node_title(api, "999"))
+        self.assertIsNone(get_node_title(api, "abc"))  # non-numeric id
+        # Robustness -- degenerate inputs do not raise.
+        self.assertIsNone(get_node_title(None, "28"))        # type: ignore[arg-type]
+        self.assertIsNone(get_node_title(api, None))         # type: ignore[arg-type]
+        # Node entry present but completely empty dict -- no class_type to fall back on.
+        self.assertIsNone(get_node_title({"x": {}}, "x"))
 
 
 if __name__ == "__main__":

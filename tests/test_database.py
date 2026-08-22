@@ -1,6 +1,7 @@
 """ScheduledQueueDB tests covering the state machine, ordering and cancellation
 rules. Pure stdlib + unittest; no third-party deps.
 """
+import json
 import os
 import sys
 import tempfile
@@ -210,6 +211,121 @@ class TestUpdateGuards(unittest.TestCase):
     def test_update_unknown_field_rejected(self):
         jid = self.db.add_job(payload={}, scheduled_at=10.0)
         self.assertRaises(ValueError, self.db.update_job, jid, garbage=1)
+
+
+# ---------------------------------------------------------------------------
+# Stage 3 (v0.3.8 backend flush): pagination/count/clear/repeat helpers.
+# ---------------------------------------------------------------------------
+
+class TestStage3Pagination(unittest.TestCase):
+    def setUp(self):
+        self.db, self.path = _fresh_db()
+
+    def tearDown(self):
+        self.db.close()
+        try:
+            os.unlink(self.path)
+        except OSError:
+            pass
+
+    def test_count_jobs_multiple_statuses(self):
+        for i in range(4):
+            self.db.add_job(payload={"i": i}, scheduled_at=10.0 + i)
+        c1 = self.db.add_job(payload={}, scheduled_at=20.0)
+        self.db.update_job(c1, status="cancelled")
+        # a done row lives in job_history, not scheduled_jobs
+        c2 = self.db.add_job(payload={}, scheduled_at=30.0)
+        self.db.update_job(c2, status="running", prompt_id="p")
+        self.db.mark_done(c2, prompt_id="p", outputs={"x": 1})
+
+        # 4 scheduled + 1 cancelled = 5 across the live table
+        self.assertEqual(self.db.count_jobs(["scheduled"]), 4)
+        self.assertEqual(self.db.count_jobs(["cancelled"]), 1)
+        # 1 done in history
+        self.assertEqual(self.db.count_jobs(["done"]), 1)
+        # cross-store sum
+        self.assertEqual(
+            self.db.count_jobs(["scheduled", "cancelled", "done"]), 6,
+        )
+        # empty filter -> total of both tables
+        self.assertEqual(self.db.count_jobs([]), 6)
+        self.assertEqual(self.db.count_jobs(None), 6)
+
+    def test_list_jobs_paginated_consistent_with_count(self):
+        for i in range(7):
+            self.db.add_job(payload={"i": i}, scheduled_at=10.0 + i)
+        c1 = self.db.add_job(payload={}, scheduled_at=99.0)
+        self.db.update_job(c1, status="cancelled")
+
+        total = self.db.count_jobs(["scheduled"])
+        self.assertEqual(total, 7)
+
+        page1 = self.db.list_jobs_paginated(["scheduled"], limit=3, offset=0)
+        page2 = self.db.list_jobs_paginated(["scheduled"], limit=3, offset=3)
+        page3 = self.db.list_jobs_paginated(["scheduled"], limit=3, offset=6)
+        self.assertEqual(len(page1), 3)
+        self.assertEqual(len(page2), 3)
+        self.assertEqual(len(page3), 1)
+        # no overlap across pages
+        ids = {r["id"] for r in page1} | {r["id"] for r in page2} | {r["id"] for r in page3}
+        self.assertEqual(len(ids), 7)
+        # offset past the end -> empty
+        self.assertEqual(
+            self.db.list_jobs_paginated(["scheduled"], limit=10, offset=999),
+            [],
+        )
+
+    def test_clear_by_status_removes_matching(self):
+        keep = self.db.add_job(payload={"keep": 1}, scheduled_at=1.0)
+        for i in range(3):
+            jid = self.db.add_job(payload={"c": i}, scheduled_at=2.0 + i)
+            self.db.update_job(jid, status="cancelled")
+        # one done job in history
+        live = self.db.add_job(payload={"will-done": 1}, scheduled_at=99.0)
+        self.db.update_job(live, status="running", prompt_id="p")
+        self.db.mark_done(live, prompt_id="p", outputs={"x": 1})
+
+        removed = self.db.clear_by_status(["cancelled", "done"])
+        self.assertEqual(removed, 4)
+        # only the kept row remains
+        rows = self.db.list_jobs()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["id"], keep)
+        # history wiped
+        self.assertEqual(self.db.list_history(), [])
+
+    def test_repeat_job_copies_payload_and_priority_zero(self):
+        # name "priority_zero" in the user's spec referred to "the new
+        # job's priority is reset to a default value (100)" — pin that.
+        src = self.db.add_job(
+            payload={"workflow": {"nodes": [1, 2, 3]}, "label": "src"},
+            scheduled_at=10.0,
+            priority=999,  # wildly different to prove reset
+            note="original",
+        )
+        self.db.update_job(src, status="running", prompt_id="p")
+        self.db.mark_done(src, prompt_id="p", outputs={"i": ["a.png"]})
+
+        new_id = self.db.repeat_job(src)
+        self.assertIsNotNone(new_id)
+        self.assertNotEqual(new_id, src)
+
+        new_row = self.db.get_job(new_id)
+        self.assertIsNotNone(new_row)
+        assert new_row is not None  # pyright narrowing
+        self.assertEqual(new_row["status"], "scheduled")
+        # payload preserved verbatim
+        self.assertEqual(
+            json.loads(new_row["payload"]),
+            {"workflow": {"nodes": [1, 2, 3]}, "label": "src"},
+        )
+        # priority reset to default 100 (NOT the source's 999)
+        self.assertEqual(new_row["priority"], 100)
+        # note recorded as a derivative of the source id
+        self.assertTrue(new_row["note"].startswith("repeat of "))
+
+        # unknown source -> None
+        self.assertIsNone(self.db.repeat_job("not-a-real-id"))
 
 
 if __name__ == "__main__":

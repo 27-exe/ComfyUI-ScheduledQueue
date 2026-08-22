@@ -4,6 +4,107 @@ All notable changes to **ComfyUI-ScheduledQueue** are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.3.8] - 2026-08-23
+
+### Added (new REST endpoints + UI controls)
+
+#### Backend
+- `POST /api/schedule/add-batch` — queue up to 50 jobs in one request;
+  per-item failures are isolated and the successful ones are returned in
+  `added[]`.
+- `GET /api/schedule/job/{job_id}` — single-job detail that returns
+  decoded `payload` and `outputs` (no JSON string leakage).
+- `DELETE /api/schedule/clear?statuses=...` — bulk delete from
+  `scheduled_jobs` and `job_history` by status list. Default =
+  `done,failed,cancelled`.
+- `POST /api/schedule/repeat/{job_id}` — clone the payload of a finished
+  job back into `scheduled_jobs` with a new uuid and immediate dispatch.
+- `GET /api/schedule/export/{job_id}` — download the job's payload as
+  a JSON attachment (`Content-Disposition: attachment; filename="..."`).
+- `GET /api/schedule/list` extended with `?status=a,b,c`, `?limit=N`,
+  `?offset=N` and now returns `{jobs, total, limit, offset, has_more}`.
+
+#### Database
+- `list_jobs_paginated(statuses, limit, offset)` — paginated query.
+- `count_jobs(statuses)` — total count for pagination.
+- `get_job_with_outputs(job_id)` — merged live + history view, both
+  `payload` and `outputs` decoded to Python objects.
+- `clear_by_status(statuses)` — bulk delete from both tables.
+- `repeat_job(job_id)` — clone payload from history into a new
+  `scheduled_jobs` row.
+
+#### Scheduler
+- `claim_next_due_job` ORDER BY now treats priority as the dominant
+  tie-breaker after `queue_order`, ahead of `scheduled_at` —
+  previously a high-priority task that was scheduled slightly later
+  could be skipped over by a lower-priority earlier task.
+
+#### Frontend (sidebar panel)
+- Status filter tabs (`All` / `Scheduled` / `Running` / `Done` /
+  `Failed` / `Cancelled`) with live counts.
+- A `Clear...` button that expands a status-checklist panel with
+  live counts and a `Clear selected` action.
+- Prev / Next pager, driven by the new `total / limit / has_more`.
+- Per-job `Repeat` (`↻`) and `Export` (`⬇`) buttons; Repeat hits the
+  POST endpoint, Export triggers a browser download.
+- Job title now resolves to the workflow nickname (`_meta.title` from
+  the KSampler / SaveImage / … node) with a short id suffix.
+- 60x60 thumbnails for done jobs; click opens a fullscreen modal that
+  closes on click or Esc.
+
+#### Frontend (Schedule dialog)
+- Count input (1–50) routes to either `/add` (single) or `/add-batch`
+  (multiple) depending on the entered value.
+- Three-section time editor (left = subtract presets, centre =
+  editable `YYYY-MM-DD HH:MM:SS / ISO / slash` field, right = add
+  presets) keeps the unix-seconds hidden input as the submission
+  source of truth.
+
+#### Helpers
+- `workflow_format.get_node_title(api_dict, node_id)` for the sidebar
+  nickname lookup.
+
+### Tests
+- 20 new unit tests covering all of the above. Full suite:
+  **104 / 104 pass** (was 84).
+
+### Known limitations (unchanged from 0.3.7)
+- `cancel` does not interrupt an in-flight ComfyUI prompt.
+- `reconcile` runs every 5 s; sub-second completions may briefly appear
+  as `running` before flipping to `done`.
+- Browser cache `execution_cached` reuse is per-ComfyUI; the scheduler
+  still cannot force a cache miss on its own — must rely on seed /
+  control_after_generate differentiation.
+- ComfyUI `/history/{prompt_id}` is in-memory; restarts wipe history.
+- `extra_pnginfo[0]` warning persists for some workflows that read
+  extra_pnginfo in a custom shape — out of scope for this plugin.
+
+## [0.3.7] - 2026-08-22
+
+### Fixed (Schedule did not run native widget queue callbacks)
+- Schedule submission now follows ComfyUI's native queue lifecycle:
+  `widget.beforeQueued()` -> `graphToPrompt()` -> POST `/api/schedule/add`
+  -> `widget.afterQueued()`.
+- The fix preserves each widget's real
+  `control_after_generate` mode (`fixed`, `randomize`, `increment`,
+  `decrement`) instead of forcing every seed node to `randomize`.
+- Schedule now forwards `graph.workflow` through
+  `extra_data.extra_pnginfo.workflow` for nodes that consume workflow
+  metadata.
+- Widget callback failures are isolated and logged with `console.warn`.
+
+### Verified
+- Two consecutive scheduled submissions used different seeds:
+  `1006994118007054` and `760400493873003`.
+- Both submissions performed full sampling (`75.41s` and `48.22s`),
+  instead of the previous `0.03s`/`0.05s` cache-hit path.
+
+### Known issue
+- ComfyUI still logs `extra_pnginfo[0] is not a dict or missing
+  'workflow' key` for this workflow. The scheduler request now includes
+  `extra_data.extra_pnginfo.workflow`, but the affected node or its
+  expected metadata shape needs a separate compatibility investigation.
+
 ## [0.3.6] - 2026-08-22
 
 ### Fixed (plugin silently failed to load in ComfyUI's importlib context)

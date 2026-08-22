@@ -132,6 +132,36 @@ def convert_ui_to_api(wf: dict) -> dict:
     return api
 
 
+def get_node_title(api_dict: dict, node_id: Any) -> str | None:
+    """Return a human-readable label for *node_id* in *api_dict*.
+
+    Lookup order:
+    1. ``api_dict[node_id]._meta.title`` -- preserved by :func:`convert_ui_to_api`
+       from the UI-format node's ``title`` field. This is what the user typed
+       in the editor ("positive KSampler", "Detailer", etc.) and is the
+       preferred display string in the sidebar.
+    2. ``api_dict[node_id].class_type`` -- fallback when no ``_meta.title``
+       was emitted by the converter (e.g. the UI node had no title, or the
+       caller is inspecting an externally-built API dict).
+    3. ``None`` when the node_id is absent or the entry is malformed.
+
+    Robust against missing nodes, non-dict values, and dicts without
+    ``class_type`` -- always returns ``str | None`` regardless of input shape.
+    """
+    entry = api_dict.get(str(node_id)) if isinstance(api_dict, dict) else None
+    if not isinstance(entry, dict):
+        return None
+    meta = entry.get("_meta")
+    if isinstance(meta, dict):
+        title = meta.get("title")
+        if isinstance(title, str) and title:
+            return title
+    class_type = entry.get("class_type")
+    if isinstance(class_type, str) and class_type:
+        return class_type
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Internals
 # ---------------------------------------------------------------------------

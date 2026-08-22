@@ -1,15 +1,21 @@
 """
-ComfyUI-ScheduledQueue - HTTP API endpoints (Stage 1 + Stage 2)
+ComfyUI-ScheduledQueue - HTTP API endpoints (Stage 1 + Stage 2 + Stage 3)
 
-Implements spec section 5 (Stage 1) and section 3 (Stage 2) from:
-    docs/scheduled-queue/01-implementation-spec-stage-1-agent-facing.md
-    docs/scheduled-queue/02-implementation-spec-stage-2-agent-facing.md
+Implements spec section 5 (Stage 1), section 3 (Stage 2), and the v0.3.8
+backend feature flush (Stage 3 — batch add / paginated list / clear /
+repeat / export / per-job detail).
 
 Endpoints (all under /api/schedule/*):
-    GET    /api/schedule/list               - list jobs (filter by status, no payload)
+    GET    /api/schedule/list               - list jobs (filter + paginate)
     POST   /api/schedule/add                - create a new scheduled job
+    POST   /api/schedule/add-batch          - bulk create (Stage 3)
     POST   /api/schedule/cancel/{id}        - soft-delete (status='cancelled')
     POST   /api/schedule/update/{id}        - patch whitelisted fields only
+    POST   /api/schedule/reorder/{id}       - move job up/down in queue
+    GET    /api/schedule/job/{id}           - one job incl. outputs (Stage 3)
+    GET    /api/schedule/export/{id}        - payload as JSON download (Stage 3)
+    DELETE /api/schedule/clear              - wipe rows by status (Stage 3)
+    POST   /api/schedule/repeat/{id}        - clone as new job (Stage 3)
     GET    /api/schedule/status             - global scheduler status snapshot
     POST   /api/schedule/pause-all          - Stage 2: pause scheduler
     POST   /api/schedule/resume-all         - Stage 2: resume + reset interrupted jobs
@@ -48,9 +54,9 @@ _log = logging.getLogger("scheduled_queue.routes")
 # intentionally excluded (spec section 5.2 update endpoint constraints).
 _UPDATE_ALLOWED_FIELDS = frozenset({"scheduled_at", "priority", "note", "auto_retry"})
 
-# Per-endpoint limit cap for /list.
-_LIST_MAX_LIMIT = 10000
-_LIST_DEFAULT_LIMIT = 200
+# Per-endpoint limit cap for /list. Spec (Stage 3): default 50, max 200.
+_LIST_MAX_LIMIT = 200
+_LIST_DEFAULT_LIMIT = 50
 
 # Status counts returned by /status. Keys must match spec section 5.2.
 _STATUS_COUNT_KEYS = (
@@ -114,6 +120,7 @@ class _StubResponse:
         else:
             self.body = json.dumps(data, ensure_ascii=False).encode()
         self._data = data
+        self.headers: dict[str, str] = {}
 
     def __repr__(self) -> str:
         return f"_StubResponse(status={self.status}, body={self.body[:80]!r})"
@@ -150,10 +157,21 @@ def _strip_payload(row: dict) -> dict:
 # ---------------------------------------------------------------------------
 
 async def list_handler(request) -> "web.Response":  # type: ignore[name-defined]
-    """GET /api/schedule/list?status=scheduled,interrupted&limit=50
+    """GET /api/schedule/list
 
-    Returns: {"jobs": [...stripped rows...], "total": int, "filter": [...]}.
-    payload is never returned (spec section 5.2).
+    Query params (all optional):
+      status  - comma-separated status filter
+                (scheduled|dispatched|running|interrupted|cancelled|done|failed)
+      limit   - 1..200, default 50
+      offset  - >=0, default 0
+    Response:
+      {"jobs": [...stripped rows...],
+       "total": <total matching the status filter>,
+       "limit": <echoed back>,
+       "offset": <echoed back>,
+       "has_more": <total > offset+len(jobs)>}
+    payload is never returned here — fetch /api/schedule/job/{id} for full
+    details (Stage 3).
     """
     db = request.app.get("sq_db")  # set in setup_routes()
     if db is None:
@@ -163,11 +181,16 @@ async def list_handler(request) -> "web.Response":  # type: ignore[name-defined]
         status_filter = _parse_status_filter(request.query.get("status"))
         limit = _parse_int(request.query.get("limit"), _LIST_DEFAULT_LIMIT, field="limit")
         limit = max(1, min(limit, _LIST_MAX_LIMIT))
+        offset = _parse_int(request.query.get("offset"), 0, field="offset")
+        offset = max(0, offset)
     except ValueError as e:
         return _bad_request(str(e))
 
     try:
-        rows = db.list_jobs(status_filter=status_filter, limit=limit)
+        total = db.count_jobs(status_filter)
+        rows = db.list_jobs_paginated(
+            statuses=status_filter, limit=limit, offset=offset,
+        )
     except Exception:
         _log.exception("list_jobs failed")
         return _server_error("database error")
@@ -175,8 +198,10 @@ async def list_handler(request) -> "web.Response":  # type: ignore[name-defined]
     jobs = [_strip_payload(r) for r in rows]
     return _json_response({
         "jobs": jobs,
-        "total": len(jobs),
-        "filter": status_filter if status_filter is not None else [],
+        "total": int(total),
+        "limit": limit,
+        "offset": offset,
+        "has_more": (offset + len(jobs)) < int(total),
     })
 
 
@@ -630,6 +655,275 @@ async def orphan_status_handler(request) -> "web.Response":  # type: ignore[name
 
 
 # ---------------------------------------------------------------------------
+# Stage 3 handlers (spec section 4 / this v0.3.8 batch)
+# ---------------------------------------------------------------------------
+
+# Cap for /add-batch. Bigger batches would slow the request thread and
+# risk OOM on the JSON parse; 50 keeps a single bulk insert snappy.
+_ADD_BATCH_MAX_ITEMS = 50
+
+
+def _validate_add_item(item: Any) -> tuple[dict, str | None]:
+    """Validate one item from /add-batch.
+
+    Returns ``(args, None)`` on success where ``args`` is the kwargs dict
+    ready to hand to ``db.add_job``; or ``({}, reason)`` when the item
+    should be skipped (per spec: a single bad item must not fail the
+    whole batch).
+    """
+    if not isinstance(item, dict):
+        return {}, "item must be an object"
+
+    payload = item.get("payload")
+    if payload is None:
+        return {}, "payload is required"
+    if not isinstance(payload, dict):
+        return {}, "payload must be a dict"
+
+    scheduled_at = item.get("scheduled_at")
+    if scheduled_at is None:
+        return {}, "scheduled_at is required"
+    if isinstance(scheduled_at, bool) or not isinstance(scheduled_at, (int, float)):
+        return {}, "scheduled_at must be a number"
+    if float(scheduled_at) <= 0:
+        return {}, "scheduled_at must be a positive float"
+
+    args: dict[str, Any] = {
+        "payload": payload,
+        "scheduled_at": float(scheduled_at),
+    }
+
+    if "priority" in item:
+        priority = item["priority"]
+        if isinstance(priority, bool) or not isinstance(priority, int):
+            return {}, "priority must be an integer"
+        args["priority"] = int(priority)
+
+    if "note" in item:
+        note = item["note"]
+        if note is not None and not isinstance(note, str):
+            return {}, "note must be a string"
+        args["note"] = note
+
+    if "auto_retry" in item:
+        ar = item["auto_retry"]
+        if isinstance(ar, bool) or not isinstance(ar, int):
+            return {}, "auto_retry must be an integer"
+        args["auto_retry"] = int(ar)
+
+    if "client_id" in item:
+        cid = item["client_id"]
+        if cid is not None and not isinstance(cid, str):
+            return {}, "client_id must be a string"
+        args["client_id"] = cid
+
+    return args, None
+
+
+async def add_batch_handler(request) -> "web.Response":  # type: ignore[name-defined]
+    """POST /api/schedule/add-batch
+
+    Body: ``{"items": [<single-add body>, ...]}`` (max 50 items per request).
+
+    Each item is validated independently; per-item validation failures are
+    silently skipped (they don't fail the whole batch). Database errors on
+    a specific item are logged and that item is dropped from the response —
+    the rest of the batch still lands.
+
+    Response: 201 ``{"added": [{"id": ..., "scheduled_at": ...}, ...],
+    "count": N}``. ``count`` reflects how many items actually got added;
+    compare with the input length to detect partial success.
+    """
+    db = request.app.get("sq_db")
+    if db is None:
+        return _server_error("db not initialized")
+
+    try:
+        body = await request.json()
+    except json.JSONDecodeError:
+        return _bad_request("body must be valid JSON")
+    except Exception:
+        return _bad_request("body must be valid JSON")
+
+    if not isinstance(body, dict):
+        return _bad_request("body must be a JSON object")
+
+    items = body.get("items")
+    if not isinstance(items, list):
+        return _bad_request("items must be a list")
+    if len(items) == 0:
+        return _bad_request("items must not be empty")
+    if len(items) > _ADD_BATCH_MAX_ITEMS:
+        return _bad_request(
+            f"too many items (max {_ADD_BATCH_MAX_ITEMS}, got {len(items)})"
+        )
+
+    added: list[dict[str, Any]] = []
+    for idx, item in enumerate(items):
+        args, err = _validate_add_item(item)
+        if err is not None:
+            _log.warning("add_batch: skipping item %d: %s", idx, err)
+            continue
+        try:
+            job_id = db.add_job(**args)
+        except Exception:
+            _log.exception("add_batch: add_job failed for item %d", idx)
+            continue
+        added.append({"id": job_id, "scheduled_at": args["scheduled_at"]})
+
+    return _json_response({"added": added, "count": len(added)}, status=201)
+
+
+async def job_detail_handler(request) -> "web.Response":  # type: ignore[name-defined]
+    """GET /api/schedule/job/{id}
+
+    Returns the full record for one job, including ``payload`` and
+    ``outputs`` (the latter from job_history when the job is finished).
+
+    Response: 200 with the job dict, or 404 if no such id.
+    """
+    db = request.app.get("sq_db")
+    if db is None:
+        return _server_error("db not initialized")
+
+    job_id = request.match_info.get("job_id", "").strip()
+    if not job_id:
+        return _bad_request("job_id is required")
+
+    try:
+        row = db.get_job_with_outputs(job_id)
+    except Exception:
+        _log.exception("get_job_with_outputs failed for %s", job_id)
+        return _server_error("database error")
+
+    if row is None:
+        return _not_found("job not found")
+    return _json_response(row)
+
+
+async def clear_handler(request) -> "web.Response":  # type: ignore[name-defined]
+    """DELETE /api/schedule/clear?statuses=done,failed,cancelled
+
+    Wipes every row whose status is in the comma-separated list (default
+    ``done,failed,cancelled``). Hits BOTH scheduled_jobs (cancelled,
+    interrupted, ...) and job_history (done, failed).
+
+    Response: 200 ``{"cleared": <count>}``.
+    """
+    db = request.app.get("sq_db")
+    if db is None:
+        return _server_error("db not initialized")
+
+    raw = request.query.get("statuses")
+    if raw is None or raw.strip() == "":
+        statuses = ["done", "failed", "cancelled"]
+    else:
+        statuses = [s.strip() for s in raw.split(",") if s.strip()]
+        if not statuses:
+            statuses = ["done", "failed", "cancelled"]
+
+    # Validation: refuse unknown statuses with 400 rather than silently
+    # treating them as no-ops — saves the operator from typos.
+    valid = set(_STATUS_IN_SCHEDULED) | set(_STATUS_IN_HISTORY)
+    unknown = [s for s in statuses if s not in valid]
+    if unknown:
+        return _bad_request(f"unknown statuses: {unknown}")
+
+    try:
+        cleared = db.clear_by_status(statuses)
+    except Exception:
+        _log.exception("clear_by_status failed")
+        return _server_error("database error")
+
+    return _json_response({"cleared": int(cleared)})
+
+
+async def repeat_handler(request) -> "web.Response":  # type: ignore[name-defined]
+    """POST /api/schedule/repeat/{job_id}
+
+    Copies a job's payload (from scheduled_jobs OR job_history) into a
+    fresh scheduled job with a new UUID. New job gets scheduled_at=now,
+    priority=100 (per spec — not the original).
+
+    Response: 201 ``{"id": <new>, "source_id": <old>}`` or 404 if the
+    source job has no payload to copy.
+    """
+    db = request.app.get("sq_db")
+    if db is None:
+        return _server_error("db not initialized")
+
+    job_id = request.match_info.get("job_id", "").strip()
+    if not job_id:
+        return _bad_request("job_id is required")
+
+    try:
+        new_id = db.repeat_job(job_id)
+    except Exception:
+        _log.exception("repeat_job failed for %s", job_id)
+        return _server_error("database error")
+
+    if new_id is None:
+        return _not_found("source job not found or has no payload")
+    return _json_response({"id": new_id, "source_id": job_id}, status=201)
+
+
+async def export_handler(request) -> "web.Response":  # type: ignore[name-defined]
+    """GET /api/schedule/export/{job_id}
+
+    Returns the job's payload as a downloadable JSON file. The job_id
+    may live in scheduled_jobs OR job_history.
+
+    Response: 200 ``application/json`` with body ``{"payload": ...}``
+    and ``Content-Disposition: attachment; filename=...``. 404 if not found.
+    """
+    db = request.app.get("sq_db")
+    if db is None:
+        return _server_error("db not initialized")
+
+    job_id = request.match_info.get("job_id", "").strip()
+    if not job_id:
+        return _bad_request("job_id is required")
+
+    try:
+        row = db.get_job_with_outputs(job_id)
+    except Exception:
+        _log.exception("get_job_with_outputs failed for %s", job_id)
+        return _server_error("database error")
+    if row is None:
+        return _not_found("job not found")
+
+    payload = row.get("payload")
+    # History rows from old DBs may have no payload column populated.
+    body = json.dumps(
+        {"payload": payload}, ensure_ascii=False, separators=(",", ":"),
+    ).encode()
+
+    try:
+        from aiohttp import web
+        resp = web.Response(body=body, content_type="application/json")
+        resp.headers["Content-Disposition"] = (
+            f'attachment; filename="job-{job_id[:8]}.json"'
+        )
+        return resp
+    except Exception:
+        # Test environment fallback — wrap in our stub so tests still see
+        # the JSON bytes and the Content-Disposition header.
+        resp = _StubResponse(body, 200)
+        resp.headers = {
+            "Content-Type": "application/json",
+            "Content-Disposition": f'attachment; filename="job-{job_id[:8]}.json"',
+        }
+        return resp
+
+
+# Make validation logic accessible to the test suite without re-importing.
+_STATUS_IN_SCHEDULED = (
+    "scheduled", "dispatched", "running", "interrupted", "cancelled",
+)
+_STATUS_IN_HISTORY = ("done", "failed")
+
+
+# ---------------------------------------------------------------------------
 # Route registration
 # ---------------------------------------------------------------------------
 
@@ -694,11 +988,19 @@ def setup_routes(db, interceptor=None) -> None:
     app.router.add_post("/api/schedule/run-now/{job_id}", run_now_handler)
     app.router.add_get("/api/schedule/orphan-status", orphan_status_handler)
 
+    # Stage 3 additions (v0.3.8 batch — backend feature flush).
+    app.router.add_post("/api/schedule/add-batch", add_batch_handler)
+    app.router.add_get("/api/schedule/job/{job_id}", job_detail_handler)
+    app.router.add_delete("/api/schedule/clear", clear_handler)
+    app.router.add_post("/api/schedule/repeat/{job_id}", repeat_handler)
+    app.router.add_get("/api/schedule/export/{job_id}", export_handler)
+
 
 __all__ = [
     "setup_routes",
     "list_handler",
     "add_handler",
+    "add_batch_handler",
     "cancel_handler",
     "update_handler",
     "reorder_handler",
@@ -707,4 +1009,8 @@ __all__ = [
     "resume_all_handler",
     "run_now_handler",
     "orphan_status_handler",
+    "job_detail_handler",
+    "clear_handler",
+    "repeat_handler",
+    "export_handler",
 ]

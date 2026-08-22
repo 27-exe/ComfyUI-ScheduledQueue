@@ -17,6 +17,17 @@ def _default_db_path() -> str:
 
 def _dict(row): return None if row is None else {k: row[k] for k in row.keys()}
 
+def _safe_json(value):
+    """Decode a JSON column into a Python object, returning None on
+    empty / malformed values rather than raising. Used by the Stage 3
+    endpoints so the public API only ever sees decoded payloads."""
+    if value is None or value == "":
+        return None
+    try:
+        return json.loads(value)
+    except (ValueError, TypeError):
+        return value
+
 class ScheduledQueueDB:
     def __init__(self, db_path: str | None = None):
         self.db_path = db_path or _default_db_path()
@@ -38,7 +49,7 @@ class ScheduledQueueDB:
             );
             CREATE TABLE IF NOT EXISTS job_history (
               id TEXT PRIMARY KEY, prompt_id TEXT, finished_at REAL NOT NULL,
-              status TEXT NOT NULL, outputs TEXT, error TEXT
+              status TEXT NOT NULL, outputs TEXT, error TEXT, payload TEXT
             );
             CREATE TABLE IF NOT EXISTS scheduler_state (key TEXT PRIMARY KEY, value TEXT NOT NULL);
             CREATE INDEX IF NOT EXISTS idx_sq_due ON scheduled_jobs(status, scheduled_at);
@@ -47,6 +58,11 @@ class ScheduledQueueDB:
             if "queue_order" not in cols:
                 self._conn.execute("ALTER TABLE scheduled_jobs ADD COLUMN queue_order INTEGER")
             self._conn.execute("UPDATE scheduled_jobs SET queue_order=rowid*1000 WHERE queue_order IS NULL")
+            # job_history gained a `payload` column in v0.3.8 so finished jobs
+            # can be re-submitted via repeat_job. Older DBs need a migration.
+            hcols = {r[1] for r in self._conn.execute("PRAGMA table_info(job_history)")}
+            if "payload" not in hcols:
+                self._conn.execute("ALTER TABLE job_history ADD COLUMN payload TEXT")
             if self.get_state("paused") is None: self.set_state("paused", "1")
 
     def add_job(self, payload, scheduled_at, priority=100, note=None, client_id=None, auto_retry=0):
@@ -70,6 +86,180 @@ class ScheduledQueueDB:
 
     def list_history(self, limit=200):
         return [_dict(r) for r in self._conn.execute("SELECT * FROM job_history ORDER BY finished_at DESC LIMIT ?",(max(1,min(int(limit),10000)),)).fetchall()]
+
+    # --- pagination/listing/clear for the v0.3.8+ list endpoint -----------------
+    # status values come from both tables:
+    #   scheduled_jobs: scheduled, dispatched, running, interrupted, cancelled
+    #   job_history   : done, failed
+    # `count_jobs` / `list_jobs_paginated` / `clear_by_status` therefore have to
+    # look at both stores. They treat `status` as a virtual key: each store is
+    # queried only for statuses it actually holds.
+
+    _STATUS_IN_SCHEDULED = ("scheduled", "dispatched", "running", "interrupted", "cancelled")
+    _STATUS_IN_HISTORY   = ("done", "failed")
+
+    def _split_statuses(self, statuses):
+        in_sched = tuple(s for s in statuses if s in self._STATUS_IN_SCHEDULED)
+        in_hist  = tuple(s for s in statuses if s in self._STATUS_IN_HISTORY)
+        return in_sched, in_hist
+
+    def count_jobs(self, statuses=None):
+        """Return the number of rows whose status is in `statuses`.
+
+        `statuses` is a list/tuple of status strings; pass None or an empty
+        iterable to count everything in both stores.
+        """
+        sched, hist = self._split_statuses(statuses or ())
+        total = 0
+        if not statuses:
+            # Count both tables in one shot.
+            total += self._conn.execute("SELECT COUNT(*) FROM scheduled_jobs").fetchone()[0]
+            total += self._conn.execute("SELECT COUNT(*) FROM job_history").fetchone()[0]
+            return int(total)
+        if sched:
+            placeholders = ",".join("?" * len(sched))
+            total += int(self._conn.execute(
+                f"SELECT COUNT(*) FROM scheduled_jobs WHERE status IN ({placeholders})",
+                sched,
+            ).fetchone()[0])
+        if hist:
+            placeholders = ",".join("?" * len(hist))
+            total += int(self._conn.execute(
+                f"SELECT COUNT(*) FROM job_history WHERE status IN ({placeholders})",
+                hist,
+            ).fetchone()[0])
+        return total
+
+    def list_jobs_paginated(self, statuses=None, limit=50, offset=0):
+        """Paginated, status-filtered view across scheduled_jobs + job_history.
+
+        Returned list is ordered: live jobs first (by queue_order, priority,
+        scheduled_at, created_at, id) followed by history rows (most-recently
+        finished first). The unified ordering matches the frontend's mental
+        model of "active queue at the top, completed items underneath".
+        """
+        limit = max(1, min(int(limit), 200))
+        offset = max(0, int(offset))
+        sched, hist = self._split_statuses(statuses or ())
+
+        out = []
+        if sched:
+            placeholders = ",".join("?" * len(sched))
+            rows = self._conn.execute(
+                f"SELECT * FROM scheduled_jobs WHERE status IN ({placeholders}) "
+                f"ORDER BY CASE WHEN status IN ('scheduled','interrupted') THEN 0 "
+                f"WHEN status IN ('dispatched','running') THEN 1 ELSE 2 END, "
+                f"queue_order ASC, priority DESC, scheduled_at ASC, created_at ASC, id ASC "
+                f"LIMIT ? OFFSET ?",
+                (*sched, limit, offset),
+            ).fetchall()
+            out.extend(_dict(r) for r in rows)
+        elif not statuses:
+            rows = self._conn.execute(
+                "SELECT * FROM scheduled_jobs "
+                "ORDER BY CASE WHEN status IN ('scheduled','interrupted') THEN 0 "
+                "WHEN status IN ('dispatched','running') THEN 1 ELSE 2 END, "
+                "queue_order ASC, priority DESC, scheduled_at ASC, created_at ASC, id ASC "
+                "LIMIT ? OFFSET ?",
+                (limit, offset),
+            ).fetchall()
+            out.extend(_dict(r) for r in rows)
+
+        if hist:
+            placeholders = ",".join("?" * len(hist))
+            rows = self._conn.execute(
+                f"SELECT * FROM job_history WHERE status IN ({placeholders}) "
+                f"ORDER BY finished_at DESC LIMIT ? OFFSET ?",
+                (*hist, limit, offset),
+            ).fetchall()
+            out.extend(_dict(r) for r in rows)
+
+        return out
+
+    def get_job_with_outputs(self, job_id):
+        """Return one job, merged with its outputs if it lives in job_history.
+
+        Live jobs (``scheduled_jobs``) get their row plus a synthetic
+        ``outputs`` field of ``None`` so the frontend always sees the same
+        shape. History rows keep their stored JSON ``outputs`` (or None).
+
+        Both ``payload`` and ``outputs`` columns are returned as decoded
+        Python objects (dicts / lists) instead of raw JSON strings, since
+        the public API serialises the result with json.dumps anyway.
+
+        Returns None if no such job exists in either table.
+        """
+        row = self.get_job(job_id)
+        if row is not None:
+            row["outputs"] = None
+            row["payload"] = _safe_json(row.get("payload"))
+            return row
+        h = self._conn.execute(
+            "SELECT * FROM job_history WHERE id=?", (job_id,),
+        ).fetchone()
+        if h is None:
+            return None
+        d = _dict(h)
+        if d is None:
+            return None
+        # job_history rows don't store note/priority — fill None so the
+        # API response shape stays consistent with the live job variant.
+        d["payload"] = _safe_json(d.get("payload"))
+        d["outputs"] = _safe_json(d.get("outputs"))
+        d.setdefault("note", None)
+        d.setdefault("priority", None)
+        return d
+
+    def clear_by_status(self, statuses):
+        """Delete every row whose status is in `statuses`. Returns the count.
+
+        Removes matching rows from BOTH ``scheduled_jobs`` (cancelled,
+        interrupted, ...) and ``job_history`` (done, failed, ...).
+        """
+        sched, hist = self._split_statuses(statuses or ())
+        removed = 0
+        with self._conn:
+            if sched:
+                placeholders = ",".join("?" * len(sched))
+                removed += self._conn.execute(
+                    f"DELETE FROM scheduled_jobs WHERE status IN ({placeholders})",
+                    sched,
+                ).rowcount
+            if hist:
+                placeholders = ",".join("?" * len(hist))
+                removed += self._conn.execute(
+                    f"DELETE FROM job_history WHERE status IN ({placeholders})",
+                    hist,
+                ).rowcount
+        return int(removed)
+
+    def repeat_job(self, job_id, priority=100, scheduled_at=None):
+        """Resurrect a finished job (typically from job_history) as a fresh
+        ``scheduled_jobs`` row carrying the same payload.
+
+        Returns the new job's id, or None if no source job (history or live)
+        carries a payload we can copy.
+        """
+        src = self._conn.execute(
+            "SELECT payload FROM job_history WHERE id=?", (job_id,),
+        ).fetchone()
+        if src is None:
+            live = self._conn.execute(
+                "SELECT payload FROM scheduled_jobs WHERE id=?", (job_id,),
+            ).fetchone()
+            if live is None or not live["payload"]:
+                return None
+            payload = json.loads(live["payload"])
+        else:
+            payload = json.loads(src["payload"]) if src["payload"] else None
+        if payload is None:
+            return None
+        return self.add_job(
+            payload=payload,
+            scheduled_at=time.time() if scheduled_at is None else float(scheduled_at),
+            priority=int(priority),
+            note=f"repeat of {job_id[:8]}",
+        )
 
     def update_job(self, job_id, **fields):
         allowed={"status","prompt_id","client_id","note","priority","scheduled_at","dispatched_at","finished_at","error","retry_count","auto_retry","queue_order"}
@@ -112,7 +302,16 @@ class ScheduledQueueDB:
     def claim_next_due_job(self):
         now=time.time()
         with self._conn:
-            r=self._conn.execute("SELECT * FROM scheduled_jobs WHERE status='scheduled' AND scheduled_at<=? ORDER BY queue_order,priority DESC,scheduled_at,created_at,id LIMIT 1",(now,)).fetchone()
+            # Priority must dominate scheduled_at: a high-priority job due
+            # later still jumps ahead of a low-priority job already due.
+            # Explicit ASC on scheduled_at mirrors the same intent in code.
+            r=self._conn.execute(
+                "SELECT * FROM scheduled_jobs "
+                "WHERE status='scheduled' AND scheduled_at<=? "
+                "ORDER BY queue_order, priority DESC, scheduled_at ASC, created_at, id "
+                "LIMIT 1",
+                (now,),
+            ).fetchone()
             if not r:return None
             self._conn.execute("UPDATE scheduled_jobs SET status='dispatched',dispatched_at=? WHERE id=? AND status='scheduled'",(now,r['id']))
             d=_dict(r); d.update(status='dispatched',dispatched_at=now); return d
@@ -123,9 +322,9 @@ class ScheduledQueueDB:
     def _finish(self, job_id, status, prompt_id=None, outputs=None, error=None):
         now=time.time()
         with self._conn:
-            r=self._conn.execute("SELECT prompt_id FROM scheduled_jobs WHERE id=?",(job_id,)).fetchone()
+            r=self._conn.execute("SELECT prompt_id,payload FROM scheduled_jobs WHERE id=?",(job_id,)).fetchone()
             if not r:return False
-            self._conn.execute("INSERT OR REPLACE INTO job_history(id,prompt_id,finished_at,status,outputs,error) VALUES(?,?,?,?,?,?)",(job_id,prompt_id or r[0],now,status,json.dumps(outputs,ensure_ascii=False,separators=(",",":")) if outputs is not None else None,error))
+            self._conn.execute("INSERT OR REPLACE INTO job_history(id,prompt_id,finished_at,status,outputs,error,payload) VALUES(?,?,?,?,?,?,?)",(job_id,prompt_id or r[0],now,status,json.dumps(outputs,ensure_ascii=False,separators=(",",":")) if outputs is not None else None,error,r['payload']))
             self._conn.execute("DELETE FROM scheduled_jobs WHERE id=?",(job_id,))
         return True
     def mark_done(self,job_id,prompt_id=None,outputs=None): return self._finish(job_id,'done',prompt_id,outputs)

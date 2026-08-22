@@ -25,10 +25,13 @@ os.environ.setdefault("COMFYUI_USER_DIR", _tmpdir)
 class _StubRequest:
     """Minimal aiohttp Request lookalike sufficient for our handlers."""
 
-    def __init__(self, *, app=None, json_body=None, match_info=None):
+    def __init__(self, *, app=None, json_body=None, match_info=None, query=None):
         self._app = app
         self._json_body = json_body
         self.match_info = match_info or {}
+        # aiohttp exposes MultiDict, but our handlers only call .get(...) on it.
+        # A plain dict is enough for the unit tests.
+        self.query = query or {}
 
     async def json(self):
         if self._json_body is None:
@@ -143,6 +146,241 @@ class TestRoutes(unittest.TestCase):
         self.db.set_state("paused", "1")
         resp = _run(self._routes.status_handler(_StubRequest(app=self.app)))
         self.assertTrue(json.loads(resp.body)["paused"])
+
+    # ------------------------------------------------------------------
+    # Stage 3: /add-batch, paginated /list, /job/{id}, /clear, /repeat,
+    # /export, and priority-aware claim_next_due_job.
+    # ------------------------------------------------------------------
+
+    def test_add_batch_with_multiple_items(self):
+        items = [
+            {"payload": {"i": 0}, "scheduled_at": 100.0, "priority": 5},
+            {"payload": {"i": 1}, "scheduled_at": 200.0, "priority": 7},
+            {"payload": {"i": 2}, "scheduled_at": 300.0, "priority": 9},
+        ]
+        resp = _run(self._routes.add_batch_handler(_StubRequest(
+            app=self.app, json_body={"items": items},
+        )))
+        self.assertEqual(resp.status, 201)
+        body = json.loads(resp.body)
+        self.assertEqual(body["count"], 3)
+        self.assertEqual(len(body["added"]), 3)
+        self.assertEqual({row["scheduled_at"] for row in body["added"]},
+                         {100.0, 200.0, 300.0})
+        # rows are real — fetch by id
+        for row in body["added"]:
+            self.assertIsNotNone(self.db.get_job(row["id"]))
+
+    def test_add_batch_rejects_over_50_items(self):
+        items = [
+            {"payload": {"i": i}, "scheduled_at": 100.0 + i}
+            for i in range(51)
+        ]
+        resp = _run(self._routes.add_batch_handler(_StubRequest(
+            app=self.app, json_body={"items": items},
+        )))
+        self.assertEqual(resp.status, 400)
+        body = json.loads(resp.body)
+        self.assertIn("too many", body["error"].lower())
+        # and nothing landed in the DB
+        self.assertEqual(len(self.db.list_jobs()), 0)
+
+    def test_list_pagination_and_status_filter(self):
+        # 5 scheduled + 2 cancelled = 7 jobs total.
+        for i in range(5):
+            self._add(note=f"s-{i}")
+        c1 = self._add(note="c-1"); self.db.update_job(c1, status="cancelled")
+        c2 = self._add(note="c-2"); self.db.update_job(c2, status="cancelled")
+
+        # page 1: status=scheduled, limit=2, offset=0
+        resp = _run(self._routes.list_handler(_StubRequest(
+            app=self.app, query={"status": "scheduled", "limit": "2", "offset": "0"},
+        )))
+        self.assertEqual(resp.status, 200)
+        body = json.loads(resp.body)
+        self.assertEqual(body["total"], 5)
+        self.assertEqual(body["limit"], 2)
+        self.assertEqual(body["offset"], 0)
+        self.assertEqual(len(body["jobs"]), 2)
+        self.assertTrue(body["has_more"])
+
+        # page 2: offset=4, expect 1 row + has_more=False
+        resp = _run(self._routes.list_handler(_StubRequest(
+            app=self.app, query={"status": "scheduled", "limit": "2", "offset": "4"},
+        )))
+        body = json.loads(resp.body)
+        self.assertEqual(len(body["jobs"]), 1)
+        self.assertFalse(body["has_more"])
+
+        # offset past the end -> empty + has_more=False
+        resp = _run(self._routes.list_handler(_StubRequest(
+            app=self.app, query={"status": "scheduled", "offset": "999"},
+        )))
+        body = json.loads(resp.body)
+        self.assertEqual(body["jobs"], [])
+        self.assertFalse(body["has_more"])
+
+    def test_list_with_multiple_statuses_filter(self):
+        for i in range(3):
+            self._add(note=f"s-{i}")
+        d = self._add(note="d-1"); self.db.update_job(d, status="dispatched")
+        c = self._add(note="c-1"); self.db.update_job(c, status="cancelled")
+
+        # comma-separated filter
+        resp = _run(self._routes.list_handler(_StubRequest(
+            app=self.app, query={"status": "dispatched,cancelled"},
+        )))
+        body = json.loads(resp.body)
+        self.assertEqual(body["total"], 2)
+        self.assertEqual({j["note"] for j in body["jobs"]}, {"d-1", "c-1"})
+
+    def test_get_job_with_outputs(self):
+        jid = self._add(note="with-outputs")
+        self.db.update_job(jid, status="running", prompt_id="pid-x")
+        # simulate reconcile finishing the job
+        self.db.mark_done(jid, prompt_id="pid-x", outputs={"images": ["a.png"]})
+        # the row is now only in job_history
+        self.assertIsNone(self.db.get_job(jid))
+
+        resp = _run(self._routes.job_detail_handler(_StubRequest(
+            app=self.app, match_info={"job_id": jid},
+        )))
+        self.assertEqual(resp.status, 200)
+        body = json.loads(resp.body)
+        self.assertEqual(body["id"], jid)
+        self.assertEqual(body["status"], "done")
+        self.assertEqual(body["outputs"], {"images": ["a.png"]})
+        self.assertEqual(body["payload"], {"x": 1})
+
+        # 404 for unknown
+        resp = _run(self._routes.job_detail_handler(_StubRequest(
+            app=self.app, match_info={"job_id": "missing"},
+        )))
+        self.assertEqual(resp.status, 404)
+
+    def test_clear_by_status_default(self):
+        # 1 scheduled + 1 cancelled + 1 done
+        self._add(note="keep-scheduled")
+        cancelled = self._add(note="to-clear-cancelled")
+        self.db.update_job(cancelled, status="cancelled")
+
+        live = self._add(note="live")
+        self.db.update_job(live, status="running", prompt_id="p-live")
+        self.db.mark_done(live, prompt_id="p-live", outputs={"x": 1})
+
+        # default deletes done/failed/cancelled
+        resp = _run(self._routes.clear_handler(_StubRequest(app=self.app)))
+        self.assertEqual(resp.status, 200)
+        body = json.loads(resp.body)
+        self.assertEqual(body["cleared"], 2)  # cancelled + done
+
+        # live scheduled row untouched
+        rows = self.db.list_jobs()
+        self.assertEqual([r["note"] for r in rows], ["keep-scheduled"])
+        # history cleaned out
+        self.assertEqual(self.db.list_history(), [])
+
+    def test_clear_by_explicit_status_list(self):
+        for i in range(3):
+            jid = self._add(note=f"x-{i}")
+            self.db.update_job(jid, status="cancelled")
+        self._add(note="keep")  # scheduled, must survive
+
+        # only wipe cancelled
+        resp = _run(self._routes.clear_handler(_StubRequest(
+            app=self.app, query={"statuses": "cancelled"},
+        )))
+        body = json.loads(resp.body)
+        self.assertEqual(body["cleared"], 3)
+        # one row left
+        self.assertEqual(len(self.db.list_jobs()), 1)
+
+        # bad status -> 400
+        resp = _run(self._routes.clear_handler(_StubRequest(
+            app=self.app, query={"statuses": "bogus"},
+        )))
+        self.assertEqual(resp.status, 400)
+
+    def test_repeat_job_creates_new_with_same_payload(self):
+        src = self._add(note="src", payload={"x": 99, "nested": {"a": 1}})
+        self.db.update_job(src, status="running", prompt_id="pid-r")
+        self.db.mark_done(src, prompt_id="pid-r", outputs={"i": ["out.png"]})
+
+        resp = _run(self._routes.repeat_handler(_StubRequest(
+            app=self.app, match_info={"job_id": src},
+        )))
+        self.assertEqual(resp.status, 201)
+        body = json.loads(resp.body)
+        self.assertEqual(body["source_id"], src)
+        new_id = body["id"]
+        self.assertNotEqual(new_id, src)
+
+        new_row = self.db.get_job(new_id)
+        self.assertIsNotNone(new_row)
+        assert new_row is not None  # type narrowing for pyright
+        self.assertEqual(new_row["status"], "scheduled")
+        # get_job returns payload as the raw JSON string (consistent with
+        # other DB methods). Decode to compare structurally.
+        self.assertEqual(json.loads(new_row["payload"]), {"x": 99, "nested": {"a": 1}})
+        self.assertEqual(new_row["priority"], 100)  # explicit default
+        self.assertEqual(new_row["note"], "repeat of " + src[:8])
+
+        # The /export endpoint should hand back the same payload as JSON.
+        resp = _run(self._routes.export_handler(_StubRequest(
+            app=self.app, match_info={"job_id": new_id},
+        )))
+        self.assertEqual(resp.status, 200)
+        self.assertEqual(
+            json.loads(resp.body)["payload"],
+            {"x": 99, "nested": {"a": 1}},
+        )
+
+        # 404 on unknown source
+        resp = _run(self._routes.repeat_handler(_StubRequest(
+            app=self.app, match_info={"job_id": "no-such"},
+        )))
+        self.assertEqual(resp.status, 404)
+
+    def test_export_returns_payload(self):
+        jid = self._add(note="exp", payload={"data": [1, 2, 3]})
+        resp = _run(self._routes.export_handler(_StubRequest(
+            app=self.app, match_info={"job_id": jid},
+        )))
+        self.assertEqual(resp.status, 200)
+        body = json.loads(resp.body)
+        self.assertEqual(body["payload"], {"data": [1, 2, 3]})
+        # attachment header present
+        self.assertIn("attachment", resp.headers["Content-Disposition"])
+        self.assertIn(".json", resp.headers["Content-Disposition"])
+
+        # also works for finished jobs (history rows)
+        self.db.update_job(jid, status="running", prompt_id="p")
+        self.db.mark_done(jid, prompt_id="p", outputs={"x": 1})
+        resp = _run(self._routes.export_handler(_StubRequest(
+            app=self.app, match_info={"job_id": jid},
+        )))
+        self.assertEqual(resp.status, 200)
+        self.assertEqual(json.loads(resp.body)["payload"], {"data": [1, 2, 3]})
+
+    def test_priority_ordering_in_claim_next(self):
+        # Three jobs with ascending scheduled_at AND ascending priority.
+        # Force them all to share the same queue_order so priority is the
+        # only thing that breaks the tie.
+        a = self.db.add_job(payload={"name": "low"},  scheduled_at=10.0, priority=1)
+        b = self.db.add_job(payload={"name": "mid"},  scheduled_at=20.0, priority=5)
+        c = self.db.add_job(payload={"name": "high"}, scheduled_at=30.0, priority=10)
+        for jid in (a, b, c):
+            self.db._conn.execute(  # type: ignore[attr-defined]
+                "UPDATE scheduled_jobs SET queue_order=? WHERE id=?",
+                (5000, jid),
+            )
+
+        claimed: list[str] = []
+        for _ in range(3):
+            row = self.db.claim_next_due_job()
+            self.assertIsNotNone(row, "claim_next_due_job returned None early")
+            claimed.append(json.loads(row["payload"])["name"])
+        self.assertEqual(claimed, ["high", "mid", "low"])
 
 
 if __name__ == "__main__":
