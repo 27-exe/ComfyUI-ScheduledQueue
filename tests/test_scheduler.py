@@ -8,7 +8,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
@@ -103,6 +103,86 @@ class TestScheduler(unittest.TestCase):
         self.assertEqual(hist[0]["status"], "done")
         self.assertEqual(hist[0]["prompt_id"], "p-done")
         self.assertIsNone(self.db.get_job(jid))
+        w.stop()
+
+    def test_reconcile_handles_real_comfyui_history_shape(self):
+        # Regression: ComfyUI 1.49.6 /history/<id> returns a nested dict:
+        #   {<prompt_id>: {status: {status_str: "success", completed: True},
+        #                  outputs: {...}, ...}}
+        # The old code did `record.get('status', '')` and then a str() .lower()
+        # match against ("success", "error") — which never fired because
+        # str(dict) is never equal to "success". Running jobs would loop
+        # forever and never reach the done/failed terminal states.
+        jid = self.db.add_job(payload={"x": 1}, scheduled_at=0.0)
+        self.db.update_job(jid, status="running", prompt_id="7afd-real-shape")
+        w = scheduler.SchedulerThread(self.db)
+
+        real_history_shape = {
+            "status": {
+                "status_str": "success",
+                "completed": True,
+                "messages": [],
+            },
+            "outputs": {
+                "9": {"images": [{"filename": "out.png"}]},
+            },
+            "meta": {},
+        }
+
+        history_fetcher = MagicMock(return_value=real_history_shape)
+        w.reconcile(history_fetcher=history_fetcher)
+
+        hist = self.db.list_history()
+        self.assertEqual(len(hist), 1, "reconcile must finalize the running job")
+        self.assertEqual(hist[0]["status"], "done")
+        self.assertEqual(hist[0]["prompt_id"], "7afd-real-shape")
+        self.assertIsNone(self.db.get_job(jid))
+        history_fetcher.assert_called_once_with("7afd-real-shape")
+        w.stop()
+
+    def test_reconcile_marks_error_failed_with_empty_outputs(self):
+        jid = self.db.add_job(payload={"x": 1}, scheduled_at=0.0)
+        self.db.update_job(jid, status="running", prompt_id="p-error-empty-outputs")
+        w = scheduler.SchedulerThread(self.db)
+        record = {
+            "status": {
+                "status_str": "error",
+                "completed": True,
+                "messages": [],
+            },
+            "outputs": {},
+        }
+        history_fetcher = MagicMock(return_value=record)
+
+        w.reconcile(history_fetcher=history_fetcher)
+
+        hist = self.db.list_history()
+        self.assertEqual(len(hist), 1)
+        self.assertEqual(hist[0]["status"], "failed")
+        self.assertEqual(
+            hist[0]["error"],
+            "ComfyUI reported error",
+        )
+        self.assertIsNone(self.db.get_job(jid))
+        history_fetcher.assert_called_once_with("p-error-empty-outputs")
+        w.stop()
+
+    def test_reconcile_leaves_none_and_empty_record_as_running(self):
+        ids = []
+        for prompt_id in ("p-none", "p-empty"):
+            jid = self.db.add_job(payload={"x": 1}, scheduled_at=0.0)
+            self.db.update_job(jid, status="running", prompt_id=prompt_id)
+            ids.append(jid)
+        w = scheduler.SchedulerThread(self.db)
+        history_fetcher = MagicMock(side_effect=[None, {}])
+
+        w.reconcile(history_fetcher=history_fetcher)
+
+        for jid in ids:
+            self.assertEqual(self.db.get_job(jid)["status"], "running")
+        self.assertEqual(self.db.list_history(), [])
+        self.assertEqual(history_fetcher.call_args_list[0].args, ("p-none",))
+        self.assertEqual(history_fetcher.call_args_list[1].args, ("p-empty",))
         w.stop()
 
     def test_reconcile_marks_failed_when_history_says_error(self):

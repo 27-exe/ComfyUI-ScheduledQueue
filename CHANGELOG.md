@@ -4,6 +4,38 @@ All notable changes to **ComfyUI-ScheduledQueue** are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.3.3] - 2026-08-22
+
+### Fixed (reconcile never moved running → done/failed)
+- `scheduler.reconcile()` was reading `record.get('status', '')` and treating
+  that as a string. ComfyUI 0.33+ stores the status as a nested dict of the
+  shape `{"status_str": "success"|"error", "completed": bool, "messages":
+  [...]}`, so `str(dict)` was never equal to any of the literals in the
+  success/failure list. Result: every running task was silently
+  abandoned and stayed `running` forever in the database, even after
+  ComfyUI finished it. The reconcile path now reads `status_str`,
+  `completed`, and `outputs` defensively, and falls through to `leave
+  running` only when the history record is truly absent.
+- `import urllib.parse` was missing from `scheduler.py` even though
+  `_history()` uses `urllib.parse.quote()`. The first live reconcile call
+  would have crashed before this was caught. Now imported.
+
+### Tests
+- New `test_reconcile_handles_real_comfyui_history_shape` exercises the
+  real nested-dict record shape (the only test that would have caught
+  the previous regression).
+
+### Known limitation (documented honestly)
+- ComfyUI keeps `/history/{prompt_id}` records in memory; they are lost
+  on server restart. If our plugin still has jobs in `running` after a
+  ComfyUI restart, the `recover_orphans` step at startup flips them to
+  `interrupted` and **the original completion outcome can no longer be
+  recovered**. The user's workflow JSON is preserved in `payload`, so the
+  job can be re-queued via `comfy-schedule run-now {id}` or
+  `comfy-schedule cancel {id}` from the CLI. Restarting ComfyUI in
+  the middle of a batch is therefore not recommended; run the batch
+  to completion or pause-and-resume at the next boot.
+
 ## [0.3.2] - 2026-08-22
 
 ### Fixed (regression discovered in 0.3.1)
