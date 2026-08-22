@@ -1055,9 +1055,11 @@ function openScheduleDialog() {
     }
 
     // +/- buttons: each click adds its data-delta (seconds) to currentWhenTs.
+    console.log("[ScheduledQueue] binding delta click handlers (v" + SQ_VERSION + ")");
     dlg.querySelectorAll('[data-role="when-row"] [data-delta]').forEach((btn) => {
         btn.addEventListener("click", () => {
             const delta = parseInt(btn.dataset.delta, 10);
+            console.log("[ScheduledQueue] delta click: " + delta + "s (was " + currentWhenTs + ")");
             if (!Number.isFinite(delta)) return;
             currentWhenTs += delta;
             refreshWhenDisplay();
@@ -1169,4 +1171,6 @@ function installSidebarWatcher(container) {
 // framework calls render(container) directly whenever our sidebar tab is
 // activated.)
 
+const SQ_VERSION = "0.3.10";
+console.log("[ScheduledQueue] Loaded version " + SQ_VERSION + " (file://" + (import.meta?.url || location.href) + ")");
 console.log("[ScheduledQueue] Registered: topbar button + sidebar tab.");
