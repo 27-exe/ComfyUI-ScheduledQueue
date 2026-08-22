@@ -4,6 +4,54 @@ All notable changes to **ComfyUI-ScheduledQueue** are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.3.5] - 2026-08-22
+
+### Fixed (plugin ignored UI-format workflows → cache hit on every dispatch)
+- The plugin was passing the user's `payload` straight to ComfyUI.
+  Users who copy-paste a workflow saved from the editor ship the
+  **UI format** (`{"nodes": [...], "links": [...], "widgets_values":
+  [...]}...`), not the **API format** ComfyUI's `/prompt` endpoint
+  accepts. The previous `_apply_pre_dispatch_hooks` walked the API-format
+  tree only and therefore never found `seed` / `noise_seed` to randomise,
+  so every dispatch kept the same seed, triggered `execution_cached`,
+  and produced the same image.
+- New module `src/comfyui_scheduled_queue/workflow_format.py`
+  (~285 LOC, 4 public helpers + 4 private helpers) implements a minimal
+  UI → API converter. Dispatch-time hook now:
+  ```python
+  if not is_api_format(prompt):
+      prompt = convert_ui_to_api(prompt)
+  ```
+  Strategy:
+  1. `widgets_values_named` (modern frontend, key=value per widget name).
+  2. Fallback: `comfy.nodes.NODE_CLASS_MAPPINGS[type].INPUT_TYPES()`
+     schema with default values.
+  3. Links first (already in API format: `[node_id, output_index]`).
+- Verified end-to-end against the user's real workflow at
+  `/home/a27exe/Downloads/SD工作流 无强化.json` (UI format, 83 nodes):
+  post-conversion, KSampler / UltimateSDUpscale / FaceDetailer nodes
+  all expose `inputs.seed` AND `inputs.control_after_generate` for the
+  existing seed-randomisation hook to mutate.
+
+### Tests
+- New `tests/test_workflow_format.py` (~416 LOC, 26 tests):
+  is_api_format detection, UI→API roundtrip on the real user fixture,
+  widgets_values_named path, INPUT_TYPES fallback path, link priority,
+  API-format passthrough, dangling link handling, empty widgets_values.
+- Full suite: **82 / 82 pass** (was 56, + 26 new).
+
+### Known limitations
+- Empty `widgets_values` + missing INPUT_TYPES schema emits a warning
+  and drops the widget's value. ComfyUI then complains at execution
+  about a missing input; users see a clear server-side error.
+- Dangling links (referencing a non-existent source node) are
+  silently dropped with a warning. ComfyUI's own execution report
+  will flag the missing dependency.
+- Link-vs-widget duplicates: link value wins, matching the frontend's
+  `graphToPrompt` behaviour.
+- The converter does not currently auto-normalise `widgets_values_named`
+  when both are present; modern frontend is the default.
+
 ## [0.3.4] - 2026-08-22
 
 ### Fixed (scheduler ignored frontend `control_after_generate`)

@@ -11,6 +11,8 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+from .workflow_format import convert_ui_to_api, is_api_format
+
 log = logging.getLogger(__name__)
 
 
@@ -135,6 +137,14 @@ def _apply_pre_dispatch_hooks(prompt: dict) -> dict:
     """
     if not isinstance(prompt, dict):
         return prompt
+    # Accept UI-format workflows pasted from the editor: ComfyUI's /prompt
+    # endpoint rejects them, but the rest of this hook only knows how to
+    # mutate API-format dicts (with ``inputs.seed``). Convert first, then
+    # run the existing per-input hooks unchanged.
+    if not is_api_format(prompt):
+        prompt = convert_ui_to_api(prompt)
+    if not isinstance(prompt, dict):
+        return prompt
     out = copy.deepcopy(prompt)
     for _node_id, node in out.items():
         if not isinstance(node, dict):
@@ -192,17 +202,62 @@ class SchedulerThread:
 
     def tick(self):
         if self.db.get_state('paused') != '0':
+            log.debug('tick skipped: paused')
             return
         job = self.db.claim_next_due_job()
         if not job:
             return
 
+        # === DEBUG: log raw payload seed values (BEFORE hook) ===
+        try:
+            raw_payload = json.loads(job['payload'])
+            for node_id, node in (raw_payload.items() if isinstance(raw_payload, dict) else []):
+                if not isinstance(node, dict):
+                    continue
+                inputs = node.get('inputs', {})
+                if not isinstance(inputs, dict):
+                    continue
+                if 'seed' in inputs or 'control_after_generate' in inputs:
+                    log.info(
+                        '[SQ-DEBUG] job=%s node=%s class=%s seed=%s noise_seed=%s cag=%s',
+                        job['id'][:8], node_id, node.get('class_type'),
+                        inputs.get('seed'),
+                        inputs.get('noise_seed'),
+                        inputs.get('control_after_generate'),
+                    )
+        except Exception as exc:
+            log.warning('[SQ-DEBUG] raw payload inspection failed: %s', exc)
+
         try:
             prompt = _apply_pre_dispatch_hooks(json.loads(job['payload']))
+
+            # === DEBUG: log payload seed values (AFTER hook, BEFORE POST) ===
+            try:
+                for node_id, node in (prompt.items() if isinstance(prompt, dict) else []):
+                    if not isinstance(node, dict):
+                        continue
+                    inputs = node.get('inputs', {})
+                    if not isinstance(inputs, dict):
+                        continue
+                    if 'seed' in inputs:
+                        log.info(
+                            '[SQ-DEBUG] AFTER_HOOK job=%s node=%s seed=%s noise_seed=%s cag_present=%s',
+                            job['id'][:8], node_id,
+                            inputs.get('seed'),
+                            inputs.get('noise_seed'),
+                            'control_after_generate' in inputs,
+                        )
+            except Exception as exc:
+                log.warning('[SQ-DEBUG] post-hook payload inspection failed: %s', exc)
+
             body = {
                 'prompt': prompt,
                 'client_id': job.get('client_id') or 'scheduled_queue',
             }
+            log.info(
+                '[SQ-DEBUG] POST /prompt job=%s client_id=%s prompt_node_count=%s',
+                job['id'][:8], body['client_id'], len(prompt) if isinstance(prompt, dict) else '?',
+            )
             req = urllib.request.Request(
                 self.comfyui_url + '/prompt',
                 data=json.dumps(body).encode(),
@@ -214,12 +269,14 @@ class SchedulerThread:
                     raise RuntimeError(f'HTTP {response.status}')
                 result = json.loads(response.read().decode() or '{}')
             prompt_id = result.get('prompt_id')
+            log.info('[SQ-DEBUG] POST /prompt response prompt_id=%s full=%s', prompt_id, result)
             if not prompt_id:
                 raise RuntimeError('ComfyUI response did not include prompt_id')
             self.db.mark_running(job['id'], prompt_id)
             self.db.set_state('last_dispatch_at', str(time.time()))
             log.info('dispatched %s as %s', job['id'], prompt_id)
         except Exception as exc:
+            log.exception('[SQ-DEBUG] dispatch failed: %s', exc)
             self._dispatch_failure(job['id'], str(exc))
 
     def _dispatch_failure(self, job_id, error):

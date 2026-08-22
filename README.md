@@ -1,10 +1,10 @@
 # ComfyUI-ScheduledQueue
 
-**Status: under development.** 本插件仍在快速迭代中。最近修复(0.3.2):
-- sidebar tab 切换冲突(`activeSidebarTabId` watcher 同步)
-- 全局 Pause/Resume 按钮真实反映 DB 状态
-- ▲/▼ reorder 持久化(新增 `/api/schedule/reorder/{id}`)
-- Schedule 对话框提交后 panel 自动刷新
+**Status: under development.** 本插件仍在快速迭代中。最近修复(0.3.5):
+- **新增 UI format 支持**:之前只处理 API format,从编辑器复制的 UI
+  format workflow 会导致 cache 命中(只出 1 张图)。现 scheduler.py 在
+  dispatch 时自动 convert UI → API,让 control_after_generate hook 真
+  正能...[truncated>
 
 CLI (`comfy-schedule`) 与 HTTP API 一直工作正常。Web 端已修到接近可用,
 但仍可能有边缘问题。生产环境请先用 CLI/curl。仓库已开放,欢迎试用
