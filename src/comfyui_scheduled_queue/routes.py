@@ -52,7 +52,9 @@ _log = logging.getLogger("scheduled_queue.routes")
 
 # Fields the /update endpoint is allowed to write. Status and payload are
 # intentionally excluded (spec section 5.2 update endpoint constraints).
-_UPDATE_ALLOWED_FIELDS = frozenset({"scheduled_at", "priority", "note", "auto_retry"})
+# `workflow_title` is added in v0.3.10 so the sidebar can correct / retag a
+# job's "which workflow" label without round-tripping through payload edits.
+_UPDATE_ALLOWED_FIELDS = frozenset({"scheduled_at", "priority", "note", "auto_retry", "workflow_title"})
 
 # Per-endpoint limit cap for /list. Spec (Stage 3): default 50, max 200.
 _LIST_MAX_LIMIT = 200
@@ -172,6 +174,10 @@ async def list_handler(request) -> "web.Response":  # type: ignore[name-defined]
        "has_more": <total > offset+len(jobs)>}
     payload is never returned here — fetch /api/schedule/job/{id} for full
     details (Stage 3).
+
+    Lightweight fields like ``workflow_title`` (the ComfyUI workflow filename
+    captured when the job was queued, v0.3.10+) ARE returned here so the
+    sidebar can label each row without a per-row detail fetch.
     """
     db = request.app.get("sq_db")  # set in setup_routes()
     if db is None:
@@ -209,7 +215,8 @@ async def add_handler(request) -> "web.Response":  # type: ignore[name-defined]
     """POST /api/schedule/add
 
     Required body: payload (dict) + scheduled_at (positive float).
-    Optional: priority (int), note (str), auto_retry (int), client_id (str).
+    Optional: priority (int), note (str), auto_retry (int), client_id (str),
+              workflow_title (str).
     Returns 201 + {id, scheduled_at, status}.
     """
     db = request.app.get("sq_db")
@@ -259,6 +266,13 @@ async def add_handler(request) -> "web.Response":  # type: ignore[name-defined]
     if client_id is not None and not isinstance(client_id, str):
         return _bad_request("client_id must be a string")
 
+    # workflow_title: optional. The ComfyUI frontend sends the active
+    # workflow's filename so the sidebar can label each row. Empty / missing
+    # values are accepted (the DB layer normalises them to NULL).
+    workflow_title = body.get("workflow_title")
+    if workflow_title is not None and not isinstance(workflow_title, str):
+        return _bad_request("workflow_title must be a string")
+
     try:
         job_id = db.add_job(
             payload=payload,
@@ -267,6 +281,7 @@ async def add_handler(request) -> "web.Response":  # type: ignore[name-defined]
             note=note,
             client_id=client_id,
             auto_retry=int(auto_retry),
+            workflow_title=workflow_title,
         )
     except Exception:
         _log.exception("add_job failed")
@@ -368,6 +383,15 @@ async def update_handler(request) -> "web.Response":  # type: ignore[name-define
         if not isinstance(v, int) or isinstance(v, bool):
             return _bad_request("auto_retry must be an integer")
         fields["auto_retry"] = int(v)
+
+    if "workflow_title" in body:
+        v = body["workflow_title"]
+        # Allow None to clear the title; otherwise require a string. Empty
+        # string is accepted and normalised to NULL by the DB layer so legacy
+        # rows that had the field passed as "" still treat it as "no title".
+        if v is not None and not isinstance(v, str):
+            return _bad_request("workflow_title must be a string")
+        fields["workflow_title"] = v
 
     # Verify the job exists so we can return 404 distinctly from a no-op
     # update (which would otherwise silently succeed).
@@ -717,6 +741,12 @@ def _validate_add_item(item: Any) -> tuple[dict, str | None]:
             return {}, "client_id must be a string"
         args["client_id"] = cid
 
+    if "workflow_title" in item:
+        wt = item["workflow_title"]
+        if wt is not None and not isinstance(wt, str):
+            return {}, "workflow_title must be a string"
+        args["workflow_title"] = wt
+
     return args, None
 
 
@@ -724,6 +754,8 @@ async def add_batch_handler(request) -> "web.Response":  # type: ignore[name-def
     """POST /api/schedule/add-batch
 
     Body: ``{"items": [<single-add body>, ...]}`` (max 50 items per request).
+    Each item accepts the same optional fields as /add (priority, note,
+    auto_retry, client_id, workflow_title).
 
     Each item is validated independently; per-item validation failures are
     silently skipped (they don't fail the whole batch). Database errors on

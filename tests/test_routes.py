@@ -383,5 +383,306 @@ class TestRoutes(unittest.TestCase):
         self.assertEqual(claimed, ["high", "mid", "low"])
 
 
+# ---------------------------------------------------------------------------
+# v0.3.10: workflow_title exposed through the HTTP layer.
+# ---------------------------------------------------------------------------
+
+class TestWorkflowTitleRoutes(unittest.TestCase):
+    """Sidecar suite for the optional ``workflow_title`` field.
+
+    The DB layer is covered exhaustively in test_database.py. These tests
+    focus on the HTTP contract: list/get/repeat expose the column, add /
+    add-batch / update accept it (with sane type validation), and the field
+    survives the strip-payload discipline on /list.
+    """
+
+    def setUp(self):
+        # Fresh DB per test.
+        self.db_path = os.path.join(_tmpdir, "test_wt.sqlite3")
+        if os.path.exists(self.db_path):
+            os.remove(self.db_path)
+        from comfyui_scheduled_queue import database as db_mod
+        from comfyui_scheduled_queue import routes
+        self._db_mod = db_mod
+        self._routes = routes
+        self.db = db_mod.ScheduledQueueDB(db_path=self.db_path)
+        self.app = {"sq_db": self.db}
+
+    def tearDown(self):
+        self.db.close()
+        if os.path.exists(self.db_path):
+            os.remove(self.db_path)
+
+    # ---- /add -----------------------------------------------------------
+
+    def test_add_accepts_workflow_title(self):
+        resp = _run(self._routes.add_handler(_StubRequest(
+            app=self.app,
+            json_body={
+                "payload": {"x": 1},
+                "scheduled_at": 100.0,
+                "workflow_title": "My Workflow",
+            },
+        )))
+        self.assertEqual(resp.status, 201)
+        jid = json.loads(resp.body)["id"]
+        # Stored in DB and readable.
+        self.assertEqual(self.db.get_job(jid)["workflow_title"], "My Workflow")
+
+    def test_add_without_workflow_title_defaults_blank(self):
+        # No workflow_title in body -> stored as blank, not crashing.
+        resp = _run(self._routes.add_handler(_StubRequest(
+            app=self.app,
+            json_body={"payload": {"x": 1}, "scheduled_at": 100.0},
+        )))
+        self.assertEqual(resp.status, 201)
+        jid = json.loads(resp.body)["id"]
+        self.assertFalse(self.db.get_job(jid)["workflow_title"])
+
+    def test_add_rejects_non_string_workflow_title(self):
+        resp = _run(self._routes.add_handler(_StubRequest(
+            app=self.app,
+            json_body={
+                "payload": {"x": 1},
+                "scheduled_at": 100.0,
+                "workflow_title": 12345,  # int, not str
+            },
+        )))
+        self.assertEqual(resp.status, 400)
+        self.assertIn("workflow_title", json.loads(resp.body)["error"])
+
+    def test_add_allows_null_workflow_title(self):
+        # Explicit null is acceptable; DB layer normalises to nil.
+        resp = _run(self._routes.add_handler(_StubRequest(
+            app=self.app,
+            json_body={
+                "payload": {"x": 1},
+                "scheduled_at": 100.0,
+                "workflow_title": None,
+            },
+        )))
+        self.assertEqual(resp.status, 201)
+        jid = json.loads(resp.body)["id"]
+        self.assertFalse(self.db.get_job(jid)["workflow_title"])
+
+    # ---- /list ----------------------------------------------------------
+
+    def test_list_exposes_workflow_title_without_payload(self):
+        # Add three jobs with different titles.
+        a_body = {"payload": {"x": 1}, "scheduled_at": 100.0,
+                  "workflow_title": "Alpha"}
+        b_body = {"payload": {"x": 2}, "scheduled_at": 200.0}
+        c_body = {"payload": {"x": 3}, "scheduled_at": 300.0,
+                  "workflow_title": ""}
+        for body in (a_body, b_body, c_body):
+            r = _run(self._routes.add_handler(_StubRequest(
+                app=self.app, json_body=body,
+            )))
+            self.assertEqual(r.status, 201)
+
+        resp = _run(self._routes.list_handler(_StubRequest(app=self.app)))
+        self.assertEqual(resp.status, 200)
+        body = json.loads(resp.body)
+        # Each row carries workflow_title (or blank) but never the heavy payload.
+        titles = sorted(
+            (j.get("workflow_title") or "") for j in body["jobs"]
+        )
+        self.assertEqual(titles, ["", "", "Alpha"])
+        # payload is stripped on /list — proves no accidental leak.
+        for j in body["jobs"]:
+            self.assertNotIn("payload", j)
+
+    def test_list_does_not_strip_workflow_title(self):
+        # Defensive: confirm the strip helper does not touch the new column.
+        self.db.add_job(payload={"x": 1}, scheduled_at=100.0,
+                        workflow_title="survives-strip")
+        resp = _run(self._routes.list_handler(_StubRequest(app=self.app)))
+        self.assertEqual(resp.status, 200)
+        job = json.loads(resp.body)["jobs"][0]
+        self.assertEqual(job["workflow_title"], "survives-strip")
+
+    # ---- /job/{id} ------------------------------------------------------
+
+    def test_get_job_with_outputs_exposes_workflow_title(self):
+        # Live row path.
+        r = _run(self._routes.add_handler(_StubRequest(
+            app=self.app,
+            json_body={
+                "payload": {"k": "v"},
+                "scheduled_at": 100.0,
+                "workflow_title": "Detail Title",
+            },
+        )))
+        jid = json.loads(r.body)["id"]
+
+        resp = _run(self._routes.job_detail_handler(_StubRequest(
+            app=self.app, match_info={"job_id": jid},
+        )))
+        self.assertEqual(resp.status, 200)
+        body = json.loads(resp.body)
+        self.assertEqual(body["workflow_title"], "Detail Title")
+
+    def test_get_job_with_outputs_history_exposes_workflow_title(self):
+        # History row path: after mark_done the live row moves to job_history
+        # but the title must follow.
+        r = _run(self._routes.add_handler(_StubRequest(
+            app=self.app,
+            json_body={
+                "payload": {"k": "v"},
+                "scheduled_at": 100.0,
+                "workflow_title": "History Title",
+            },
+        )))
+        jid = json.loads(r.body)["id"]
+        self.db.update_job(jid, status="running", prompt_id="p")
+        self.db.mark_done(jid, prompt_id="p", outputs={"x": 1})
+
+        resp = _run(self._routes.job_detail_handler(_StubRequest(
+            app=self.app, match_info={"job_id": jid},
+        )))
+        self.assertEqual(resp.status, 200)
+        body = json.loads(resp.body)
+        self.assertEqual(body["workflow_title"], "History Title")
+
+    # ---- /update -------------------------------------------------------
+
+    def test_update_accepts_workflow_title(self):
+        r = _run(self._routes.add_handler(_StubRequest(
+            app=self.app,
+            json_body={
+                "payload": {"x": 1},
+                "scheduled_at": 100.0,
+                "workflow_title": "Original",
+            },
+        )))
+        jid = json.loads(r.body)["id"]
+
+        resp = _run(self._routes.update_handler(_StubRequest(
+            app=self.app,
+            match_info={"job_id": jid},
+            json_body={"workflow_title": "Renamed"},
+        )))
+        self.assertEqual(resp.status, 200)
+        body = json.loads(resp.body)
+        self.assertIn("workflow_title", body["updated_fields"])
+        self.assertEqual(self.db.get_job(jid)["workflow_title"], "Renamed")
+
+    def test_update_clears_workflow_title_with_null(self):
+        r = _run(self._routes.add_handler(_StubRequest(
+            app=self.app,
+            json_body={
+                "payload": {"x": 1},
+                "scheduled_at": 100.0,
+                "workflow_title": "Will be cleared",
+            },
+        )))
+        jid = json.loads(r.body)["id"]
+
+        resp = _run(self._routes.update_handler(_StubRequest(
+            app=self.app,
+            match_info={"job_id": jid},
+            json_body={"workflow_title": None},
+        )))
+        self.assertEqual(resp.status, 200)
+        self.assertFalse(self.db.get_job(jid)["workflow_title"])
+
+    def test_update_rejects_non_string_workflow_title(self):
+        r = _run(self._routes.add_handler(_StubRequest(
+            app=self.app,
+            json_body={"payload": {"x": 1}, "scheduled_at": 100.0},
+        )))
+        jid = json.loads(r.body)["id"]
+
+        resp = _run(self._routes.update_handler(_StubRequest(
+            app=self.app,
+            match_info={"job_id": jid},
+            json_body={"workflow_title": ["list", "not", "allowed"]},
+        )))
+        self.assertEqual(resp.status, 400)
+        self.assertIn("workflow_title", json.loads(resp.body)["error"])
+
+    def test_update_workflow_title_alongside_other_fields(self):
+        # Sanity: workflow_title is whitelisted, so it should pass the
+        # unknown-field guard together with note.
+        r = _run(self._routes.add_handler(_StubRequest(
+            app=self.app,
+            json_body={"payload": {"x": 1}, "scheduled_at": 100.0},
+        )))
+        jid = json.loads(r.body)["id"]
+
+        resp = _run(self._routes.update_handler(_StubRequest(
+            app=self.app,
+            match_info={"job_id": jid},
+            json_body={"workflow_title": "Combo", "note": "tag"},
+        )))
+        self.assertEqual(resp.status, 200)
+        updated = json.loads(resp.body)["updated_fields"]
+        self.assertIn("workflow_title", updated)
+        self.assertIn("note", updated)
+
+    # ---- /add-batch ----------------------------------------------------
+
+    def test_add_batch_per_item_workflow_title(self):
+        items = [
+            {"payload": {"i": 0}, "scheduled_at": 100.0, "workflow_title": "Zero"},
+            {"payload": {"i": 1}, "scheduled_at": 200.0, "workflow_title": "One"},
+            {"payload": {"i": 2}, "scheduled_at": 300.0},  # no title
+        ]
+        resp = _run(self._routes.add_batch_handler(_StubRequest(
+            app=self.app, json_body={"items": items},
+        )))
+        self.assertEqual(resp.status, 201)
+        body = json.loads(resp.body)
+        self.assertEqual(body["count"], 3)
+
+        rows = self.db.list_jobs_paginated(["scheduled"], limit=10, offset=0)
+        titles = sorted((r.get("workflow_title") or "") for r in rows)
+        self.assertEqual(titles, ["", "One", "Zero"])
+
+    def test_add_batch_skips_item_with_invalid_workflow_title(self):
+        # Per-item validation: a bad workflow_title in one item must not
+        # poison the rest of the batch.
+        items = [
+            {"payload": {"i": 0}, "scheduled_at": 100.0, "workflow_title": 99},
+            {"payload": {"i": 1}, "scheduled_at": 200.0, "workflow_title": "OK"},
+        ]
+        resp = _run(self._routes.add_batch_handler(_StubRequest(
+            app=self.app, json_body={"items": items},
+        )))
+        # Whole batch still succeeds; the bad item is silently skipped
+        # (spec: a single bad item must not fail the batch).
+        self.assertEqual(resp.status, 201)
+        body = json.loads(resp.body)
+        self.assertEqual(body["count"], 1)
+        # Only the valid item is in the DB.
+        rows = self.db.list_jobs()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["workflow_title"], "OK")
+
+    # ---- /repeat -------------------------------------------------------
+
+    def test_repeat_carries_workflow_title_from_source(self):
+        # History path: finish a job then repeat it.
+        r = _run(self._routes.add_handler(_StubRequest(
+            app=self.app,
+            json_body={
+                "payload": {"x": 1},
+                "scheduled_at": 100.0,
+                "workflow_title": "Repeat Me",
+            },
+        )))
+        src_id = json.loads(r.body)["id"]
+        self.db.update_job(src_id, status="running", prompt_id="p")
+        self.db.mark_done(src_id, prompt_id="p", outputs={"i": ["x.png"]})
+
+        resp = _run(self._routes.repeat_handler(_StubRequest(
+            app=self.app, match_info={"job_id": src_id},
+        )))
+        self.assertEqual(resp.status, 201)
+        body = json.loads(resp.body)
+        new_id = body["id"]
+        self.assertEqual(self.db.get_job(new_id)["workflow_title"], "Repeat Me")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -45,11 +45,13 @@ class ScheduledQueueDB:
               scheduled_at REAL NOT NULL, created_at REAL NOT NULL,
               dispatched_at REAL, finished_at REAL, status TEXT NOT NULL DEFAULT 'scheduled',
               error TEXT, retry_count INTEGER NOT NULL DEFAULT 0,
-              auto_retry INTEGER NOT NULL DEFAULT 0, queue_order INTEGER
+              auto_retry INTEGER NOT NULL DEFAULT 0, queue_order INTEGER,
+              workflow_title TEXT
             );
             CREATE TABLE IF NOT EXISTS job_history (
               id TEXT PRIMARY KEY, prompt_id TEXT, finished_at REAL NOT NULL,
-              status TEXT NOT NULL, outputs TEXT, error TEXT, payload TEXT
+              status TEXT NOT NULL, outputs TEXT, error TEXT, payload TEXT,
+              workflow_title TEXT
             );
             CREATE TABLE IF NOT EXISTS scheduler_state (key TEXT PRIMARY KEY, value TEXT NOT NULL);
             CREATE INDEX IF NOT EXISTS idx_sq_due ON scheduled_jobs(status, scheduled_at);
@@ -58,21 +60,34 @@ class ScheduledQueueDB:
             if "queue_order" not in cols:
                 self._conn.execute("ALTER TABLE scheduled_jobs ADD COLUMN queue_order INTEGER")
             self._conn.execute("UPDATE scheduled_jobs SET queue_order=rowid*1000 WHERE queue_order IS NULL")
+            # v0.3.10: track the ComfyUI workflow filename alongside every job so
+            # the sidebar can show "which workflow" without re-fetching payload.
+            # Older DBs need an ALTER. Stays NULL / empty for legacy rows.
+            if "workflow_title" not in cols:
+                self._conn.execute("ALTER TABLE scheduled_jobs ADD COLUMN workflow_title TEXT")
             # job_history gained a `payload` column in v0.3.8 so finished jobs
             # can be re-submitted via repeat_job. Older DBs need a migration.
             hcols = {r[1] for r in self._conn.execute("PRAGMA table_info(job_history)")}
             if "payload" not in hcols:
                 self._conn.execute("ALTER TABLE job_history ADD COLUMN payload TEXT")
+            # Mirror workflow_title on the history row so sidebar lists still
+            # display "which workflow" after the live row is archived.
+            if "workflow_title" not in hcols:
+                self._conn.execute("ALTER TABLE job_history ADD COLUMN workflow_title TEXT")
             if self.get_state("paused") is None: self.set_state("paused", "1")
 
-    def add_job(self, payload, scheduled_at, priority=100, note=None, client_id=None, auto_retry=0):
+    def add_job(self, payload, scheduled_at, priority=100, note=None, client_id=None, auto_retry=0, workflow_title=None):
         jid = str(uuid.uuid4()); now = time.time()
         row = self._conn.execute("SELECT COALESCE(MAX(queue_order),0)+1000 FROM scheduled_jobs WHERE status IN ('scheduled','interrupted')").fetchone()
         order = int(row[0] or 1000)
+        # Normalise: empty string == "no title" == NULL. Storing NULL keeps the
+        # column tidy for legacy rows and lets the sidebar fall back to the
+        # node-derived nickname / note when no filename is known.
+        wtitle = workflow_title if isinstance(workflow_title, str) and workflow_title else None
         with self._conn:
             self._conn.execute("""INSERT INTO scheduled_jobs
-              (id,payload,client_id,note,priority,scheduled_at,created_at,status,auto_retry,queue_order)
-              VALUES (?,?,?,?,?,?,?,'scheduled',?,?)""", (jid,json.dumps(payload,ensure_ascii=False,separators=(",",":")),client_id,note,int(priority),float(scheduled_at),now,int(auto_retry),order))
+              (id,payload,client_id,note,priority,scheduled_at,created_at,status,auto_retry,queue_order,workflow_title)
+              VALUES (?,?,?,?,?,?,?,'scheduled',?,?,?)""", (jid,json.dumps(payload,ensure_ascii=False,separators=(",",":")),client_id,note,int(priority),float(scheduled_at),now,int(auto_retry),order,wtitle))
         return jid
 
     def get_job(self, job_id): return _dict(self._conn.execute("SELECT * FROM scheduled_jobs WHERE id=?",(job_id,)).fetchone())
@@ -239,19 +254,25 @@ class ScheduledQueueDB:
 
         Returns the new job's id, or None if no source job (history or live)
         carries a payload we can copy.
+
+        ``workflow_title`` is propagated from the source row (history or live)
+        so the new entry keeps the sidebar's "which workflow" association.
         """
         src = self._conn.execute(
-            "SELECT payload FROM job_history WHERE id=?", (job_id,),
+            "SELECT payload, workflow_title FROM job_history WHERE id=?", (job_id,),
         ).fetchone()
+        wtitle = None
         if src is None:
             live = self._conn.execute(
-                "SELECT payload FROM scheduled_jobs WHERE id=?", (job_id,),
+                "SELECT payload, workflow_title FROM scheduled_jobs WHERE id=?", (job_id,),
             ).fetchone()
             if live is None or not live["payload"]:
                 return None
             payload = json.loads(live["payload"])
+            wtitle = live["workflow_title"]
         else:
             payload = json.loads(src["payload"]) if src["payload"] else None
+            wtitle = src["workflow_title"]
         if payload is None:
             return None
         return self.add_job(
@@ -259,13 +280,21 @@ class ScheduledQueueDB:
             scheduled_at=time.time() if scheduled_at is None else float(scheduled_at),
             priority=int(priority),
             note=f"repeat of {job_id[:8]}",
+            workflow_title=wtitle,
         )
 
     def update_job(self, job_id, **fields):
-        allowed={"status","prompt_id","client_id","note","priority","scheduled_at","dispatched_at","finished_at","error","retry_count","auto_retry","queue_order"}
+        allowed={"status","prompt_id","client_id","note","priority","scheduled_at","dispatched_at","finished_at","error","retry_count","auto_retry","queue_order","workflow_title"}
         if "payload" in fields: raise ValueError("payload cannot be updated")
         bad=set(fields)-allowed
         if bad: raise ValueError(f"unknown fields: {sorted(bad)}")
+        # Normalise empty-string workflow_title to NULL to keep the column tidy.
+        if "workflow_title" in fields:
+            v = fields["workflow_title"]
+            if v is None:
+                fields["workflow_title"] = None
+            elif isinstance(v, str) and v == "":
+                fields["workflow_title"] = None
         if not fields:return False
         with self._conn:
             cur=self._conn.execute("UPDATE scheduled_jobs SET "+", ".join(f"{k}=?" for k in fields)+" WHERE id=?",(*fields.values(),job_id))
@@ -322,9 +351,9 @@ class ScheduledQueueDB:
     def _finish(self, job_id, status, prompt_id=None, outputs=None, error=None):
         now=time.time()
         with self._conn:
-            r=self._conn.execute("SELECT prompt_id,payload FROM scheduled_jobs WHERE id=?",(job_id,)).fetchone()
+            r=self._conn.execute("SELECT prompt_id,payload,workflow_title FROM scheduled_jobs WHERE id=?",(job_id,)).fetchone()
             if not r:return False
-            self._conn.execute("INSERT OR REPLACE INTO job_history(id,prompt_id,finished_at,status,outputs,error,payload) VALUES(?,?,?,?,?,?,?)",(job_id,prompt_id or r[0],now,status,json.dumps(outputs,ensure_ascii=False,separators=(",",":")) if outputs is not None else None,error,r['payload']))
+            self._conn.execute("INSERT OR REPLACE INTO job_history(id,prompt_id,finished_at,status,outputs,error,payload,workflow_title) VALUES(?,?,?,?,?,?,?,?)",(job_id,prompt_id or r[0],now,status,json.dumps(outputs,ensure_ascii=False,separators=(",",":")) if outputs is not None else None,error,r['payload'],r['workflow_title']))
             self._conn.execute("DELETE FROM scheduled_jobs WHERE id=?",(job_id,))
         return True
     def mark_done(self,job_id,prompt_id=None,outputs=None): return self._finish(job_id,'done',prompt_id,outputs)

@@ -49,6 +49,9 @@ function buildPanel() {
             <p style="margin:0;font-size:11px;color:#888;">
                 Managed by ScheduledQueue (not ComfyUI native queue).
             </p>
+            <p style="margin:4px 0 0 0;font-size:10px;color:#666;font-style:italic;line-height:1.4;">
+                Workflow title = current <code style="font-size:10px;color:#888;">app.graph.activeWorkflow.filename</code> from ComfyUI Pinia store.
+            </p>
         </div>
 
         <div data-role="status-tabs" style="display:flex;gap:2px;margin-bottom:6px;flex-wrap:wrap;align-items:center;">
@@ -283,6 +286,76 @@ function buildPanel() {
         pauseResumeBtn.style.background = status.paused ? "#2d8f3e" : "#666";
     }
 
+    // Format a duration in seconds as a short human-readable string.
+    //   < 60s  -> "Ns"
+    //   < 1h   -> "Nm Ks" (omits K when K is 0)
+    //   >= 1h  -> "Nh Mm" (omits M when M is 0)
+    // Returns "—" for null/undefined/NaN/negative inputs.
+    function formatDuration(secs) {
+        if (secs == null || !Number.isFinite(secs) || secs < 0) return "—";
+        const s = Math.floor(secs);
+        if (s < 60) return `${s}s`;
+        const m = Math.floor(s / 60);
+        const rs = s % 60;
+        if (m < 60) return rs > 0 ? `${m}m ${rs}s` : `${m}m`;
+        const h = Math.floor(m / 60);
+        const rm = m % 60;
+        return rm > 0 ? `${h}h ${rm}m` : `${h}h`;
+    }
+
+    // Format a unix-seconds timestamp as a delta from now, e.g.
+    // "in 0:54:00" (h:mm:ss under a day) or "in 12h 5m".
+    // Returns "—" for invalid inputs and "now" if delta is <2s.
+    function formatTimeUntil(ts) {
+        if (ts == null || !Number.isFinite(ts)) return "—";
+        const delta = ts - Math.floor(Date.now() / 1000);
+        if (Math.abs(delta) < 2) return "now";
+        if (delta >= 0) {
+            // Future: h:mm:ss for sub-day, otherwise "Nh Mm"
+            const s = delta;
+            if (s < 86400) {
+                const h = Math.floor(s / 3600);
+                const m = Math.floor((s % 3600) / 60);
+                const ss = s % 60;
+                return `in ${h}:${String(m).padStart(2, "0")}:${String(ss).padStart(2, "0")}`;
+            }
+            const h = Math.floor(s / 3600);
+            const m = Math.floor((s % 3600) / 60);
+            return m > 0 ? `in ${h}h ${m}m` : `in ${h}h`;
+        }
+        // Past: same shape but "ago"
+        const s = -delta;
+        if (s < 86400) {
+            const h = Math.floor(s / 3600);
+            const m = Math.floor((s % 3600) / 60);
+            const ss = s % 60;
+            return `${h}:${String(m).padStart(2, "0")}:${String(ss).padStart(2, "0")} ago`;
+        }
+        const h = Math.floor(s / 3600);
+        const m = Math.floor((s % 3600) / 60);
+        return m > 0 ? `${h}h ${m}m ago` : `${h}h ago`;
+    }
+
+    // Resolve the row title with the documented precedence:
+    //   workflow_title (sent at Schedule submit time, captured from
+    //     app.extensionManager.workflow.activeWorkflow.filename) →
+    //   nickname (computed from the saved SaveImage _meta.title via
+    //     resolveJobTitle, applied async below) →
+    //   note (free-form user note from the dialog) →
+    //   "untitled" (last-resort).
+    // Note: the async hydration below writes the nickname into this same
+    // slot once it resolves, so we always start with whichever fallback is
+    // known synchronously.
+    function pickRowTitle(j) {
+        if (j && typeof j.workflow_title === "string" && j.workflow_title.trim()) {
+            return { text: j.workflow_title.trim(), tooltip: j.workflow_title.trim() };
+        }
+        if (j && typeof j.note === "string" && j.note.trim()) {
+            return { text: j.note.trim(), tooltip: j.note.trim() };
+        }
+        return { text: "untitled", tooltip: "" };
+    }
+
     function renderJobs(jobs) {
         const allJobs = jobs.jobs || [];
         const pendingJobs = allJobs.filter(j => j.status === "scheduled" || j.status === "interrupted");
@@ -304,7 +377,6 @@ function buildPanel() {
             done: "#888", failed: "#f44", cancelled: "#666",
         };
         jobsEl.innerHTML = visibleJobs.map((j, idx) => {
-            const ts = new Date(j.scheduled_at * 1000).toLocaleTimeString();
             const col = colors[j.status] || "#888";
             const actionable = j.status === "scheduled" || j.status === "interrupted";
             const queueIdx = pendingJobs.findIndex(p => p.id === j.id);
@@ -316,14 +388,50 @@ function buildPanel() {
             const thumbHtml = j.status === "done"
                 ? `<div data-role="thumb-slot" data-job-id="${escapeHtml(j.id)}" style="margin-top:4px;width:60px;height:60px;background:#333;border-radius:3px;display:flex;align-items:center;justify-content:center;color:#666;font-size:10px;">…</div>`
                 : "";
+            // Row title (workflow_title || note || "untitled"); the async
+            // hydration below overwrites the span text with the computed
+            // nickname when one resolves AND no workflow_title is present.
+            const rowTitle = pickRowTitle(j);
+            // Status badge text: human-readable Chinese for the four
+            // terminal states, English otherwise.
+            const statusBadgeText = ({
+                failed: "失败",
+                done: "成功",
+                running: "运行中",
+                cancelled: "已取消",
+                scheduled: "等待中",
+                interrupted: "已中断",
+            })[j.status] || j.status;
+            // Duration row: finished_at - dispatched_at for terminal jobs,
+            // "running Nm Ks" if still running, "—" if neither is set.
+            let durationText;
+            if (j.finished_at && j.dispatched_at) {
+                durationText = `${formatDuration(j.finished_at - j.dispatched_at)}`;
+            } else if (j.status === "running") {
+                durationText = `running`;
+            } else {
+                durationText = "—";
+            }
+            const finishedLabel = j.status === "failed" ? "失败于"
+                : j.status === "done" ? "完成于"
+                : j.status === "cancelled" ? "取消于"
+                : j.status === "running" ? "运行"
+                : j.status === "interrupted" ? "中断于"
+                : "调度";
             return `<div data-job-id="${j.id}" style="padding:6px;margin-bottom:4px;background:#252525;border-radius:3px;border-left:3px solid ${col};">
                 <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:4px;">
                     <div style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1;min-width:0;">
-                        <div data-role="job-title">
-                            <span data-role="job-nickname" data-job-id="${escapeHtml(j.id)}" title="${escapeHtml(j.note || "")}">${escapeHtml(j.note) || "untitled"}</span>
-                            <span style="opacity:.6;font-size:10px;margin-left:6px;">(${escapeHtml(shortId)})</span>
+                        <div data-role="job-title" style="display:flex;justify-content:space-between;align-items:baseline;gap:6px;">
+                            <span data-role="job-nickname" data-job-id="${escapeHtml(j.id)}" title="${escapeHtml(rowTitle.tooltip)}" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1;min-width:0;">${escapeHtml(rowTitle.text)}</span>
+                            <span style="opacity:.6;font-size:10px;flex-shrink:0;">(${escapeHtml(shortId)})</span>
                         </div>
-                        <div style="font-size:10px;color:#888;margin-top:2px;">[${j.status}] • pri=${j.priority}</div>
+                        <div style="font-size:10px;color:#aaa;margin-top:3px;display:flex;flex-wrap:wrap;gap:6px;align-items:center;">
+                            <span data-role="job-status" style="padding:1px 5px;background:${col};color:#000;border-radius:2px;font-weight:600;">${escapeHtml(statusBadgeText)}</span>
+                            <span style="color:#888;">${escapeHtml(formatTimeUntil(j.scheduled_at))}</span>
+                        </div>
+                        <div style="font-size:10px;color:#888;margin-top:2px;">
+                            ${finishedLabel} ${escapeHtml(durationText)}
+                        </div>
                     </div>
                     <div data-actions="${j.id}" style="display:flex;gap:2px;flex-shrink:0;margin-left:4px;">
                         ${actionable ? `<button data-act="up" title="Move up (higher priority)" ${isFirst ? "disabled style=\"padding:2px 6px;background:#222;color:#555;border:none;border-radius:3px;font-size:11px;cursor:not-allowed;\"" : "style=\"padding:2px 6px;background:#3a3;color:#fff;border:none;border-radius:3px;font-size:11px;cursor:pointer;\""}>↑</button><button data-act="down" title="Move down (lower priority)" ${isLast ? "disabled style=\"padding:2px 6px;background:#222;color:#555;border:none;border-radius:3px;font-size:11px;cursor:not-allowed;\"" : "style=\"padding:2px 6px;background:#3a3;color:#fff;border:none;border-radius:3px;font-size:11px;cursor:pointer;\""}>↓</button>` : ""}
@@ -334,7 +442,7 @@ function buildPanel() {
                     </div>
                 </div>
                 ${thumbHtml}
-                <div style="font-size:10px;color:#666;margin-top:2px;">@ ${ts}${j.error ? " • " + escapeHtml(j.error) : ""}</div>
+                ${j.error ? `<div style="font-size:10px;color:#f88;margin-top:2px;">⚠ ${escapeHtml(j.error)}</div>` : ""}
             </div>`;
         }).join("");
 
@@ -827,6 +935,18 @@ function openScheduleDialog() {
         const countRaw = parseInt(dlg.querySelector('[data-role="count"]').value, 10);
         const count = Number.isFinite(countRaw) ? Math.max(1, Math.min(50, countRaw)) : 1;
 
+        // Capture the current workflow's filename from the ComfyUI Pinia
+        // store before serializing. The backend stores this verbatim on
+        // every created job (as workflow_title) so the sidebar can label
+        // rows with the user-visible workflow name instead of just a UUID.
+        // Guarded because the extensionManager/activeWorkflow wiring differs
+        // across ComfyUI versions; any failure here must NOT block submission.
+        let workflowTitle = "";
+        try {
+            const aw = app.extensionManager?.workflow?.activeWorkflow;
+            if (aw) workflowTitle = aw.filename || aw.fullFilename || "";
+        } catch (_e) { /* ignore -- empty title is fine */ }
+
         if (!scheduledAt || scheduledAt <= Math.floor(Date.now() / 1000)) {
             alert("Scheduled time must be in the future.");
             return;
@@ -867,6 +987,7 @@ function openScheduleDialog() {
                             scheduled_at: scheduledAt,
                             priority,
                             note,
+                            workflow_title: workflowTitle,
                         }),
                     });
                 } else {
@@ -878,6 +999,7 @@ function openScheduleDialog() {
                         scheduled_at: scheduledAt,
                         priority,
                         note,
+                        workflow_title: workflowTitle,
                     }));
                     resp = await fetch("/api/schedule/add-batch", {
                         method: "POST",

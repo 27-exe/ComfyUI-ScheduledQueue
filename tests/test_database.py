@@ -328,5 +328,196 @@ class TestStage3Pagination(unittest.TestCase):
         self.assertIsNone(self.db.repeat_job("not-a-real-id"))
 
 
+# ---------------------------------------------------------------------------
+# v0.3.10: workflow_title field tests.
+# ---------------------------------------------------------------------------
+
+class TestWorkflowTitle(unittest.TestCase):
+    """Cover the optional ``workflow_title`` column added in v0.3.10.
+
+    The field stores the ComfyUI workflow filename that was active when the
+    job was queued, so the sidebar can label rows without re-fetching payload.
+    Backend behaviour is intentionally minimal: accept a string (or NULL),
+    persist it, surface it on read endpoints, propagate through repeat_job,
+    and migrate legacy DBs that predate the column.
+    """
+
+    def setUp(self):
+        self.db, self.path = _fresh_db()
+
+    def tearDown(self):
+        self.db.close()
+        try:
+            os.unlink(self.path)
+        except OSError:
+            pass
+
+    def test_default_workflow_title_is_none(self):
+        jid = self.db.add_job(payload={"a": 1}, scheduled_at=10.0)
+        row = self.db.get_job(jid)
+        # Either NULL or empty string is acceptable as "no title".
+        self.assertFalse(row["workflow_title"], f"expected blank, got {row['workflow_title']!r}")
+
+    def test_workflow_title_round_trips(self):
+        jid = self.db.add_job(
+            payload={"a": 1}, scheduled_at=10.0,
+            workflow_title="SD工作流 无强化",
+        )
+        row = self.db.get_job(jid)
+        self.assertEqual(row["workflow_title"], "SD工作流 无强化")
+
+    def test_empty_workflow_title_normalised_to_null(self):
+        # Some savers emit "" to mean "no title" -- treat identically to None.
+        jid = self.db.add_job(payload={}, scheduled_at=10.0, workflow_title="")
+        row = self.db.get_job(jid)
+        self.assertFalse(row["workflow_title"])
+
+    def test_non_string_workflow_title_rejected(self):
+        # Defensive: numbers / dicts are never valid titles. Database layer
+        # coerces to None when not a string (so add_job never crashes), but
+        # the routes layer is the primary gate -- this test just locks the
+        # current "coerce to None" behaviour.
+        jid = self.db.add_job(payload={}, scheduled_at=10.0, workflow_title=12345)
+        row = self.db.get_job(jid)
+        self.assertFalse(row["workflow_title"])
+
+    def test_list_jobs_exposes_workflow_title(self):
+        a = self.db.add_job(payload={}, scheduled_at=10.0, workflow_title="alpha")
+        b = self.db.add_job(payload={}, scheduled_at=20.0, workflow_title="beta")
+        c = self.db.add_job(payload={}, scheduled_at=30.0, note="legacy")
+        rows = self.db.list_jobs()
+        titles = {r["id"]: r.get("workflow_title") for r in rows}
+        self.assertEqual(titles[a], "alpha")
+        self.assertEqual(titles[b], "beta")
+        self.assertFalse(titles[c])
+
+    def test_list_jobs_paginated_exposes_workflow_title(self):
+        # Same as above but via the paginated helper used by /list.
+        jid = self.db.add_job(payload={}, scheduled_at=10.0, workflow_title="page-test")
+        page = self.db.list_jobs_paginated(["scheduled"], limit=10, offset=0)
+        self.assertEqual(len(page), 1)
+        self.assertEqual(page[0]["workflow_title"], "page-test")
+
+    def test_get_job_with_outputs_live_exposes_workflow_title(self):
+        jid = self.db.add_job(payload={"k": "v"}, scheduled_at=10.0,
+                              workflow_title="live-title")
+        row = self.db.get_job_with_outputs(jid)
+        self.assertIsNotNone(row)
+        assert row is not None  # type narrowing
+        self.assertEqual(row["workflow_title"], "live-title")
+        self.assertEqual(row["payload"], {"k": "v"})
+
+    def test_workflow_title_propagates_to_history_on_mark_done(self):
+        # When a live job finishes, its workflow_title must move to
+        # job_history so the sidebar can still label it.
+        jid = self.db.add_job(payload={"k": "v"}, scheduled_at=10.0,
+                              workflow_title="to-be-done")
+        self.db.update_job(jid, status="running", prompt_id="p-1")
+        self.db.mark_done(jid, prompt_id="p-1", outputs={"images": ["a.png"]})
+        # live row is gone
+        self.assertIsNone(self.db.get_job(jid))
+        # history row carries the title
+        hist = self.db.list_history()
+        self.assertEqual(len(hist), 1)
+        self.assertEqual(hist[0]["workflow_title"], "to-be-done")
+
+    def test_workflow_title_propagates_to_history_on_mark_failed(self):
+        jid = self.db.add_job(payload={}, scheduled_at=10.0,
+                              workflow_title="will-fail")
+        self.db.update_job(jid, status="running", prompt_id="p-2")
+        self.db.mark_failed(jid, error="boom")
+        hist = self.db.list_history()
+        self.assertEqual(len(hist), 1)
+        self.assertEqual(hist[0]["workflow_title"], "will-fail")
+
+    def test_workflow_title_propagates_through_repeat_from_history(self):
+        # The common case: re-run a finished job. workflow_title must follow.
+        src = self.db.add_job(payload={"x": 1}, scheduled_at=10.0,
+                              workflow_title="My Workflow")
+        self.db.update_job(src, status="running", prompt_id="p-r")
+        self.db.mark_done(src, prompt_id="p-r", outputs={"i": ["o.png"]})
+
+        new_id = self.db.repeat_job(src)
+        self.assertIsNotNone(new_id)
+        assert new_id is not None
+        new_row = self.db.get_job(new_id)
+        self.assertIsNotNone(new_row)
+        assert new_row is not None
+        self.assertEqual(new_row["workflow_title"], "My Workflow")
+
+    def test_workflow_title_propagates_through_repeat_from_live(self):
+        # Edge case: re-running a job that is still scheduled. The live row
+        # already has workflow_title, repeat_job must copy it forward.
+        src = self.db.add_job(payload={"x": 2}, scheduled_at=10.0,
+                              workflow_title="Live Title")
+        new_id = self.db.repeat_job(src)
+        self.assertIsNotNone(new_id)
+        assert new_id is not None
+        new_row = self.db.get_job(new_id)
+        self.assertIsNotNone(new_row)
+        assert new_row is not None
+        self.assertEqual(new_row["workflow_title"], "Live Title")
+
+    def test_update_job_accepts_workflow_title(self):
+        jid = self.db.add_job(payload={}, scheduled_at=10.0,
+                              workflow_title="original")
+        # Replace the title via update_job.
+        self.db.update_job(jid, workflow_title="renamed")
+        self.assertEqual(self.db.get_job(jid)["workflow_title"], "renamed")
+        # None clears it.
+        self.db.update_job(jid, workflow_title=None)
+        self.assertFalse(self.db.get_job(jid)["workflow_title"])
+        # Empty string normalises to NULL.
+        self.db.update_job(jid, workflow_title="")
+        self.assertFalse(self.db.get_job(jid)["workflow_title"])
+
+    def test_update_job_still_rejects_unknown_fields(self):
+        # Sanity: adding workflow_title to the whitelist must not weaken
+        # the existing unknown-field guard.
+        jid = self.db.add_job(payload={}, scheduled_at=10.0)
+        with self.assertRaises(ValueError):
+            self.db.update_job(jid, payload={"x": 1})
+        with self.assertRaises(ValueError):
+            self.db.update_job(jid, garbage=1)
+
+    def test_migration_adds_workflow_title_to_legacy_db(self):
+        # Simulate a v0.3.9-era DB (no workflow_title column) and verify the
+        # ALTER TABLE migration runs cleanly on first connect.
+        legacy = database.ScheduledQueueDB(db_path=self.path)
+        try:
+            # The column shouldn't exist on a fresh legacy DB because we
+            # never wrote one. But our CREATE TABLE in __init__ already
+            # includes workflow_title in fresh DBs. So instead, simulate a
+            # legacy DB by recreating the schema without the column.
+            legacy._conn.executescript("""
+                DROP TABLE scheduled_jobs;
+                CREATE TABLE scheduled_jobs (
+                  id TEXT PRIMARY KEY, prompt_id TEXT, payload TEXT NOT NULL,
+                  client_id TEXT, note TEXT, priority INTEGER NOT NULL DEFAULT 100,
+                  scheduled_at REAL NOT NULL, created_at REAL NOT NULL,
+                  dispatched_at REAL, finished_at REAL, status TEXT NOT NULL DEFAULT 'scheduled',
+                  error TEXT, retry_count INTEGER NOT NULL DEFAULT 0,
+                  auto_retry INTEGER NOT NULL DEFAULT 0, queue_order INTEGER
+                );
+            """)
+            legacy._conn.commit()
+            legacy.close()
+
+            # Re-open with our patched code; migration should ALTER TABLE.
+            legacy2 = database.ScheduledQueueDB(db_path=self.path)
+            try:
+                cols = {r[1] for r in legacy2._conn.execute(
+                    "PRAGMA table_info(scheduled_jobs)"
+                ).fetchall()}
+                self.assertIn("workflow_title", cols)
+            finally:
+                legacy2.close()
+        finally:
+            try:
+                legacy.close()
+            except Exception:
+                pass
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

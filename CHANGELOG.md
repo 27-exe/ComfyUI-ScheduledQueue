@@ -4,6 +4,41 @@ All notable changes to **ComfyUI-ScheduledQueue** are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.3.10] - 2026-08-23
+
+### Added (workflow title tracking)
+
+- **Database**: new `workflow_title TEXT` column on both `scheduled_jobs`
+  and `job_history` (idempotent ALTER for live upgrades from 0.3.9).
+- **Database**: `add_job`, `update_job`, `_finish` (`mark_done` /
+  `mark_failed`), and `repeat_job` accept / propagate the field. Empty
+  string is normalised to NULL.
+- **Routes**: `add`, `add-batch`, `update` accept `workflow_title` (string
+  or null; other types → 400). `list_jobs` and `get_job_with_outputs`
+  return the field for sidebar rendering.
+- **Schedule dialog**: on submit, reads the active workflow title from
+  ComfyUI's Pinia store via `app.extensionManager.workflow.activeWorkflow`
+  (fields tried: `filename` → `fullFilename`) and forwards it to the
+  POST body so the server can store it next to the payload.
+- **Sidebar job row title**: now picks `workflow_title` first, then
+  `note`, then `"untitled"`. Old nickname path (async hydrated from
+  `getNodeTitle`) still runs but only overwrites if `workflow_title` is
+  empty.
+- **Sidebar header note**: small annotation pointing the workflow title
+  source at ComfyUI's `app.graph.activeWorkflow.filename` for users
+  reading the source.
+
+### Tests
+- 14 new database tests (`TestWorkflowTitle`).
+- 15 new routes tests (add / add-batch / update / list / get_job /
+  repeat).
+- Full suite: **133 / 133 pass** (was 104).
+
+### Known limitation
+- `workflow_title` will read `"Unsaved Workflow"` whenever the user
+  submits a Schedule before ComfyUI's "Save As…" dialog has given the
+  workflow a real filename. That matches ComfyUI's own display.
+
 ## [0.3.9] - 2026-08-23
 
 ### Fixed (live bugs reported after 0.3.8 push)
