@@ -845,7 +845,7 @@ function openScheduleDialog() {
     }
 
     dlg.innerHTML = `
-        <div style="background:#1e1e1e;color:#ccc;padding:20px;border-radius:8px;width:380px;box-shadow:0 8px 32px rgba(0,0,0,0.5);">
+        <div style="background:#1e1e1e;color:#ccc;padding:20px;border-radius:8px;width:480px;box-shadow:0 8px 32px rgba(0,0,0,0.5);">
             <h3 style="margin:0 0 12px 0;color:#fff;font-size:15px;">Schedule current workflow</h3>
 
             <div style="margin-bottom:10px;">
@@ -853,21 +853,28 @@ function openScheduleDialog() {
                 <div style="display:flex;flex-wrap:wrap;gap:4px;margin-bottom:6px;">
                     ${presets.map((p, i) => `<button data-preset="${i}" style="padding:4px 8px;background:#333;color:#fff;border:none;border-radius:3px;cursor:pointer;font-size:11px;">${p.label}</button>`).join("")}
                 </div>
-                <div data-role="when-row" style="display:grid;grid-template-columns:auto 1fr auto;gap:6px;align-items:center;margin-top:6px;">
-                    <div data-role="when-dec" style="display:flex;gap:2px;">
-                        <button type="button" data-delta="-3600" style="padding:4px 6px;background:#333;color:#fff;border:none;border-radius:3px;cursor:pointer;font-size:11px;">-1h</button>
-                        <button type="button" data-delta="-600" style="padding:4px 6px;background:#333;color:#fff;border:none;border-radius:3px;cursor:pointer;font-size:11px;">-10m</button>
-                        <button type="button" data-delta="-60" style="padding:4px 6px;background:#333;color:#fff;border:none;border-radius:3px;cursor:pointer;font-size:11px;">-1m</button>
-                        <button type="button" data-delta="-10" style="padding:4px 6px;background:#333;color:#fff;border:none;border-radius:3px;cursor:pointer;font-size:11px;">-10s</button>
-                        <button type="button" data-delta="-5" style="padding:4px 6px;background:#333;color:#fff;border:none;border-radius:3px;cursor:pointer;font-size:11px;">-5s</button>
+                <!-- Two-row layout so the time input gets the full row width and is
+                     never squeezed by 5 +/- buttons on either side. Row 1: -buttons
+                     left-aligned + display input flex:1. Row 2: +buttons right-aligned. -->
+                <div data-role="when-row" style="display:flex;flex-direction:column;gap:4px;margin-top:6px;">
+                    <div style="display:flex;gap:2px;align-items:center;">
+                        <div data-role="when-dec" style="display:flex;gap:2px;">
+                            <button type="button" data-delta="-3600" style="padding:4px 6px;background:#333;color:#fff;border:none;border-radius:3px;cursor:pointer;font-size:11px;">-1h</button>
+                            <button type="button" data-delta="-600" style="padding:4px 6px;background:#333;color:#fff;border:none;border-radius:3px;cursor:pointer;font-size:11px;">-10m</button>
+                            <button type="button" data-delta="-60" style="padding:4px 6px;background:#333;color:#fff;border:none;border-radius:3px;cursor:pointer;font-size:11px;">-1m</button>
+                            <button type="button" data-delta="-10" style="padding:4px 6px;background:#333;color:#fff;border:none;border-radius:3px;cursor:pointer;font-size:11px;">-10s</button>
+                            <button type="button" data-delta="-5" style="padding:4px 6px;background:#333;color:#fff;border:none;border-radius:3px;cursor:pointer;font-size:11px;">-5s</button>
+                        </div>
+                        <input data-role="when-display" placeholder="2026-08-22 22:30:00" style="flex:1;min-width:0;padding:6px;background:#252525;color:#fff;border:1px solid #444;border-radius:3px;font-family:monospace;text-align:center;" value="${formatWhen(currentWhenTs)}" />
                     </div>
-                    <input data-role="when-display" placeholder="2026-08-22 22:30:00" style="width:100%;padding:6px;background:#252525;color:#fff;border:1px solid #444;border-radius:3px;font-family:monospace;text-align:center;" value="${formatWhen(currentWhenTs)}" />
-                    <div data-role="when-inc" style="display:flex;gap:2px;">
-                        <button type="button" data-delta="5" style="padding:4px 6px;background:#333;color:#fff;border:none;border-radius:3px;cursor:pointer;font-size:11px;">+5s</button>
-                        <button type="button" data-delta="10" style="padding:4px 6px;background:#333;color:#fff;border:none;border-radius:3px;cursor:pointer;font-size:11px;">+10s</button>
-                        <button type="button" data-delta="60" style="padding:4px 6px;background:#333;color:#fff;border:none;border-radius:3px;cursor:pointer;font-size:11px;">+1m</button>
-                        <button type="button" data-delta="600" style="padding:4px 6px;background:#333;color:#fff;border:none;border-radius:3px;cursor:pointer;font-size:11px;">+10m</button>
-                        <button type="button" data-delta="3600" style="padding:4px 6px;background:#333;color:#fff;border:none;border-radius:3px;cursor:pointer;font-size:11px;">+1h</button>
+                    <div style="display:flex;gap:2px;justify-content:flex-end;">
+                        <div data-role="when-inc" style="display:flex;gap:2px;">
+                            <button type="button" data-delta="5" style="padding:4px 6px;background:#333;color:#fff;border:none;border-radius:3px;cursor:pointer;font-size:11px;">+5s</button>
+                            <button type="button" data-delta="10" style="padding:4px 6px;background:#333;color:#fff;border:none;border-radius:3px;cursor:pointer;font-size:11px;">+10s</button>
+                            <button type="button" data-delta="60" style="padding:4px 6px;background:#333;color:#fff;border:none;border-radius:3px;cursor:pointer;font-size:11px;">+1m</button>
+                            <button type="button" data-delta="600" style="padding:4px 6px;background:#333;color:#fff;border:none;border-radius:3px;cursor:pointer;font-size:11px;">+10m</button>
+                            <button type="button" data-delta="3600" style="padding:4px 6px;background:#333;color:#fff;border:none;border-radius:3px;cursor:pointer;font-size:11px;">+1h</button>
+                        </div>
                     </div>
                 </div>
                 <!-- Hidden unix-seconds input: source of truth at submit time. -->
@@ -1048,10 +1055,26 @@ function openScheduleDialog() {
     // Push currentWhenTs out to both the visible input and the hidden
     // unix-seconds input. Centralised so preset clicks, +/- buttons, and
     // programmatic edits all converge on the same render path.
+    // Brief highlight (green tint) on the time input after a +/- or preset click.
+    // The value changes silently otherwise, which is invisible to users; this
+    // gives immediate visual confirmation. We restore the original background
+    // (#252525) instead of clearing to "" so the input never flashes white.
+    function flashWhenDisplay() {
+        whenDisplay.style.background = "#0a4d2a";
+        whenDisplay.style.transition = "background 0.05s linear";
+        if (flashWhenDisplay._t) clearTimeout(flashWhenDisplay._t);
+        flashWhenDisplay._t = setTimeout(() => {
+            whenDisplay.style.background = "#252525";
+            flashWhenDisplay._t = null;
+        }, 150);
+    }
+
     function refreshWhenDisplay() {
         whenDisplay.value = formatWhen(currentWhenTs);
         whenDisplay.style.borderColor = "";
         whenHidden.value = String(currentWhenTs);
+        console.log("[ScheduledQueue] refreshWhenDisplay -> currentWhenTs=" + currentWhenTs
+            + " (" + whenDisplay.value + ")");
     }
 
     // +/- buttons: each click adds its data-delta (seconds) to currentWhenTs.
@@ -1063,6 +1086,7 @@ function openScheduleDialog() {
             if (!Number.isFinite(delta)) return;
             currentWhenTs += delta;
             refreshWhenDisplay();
+            flashWhenDisplay();
         });
     });
 
@@ -1087,6 +1111,7 @@ function openScheduleDialog() {
             const p = presets[idx];
             currentWhenTs = p.absolute !== undefined ? p.absolute : (now + p.offset);
             refreshWhenDisplay();
+            flashWhenDisplay();
             dlg.querySelectorAll('[data-preset]').forEach((b) => {
                 b.style.background = "#333";
                 b.style.color = "#fff";
