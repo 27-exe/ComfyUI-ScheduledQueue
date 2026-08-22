@@ -1,5 +1,13 @@
 # ComfyUI-ScheduledQueue
 
+**Status: under development.** 本插件仍在快速迭代中 — 浏览器侧边栏 UI 在
+ComfyUI 1.49.6 前端下存在已知的切换冲突与控件缺失,排序/刷新反馈也还在打磨。
+API (`/api/schedule/*`) 与 CLI (`comfy-schedule`) 工作正常,但 Web 端不推荐
+日常使用。生产环境请先用 CLI/curl 直到 0.4.0 修复 UI 行为。仓库已开放,欢迎
+试用 + 反馈,但请勿将其作为唯一队列管理路径。
+
+---
+
 持久化 + 暂停 + 重排序 + 任意时间定时投递的 ComfyUI 队列扩展。
 
 > **Beta:** read [Compatibility](#compatibility) before installing. The
@@ -43,6 +51,18 @@ PrimeVue + pinia layout. There are no third-party Python dependencies
 (the scheduler uses `urllib.request` from the standard library).
 
 ## Installation
+
+## Install
+
+> Paths below use placeholders. Set them before running:
+>
+> | placeholder | meaning |
+> |---|---|
+> | `$COMFYUI` | Your ComfyUI checkout directory (the parent of `custom_nodes/` and `user/`) |
+>
+> Common values: `/opt/ComfyUI`, `/srv/ComfyUI`, `~/projects/ComfyUI`. The
+> plugin makes **no assumptions** about where ComfyUI lives — only that
+> `custom_nodes/` and `user/` exist under that directory.
 
 ```bash
 # 1) clone

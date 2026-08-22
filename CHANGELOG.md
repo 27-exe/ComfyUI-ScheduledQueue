@@ -4,6 +4,25 @@ All notable changes to **ComfyUI-ScheduledQueue** are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.3.1] - 2026-08-22
+
+### Known issues (read before installing)
+- Sidebar UI panel does not reliably switch back to the native “Node
+  library” tab once the ScheduledQueue tab is open: the framework keeps
+  showing our panel and ignores clicks on the native tabs.
+- The global Pause/Resume control is missing from the sidebar toolbar;
+  use the CLI (`comfy-schedule pause` / `resume`) or the HTTP API
+  (`/api/schedule/pause-all` / `/resume-all`) in the meantime.
+- Submitted jobs require a manual Refresh click before they appear in the
+  sidebar list. Auto-refresh interval exists but can lag behind submit.
+- The ▲/▼ reorder buttons do not yet persist the new order to the
+  server-side `queue_order`; rows visually swap but reload the old order.
+
+### Added
+- README banner explicitly marking the project as **under development**.
+- Documented UI limitations and CLI/HTTP workarounds so early users do
+  not rely on the sidebar panel as the only control surface.
+
 ## [0.3.0] - 2026-08-22
 
 ### Added
