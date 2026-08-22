@@ -413,5 +413,68 @@ class TestSchedulerHookWithUIFormat(unittest.TestCase):
         self.assertNotIn("control_after_generate", out["28"]["inputs"])
 
 
+# ---------------------------------------------------------------------------
+# Regression coverage for the control_after_generate sentinel pipeline.
+#
+# These two tests pin down the user-visible bug we just fixed: when a UI
+# workflow is dispatched through the pre-dispatch hook, every "randomize"
+# sentinel on every seed-bearing node must (1) really mutate the seed via
+# secrets.randbelow, and (2) be stripped so the payload ComfyUI sees is
+# indistinguishable from one Queue Prompt would have produced.
+# ---------------------------------------------------------------------------
+
+class TestRandomizeEndToEnd(unittest.TestCase):
+    """Full-pipeline regression: real user workflow → convert → hook."""
+
+    def test_user_workflow_hook_yields_large_random_seed_and_strips_cag(self):
+        """Feeding the user's actual 83-node UI workflow through the hook
+        must produce a ``KSampler.inputs.seed`` that has been re-rolled into
+        a 64-bit random range and must not carry ``control_after_generate``
+        any more (the hook strips it after consuming the directive)."""
+        wf = json.loads((FIXTURES / "sd_workflow_no_enhance.json").read_text())
+        out = scheduler._apply_pre_dispatch_hooks(wf)
+
+        ks = out["28"]
+        self.assertEqual(ks["class_type"], "KSampler")
+        seed = ks["inputs"]["seed"]
+        # randomize path: int, not str; within [_SEED_MIN, _SEED_MAX]
+        self.assertIsInstance(seed, int)
+        # Frontend widget range is 0..2**64-1 (= 18446744073709551615).
+        self.assertGreaterEqual(seed, 0)
+        self.assertLessEqual(seed, 0xFFFFFFFFFFFFFFFF)
+        # And it must differ from the saved seed (the whole point of the fix).
+        self.assertNotEqual(seed, 458839675645881)
+        # Sentinel must be gone -- ComfyUI's /prompt would 400 on it.
+        self.assertNotIn("control_after_generate", ks["inputs"])
+
+    def test_two_hook_runs_yield_different_seeds(self):
+        """``randomize`` must use a fresh draw each dispatch, otherwise ComfyUI's
+        execution cache will hit on the second run and return stale output.
+
+        Two independent conversions of the same workflow, both run through
+        the hook, must produce different KSampler seeds with overwhelming
+        probability (collision chance is ~2**-64 per pair)."""
+        with open(FIXTURES / "sd_workflow_no_enhance.json") as fh:
+            wf_src = fh.read()
+        wf1 = json.loads(wf_src)
+        wf2 = json.loads(wf_src)
+
+        out1 = scheduler._apply_pre_dispatch_hooks(wf1)
+        out2 = scheduler._apply_pre_dispatch_hooks(wf2)
+
+        seed1 = out1["28"]["inputs"]["seed"]
+        seed2 = out2["28"]["inputs"]["seed"]
+        self.assertNotEqual(
+            seed1, seed2,
+            f"randomize produced identical seeds across runs ({seed1}); "
+            f"the hook is not actually re-rolling via secrets.randbelow",
+        )
+        # Both are in-range ints.
+        for s in (seed1, seed2):
+            self.assertIsInstance(s, int)
+            self.assertGreaterEqual(s, 0)
+            self.assertLessEqual(s, 0xFFFFFFFFFFFFFFFF)
+
+
 if __name__ == "__main__":
     unittest.main()

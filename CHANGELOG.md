@@ -4,6 +4,56 @@ All notable changes to **ComfyUI-ScheduledQueue** are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.3.6] - 2026-08-22
+
+### Fixed (plugin silently failed to load in ComfyUI's importlib context)
+
+Two follow-on bugs revealed once the dispatch path was wired together
+end-to-end against a real running ComfyUI 0.33.0 (frontend 1.49.6):
+
+- **scheduler.py raised `ModuleNotFoundError: No module named
+  'ComfyUI-ScheduledQueue'` at module load.** ComfyUI loads custom
+  nodes via `importlib.util.spec_from_file_location(..., name="...
+  -ScheduledQueue.scheduler", ...)`. A plain
+  `from .workflow_format import ...` then asks Python to look up the
+  parent package `ComfyUI-ScheduledQueue` plus child
+  `workflow_format` in `sys.modules` — but only `scheduler` itself
+  was registered there, so the relative import failed. `__init__`'s
+  `_load_sibling` swallowed the error and `setup_routes` was never
+  called, so every `/api/schedule/*` route returned 404/405 plain-text
+  responses (and the dialog submit surfaced as `Network error:
+  Unexpected non-whitespace character after JSON at position 3`).
+
+  Fix: scheduler.py now mirrors `__init__._load_sibling` and uses
+  `importlib.util.spec_from_file_location` to self-load
+  `workflow_format.py` into `sys.modules` under the expected dotted
+  name before binding the symbols. Works both in production (where
+  ComfyUI drives the loader) and in the unit-test context (where
+  `sys.path.insert(0, 'src')` resolves them via the package).
+
+- **`convert_ui_to_api` could silently drop the
+  `control_after_generate` sentinel** when the schema-driven
+  positional-fallback path resolved the value to whatever schema
+  key sat at that index (`steps`, `cfg`, etc.). `widgets_values_named`
+  paths were already correct, but any workflow that relied on the
+  fallback could land in a state where the hook could not see the
+  sentinel and thus could not randomise `seed`. Added a defensive
+  coercion that writes `inputs["control_after_generate"]` whenever a
+  widget value matches `{fixed, randomize, increment, decrement,
+  increment-wrap}`.
+
+### Tests
+
+- New `test_user_workflow_hook_yields_large_random_seed_and_strips_cag`
+  feeds the user's real 83-node workflow through the hook and asserts
+  KSampler 28's seed becomes a 64-bit integer different from the
+  saved `458839675645881`, with `control_after_generate` removed from
+  inputs.
+- New `test_two_hook_runs_yield_different_seeds` runs the hook twice
+  on independent copies and asserts the seeds differ — guards against
+  any future regression where the hook returns early.
+- Full suite: **84 / 84 pass** (was 82).
+
 ## [0.3.5] - 2026-08-22
 
 ### Fixed (plugin ignored UI-format workflows → cache hit on every dispatch)

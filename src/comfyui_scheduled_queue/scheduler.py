@@ -2,16 +2,47 @@
 from __future__ import annotations
 
 import copy
+import importlib.util as _il_util
 import json
 import logging
+import os as _os
 import secrets
+import sys as _sys
 import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 
-from .workflow_format import convert_ui_to_api, is_api_format
+# ComfyUI loads custom_nodes via ``importlib.util.spec_from_file_location``
+# using the parent package name ``ComfyUI-ScheduledQueue`` as the module's
+# dotted parent. A relative ``from .workflow_format import ...`` then resolves
+# to ``ComfyUI-ScheduledQueue.workflow_format`` -- but workflow_format was
+# never registered in ``sys.modules`` (only ``scheduler`` was), so the import
+# raises ``ModuleNotFoundError`` and ComfyUI's ``_load_sibling`` swallows the
+# failure, never installing our routes.
+#
+# Mirror the loader pattern used by ``__init__._load_sibling`` and explicitly
+# self-load ``workflow_format`` into ``sys.modules`` under the same dotted name
+# before importing its symbols. This keeps scheduler.py import-safe both when
+# executed as a sibling file (production / ComfyUI) and as part of a real
+# package (tests with ``sys.path.insert(0, 'src')``).
+_wf_spec = _il_util.spec_from_file_location(
+    "ComfyUI-ScheduledQueue.workflow_format",
+    _os.path.join(_os.path.dirname(__file__), "workflow_format.py"),
+)
+if _wf_spec is None or _wf_spec.loader is None:
+    raise ImportError(
+        "[ScheduledQueue] cannot self-load workflow_format.py"
+    )
+_wf_mod = _il_util.module_from_spec(_wf_spec)
+_sys.modules.setdefault(
+    "ComfyUI-ScheduledQueue.workflow_format", _wf_mod
+)
+_wf_spec.loader.exec_module(_wf_mod)
+convert_ui_to_api = _wf_mod.convert_ui_to_api
+is_api_format = _wf_mod.is_api_format
+del _il_util, _os, _sys, _wf_spec, _wf_mod
 
 log = logging.getLogger(__name__)
 

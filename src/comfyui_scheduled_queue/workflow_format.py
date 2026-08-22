@@ -53,6 +53,19 @@ from typing import Any
 log = logging.getLogger(__name__)
 
 
+# Recognised sentinel strings the ComfyUI frontend uses for its
+# ``control_after_generate`` widget option. Listed exhaustively so the
+# defensive coercion in ``_build_node_inputs`` (positional fallback path)
+# can recognise the directive whatever the saver emitted.
+_CONTROL_AFTER_GENERATE_SENTINELS = frozenset({
+    "fixed",
+    "randomize",
+    "increment",
+    "decrement",
+    "increment-wrap",
+})
+
+
 # ---------------------------------------------------------------------------
 # Public entry points
 # ---------------------------------------------------------------------------
@@ -209,6 +222,22 @@ def _build_node_inputs(node: dict, link_map: dict[int, tuple[int, int]]) -> dict
                     break
                 name = widget_names_fallback[idx]
                 if name in inputs:
+                    continue
+                # Defensive coercion: if a saver drops ``control_after_generate``
+                # from ``widgets_values_named`` -- or the node schema we
+                # recovered doesn't mention it -- but the positional value at
+                # this slot is a recognised sentinel string, route it onto the
+                # well-known ``control_after_generate`` input name so the
+                # pre-dispatch hook can still see it. The hook is the single
+                # interpreter of this input; without the rename the sentinel
+                # would land on whatever the schema declared (often ``steps`` or
+                # ``cfg``) and silently corrupt that field.
+                if (
+                    isinstance(value, str)
+                    and value in _CONTROL_AFTER_GENERATE_SENTINELS
+                    and name != "control_after_generate"
+                ):
+                    inputs.setdefault("control_after_generate", value)
                     continue
                 inputs[name] = value
         else:
