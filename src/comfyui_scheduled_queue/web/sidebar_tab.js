@@ -853,22 +853,22 @@ function openScheduleDialog() {
                 <div style="display:flex;flex-wrap:wrap;gap:4px;margin-bottom:6px;">
                     ${presets.map((p, i) => `<button data-preset="${i}" style="padding:4px 8px;background:#333;color:#fff;border:none;border-radius:3px;cursor:pointer;font-size:11px;">${p.label}</button>`).join("")}
                 </div>
-                <!-- Two-row layout so the time input gets the full row width and is
-                     never squeezed by 5 +/- buttons on either side. Row 1: -buttons
-                     left-aligned + display input flex:1. Row 2: +buttons right-aligned. -->
-                <div data-role="when-row" style="display:flex;flex-direction:column;gap:4px;margin-top:6px;">
+                <!-- Two-row layout: input fills middle width, +/- button groups sit
+                     right-aligned in both rows so the eye reads a single vertical
+                     button column on the right edge. -->
+                <div data-role="when-row" style="display:flex;flex-direction:column;gap:4px;margin-top:6px;align-items:stretch;">
                     <div style="display:flex;gap:2px;align-items:center;">
-                        <div data-role="when-dec" style="display:flex;gap:2px;">
+                        <input data-role="when-display" placeholder="2026-08-22 22:30:00" style="flex:1;min-width:0;padding:6px;background:#252525;color:#fff;border:1px solid #444;border-radius:3px;font-family:monospace;text-align:center;" value="${formatWhen(currentWhenTs)}" />
+                        <div data-role="when-dec" style="display:flex;gap:2px;justify-content:flex-end;">
                             <button type="button" data-delta="-3600" style="padding:4px 6px;background:#333;color:#fff;border:none;border-radius:3px;cursor:pointer;font-size:11px;">-1h</button>
                             <button type="button" data-delta="-600" style="padding:4px 6px;background:#333;color:#fff;border:none;border-radius:3px;cursor:pointer;font-size:11px;">-10m</button>
                             <button type="button" data-delta="-60" style="padding:4px 6px;background:#333;color:#fff;border:none;border-radius:3px;cursor:pointer;font-size:11px;">-1m</button>
                             <button type="button" data-delta="-10" style="padding:4px 6px;background:#333;color:#fff;border:none;border-radius:3px;cursor:pointer;font-size:11px;">-10s</button>
                             <button type="button" data-delta="-5" style="padding:4px 6px;background:#333;color:#fff;border:none;border-radius:3px;cursor:pointer;font-size:11px;">-5s</button>
                         </div>
-                        <input data-role="when-display" placeholder="2026-08-22 22:30:00" style="flex:1;min-width:0;padding:6px;background:#252525;color:#fff;border:1px solid #444;border-radius:3px;font-family:monospace;text-align:center;" value="${formatWhen(currentWhenTs)}" />
                     </div>
                     <div style="display:flex;gap:2px;justify-content:flex-end;">
-                        <div data-role="when-inc" style="display:flex;gap:2px;">
+                        <div data-role="when-inc" style="display:flex;gap:2px;justify-content:flex-end;">
                             <button type="button" data-delta="5" style="padding:4px 6px;background:#333;color:#fff;border:none;border-radius:3px;cursor:pointer;font-size:11px;">+5s</button>
                             <button type="button" data-delta="10" style="padding:4px 6px;background:#333;color:#fff;border:none;border-radius:3px;cursor:pointer;font-size:11px;">+10s</button>
                             <button type="button" data-delta="60" style="padding:4px 6px;background:#333;color:#fff;border:none;border-radius:3px;cursor:pointer;font-size:11px;">+1m</button>
@@ -1059,8 +1059,12 @@ function openScheduleDialog() {
     // The value changes silently otherwise, which is invisible to users; this
     // gives immediate visual confirmation. We restore the original background
     // (#252525) instead of clearing to "" so the input never flashes white.
-    function flashWhenDisplay() {
-        whenDisplay.style.background = "#0a4d2a";
+    // Briefly tint the time-display background so the user sees that a click
+    // actually took effect. Defaults to green for preset clicks; the +/- delta
+    // handler passes blue when shrinking time and green when extending it,
+    // so the sign of the change is communicated without text labels.
+    function flashWhenDisplay(color = "#0a4d2a") {
+        whenDisplay.style.background = color;
         whenDisplay.style.transition = "background 0.05s linear";
         if (flashWhenDisplay._t) clearTimeout(flashWhenDisplay._t);
         flashWhenDisplay._t = setTimeout(() => {
@@ -1086,7 +1090,9 @@ function openScheduleDialog() {
             if (!Number.isFinite(delta)) return;
             currentWhenTs += delta;
             refreshWhenDisplay();
-            flashWhenDisplay();
+            // Green = time moves forward (button adds seconds).
+            // Blue  = time moves backward (button subtracts seconds).
+            flashWhenDisplay(delta > 0 ? "#0a4d2a" : "#0a4068");
         });
     });
 
