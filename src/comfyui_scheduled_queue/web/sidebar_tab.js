@@ -27,8 +27,11 @@ const EXT_NAME = "ComfyUI.ScheduledQueue";
 const TAB_ID = "scheduled-queue";
 
 // ============================================================
-// Sidebar panel -- mount/unmount driven by $subscribe only
-// ============================================================
+// Sidebar panel -- framework-managed render lifecycle.
+// registerSidebarTab's render(container) is called ONCE per tab activation
+// in 1.49.6; switching to another tab and back does NOT re-invoke render.
+// To stay correct across tab switches we listen to the sidebarTab store
+// and clear/replace the container ourselves on every activeId change.
 
 // Each call to buildPanel creates a fresh root element. The framework
 // re-runs render(container) on every tab activation, and on remount we
@@ -37,6 +40,7 @@ const TAB_ID = "scheduled-queue";
 // framework unmounted the tab.
 function buildPanel() {
     const root = document.createElement("div");
+    root.dataset.sqRoot = "1";
     root.style.cssText = "padding:12px;font-family:system-ui,sans-serif;color:#ccc;background:#1a1a1a;height:100%;box-sizing:border-box;overflow-y:auto;";
 
     root.innerHTML = `
@@ -47,7 +51,7 @@ function buildPanel() {
             </p>
         </div>
 
-        <div data-role="actions" style="margin-bottom:10px;display:grid;grid-template-columns:1fr 1fr;gap:4px;">
+        <div data-role="actions" data-actions="__header__" style="margin-bottom:10px;display:grid;grid-template-columns:1fr 1fr;gap:4px;">
             <button data-act="refresh" style="padding:6px 8px;background:#0078d4;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:11px;">Refresh</button>
             <button data-act="pause-resume" style="padding:6px 8px;background:#444;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:11px;">Pause</button>
         </div>
@@ -192,28 +196,22 @@ function buildPanel() {
             } else if (act === "run-now") {
                 await callApi(`/run-now/${encodeURIComponent(id)}`, { method: "POST" });
             } else if (act === "up" || act === "down") {
-                const delta = act === "up" ? 10 : -10;
-                const r = await fetch(`/api/schedule/list?limit=200`);
-                const { jobs } = await r.json();
-                const idx = jobs.findIndex(j => j.id === id);
-                if (idx === -1) return;
-                const target = jobs[idx + (act === "up" ? -1 : 1)];
-                if (!target) return;
-                // Swap priorities between this job and its neighbour.
-                const a = jobs[idx].priority;
-                const b = target.priority;
-                await Promise.all([
-                    callApi(`/update/${encodeURIComponent(id)}`, {
+                // Swap with neighbour via the dedicated reorder endpoint,
+                // which persists queue_order. Refreshing then re-renders
+                // jobs in the new order.
+                const direction = act === "up" ? -1 : 1;
+                const r = await callApi(
+                    `/reorder/${encodeURIComponent(id)}`,
+                    {
                         method: "POST",
                         headers: { "Content-Type": "application/json" },
-                        body: JSON.stringify({ priority: b }),
-                    }),
-                    callApi(`/update/${encodeURIComponent(target.id)}`, {
-                        method: "POST",
-                        headers: { "Content-Type": "application/json" },
-                        body: JSON.stringify({ priority: a }),
-                    }),
-                ]);
+                        body: JSON.stringify({ direction }),
+                    }
+                );
+                if (!r.moved) {
+                    // No-op (already at edge or job not pending). Refresh
+                    // anyway so the disabled state matches reality.
+                }
             }
         } catch (err) {
             statusEl.innerHTML = `<div style="color:#f44;">Action failed: ${escapeHtml(err.message)}</div>`;
@@ -360,6 +358,15 @@ function openScheduleDialog() {
             }
             console.log("[ScheduledQueue] Added job:", data);
             closeDialog();
+            // Ask any open sidebar panel to refresh so the new job shows up
+            // immediately, without waiting for the next 5 s poll.
+            window.dispatchEvent(new CustomEvent("sq:job-added"));
+            try {
+                const r = await fetch("/api/schedule/status");
+                const s = await r.json();
+                document.querySelectorAll('[data-sq-root] [data-act="refresh"]')
+                    .forEach((b) => b.click());
+            } catch (_e) { /* best-effort */ }
         } catch (err) {
             alert("Network error: " + err.message);
         }
@@ -403,9 +410,11 @@ app.registerExtension({
     ],
 });
 
-// Sidebar tab (must call sidebarTab store directly -- registerExtension does
-// not auto-handle the `sidebarTab` field). Framework calls render(container)
-// every time the tab becomes active; it owns mount/unmount lifecycle.
+// Sidebar tab. The 1.49.6 framework calls render(container) ONCE per tab
+// activation -- switching to another tab and back does NOT re-invoke it.
+// We render once, then keep the container in sync with the sidebarTab
+// store via $subscribe so the panel swaps correctly when the user
+// toggles tabs.
 app.extensionManager.registerSidebarTab({
     id: TAB_ID,
     title: "Scheduled Queue",
@@ -417,9 +426,36 @@ app.extensionManager.registerSidebarTab({
         container.innerHTML = "";
         container.appendChild(p);
         if (typeof p.refresh === "function") p.refresh();
+        // Install watcher AFTER first mount so we can also clean up the
+        // container when the user navigates away.
+        installSidebarWatcher(container);
         return p;
     },
 });
+
+// Keep the container we were given in sync with activeSidebarTabId.
+let _sidebarWatcher = null;
+function installSidebarWatcher(container) {
+    if (_sidebarWatcher) return; // already installed
+    const sb = window.app.extensionManager.sidebarTab;
+    if (!sb || typeof sb.$subscribe !== "function") return;
+    const apply = () => {
+        const activeId = sb.activeSidebarTabId;
+        if (activeId !== TAB_ID && container.firstChild) {
+            // Active tab is something else: clear our content so the
+            // framework's native panel is free to render.
+            container.innerHTML = "";
+        } else if (activeId === TAB_ID && !container.firstChild) {
+            // Active tab is ours but content missing: re-mount.
+            const p = buildPanel();
+            container.appendChild(p);
+            if (typeof p.refresh === "function") p.refresh();
+        }
+    };
+    sb.$subscribe(() => apply());
+    _sidebarWatcher = { sb, apply };
+    apply();
+}
 
 // Start watching after a tick so the pinia store is fully initialized.
 // (Removed: manual $subscribe-based mounting is no longer needed -- the

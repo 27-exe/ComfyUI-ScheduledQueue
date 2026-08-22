@@ -69,23 +69,54 @@ _STATUS_COUNT_KEYS = (
 
 def _bad_request(reason: str):
     """Lazy-import web so the module is importable without aiohttp at parse time."""
-    from aiohttp import web
-    return web.json_response({"error": reason}, status=400)
+    try:
+        from aiohttp import web
+        return web.json_response({"error": reason}, status=400)
+    except Exception:
+        return _StubResponse({"error": reason}, 400)
 
 
 def _not_found(reason: str = "job not found"):
-    from aiohttp import web
-    return web.json_response({"error": reason}, status=404)
+    try:
+        from aiohttp import web
+        return web.json_response({"error": reason}, status=404)
+    except Exception:
+        return _StubResponse({"error": reason}, 404)
 
 
 def _server_error(reason: str = "internal error"):
-    from aiohttp import web
-    return web.json_response({"error": reason}, status=500)
+    try:
+        from aiohttp import web
+        return web.json_response({"error": reason}, status=500)
+    except Exception:
+        return _StubResponse({"error": reason}, 500)
 
 
 def _json_response(data: Any, status: int = 200):
-    from aiohttp import web
-    return web.json_response(data, status=status)
+    try:
+        from aiohttp import web
+        return web.json_response(data, status=status)
+    except Exception:
+        return _StubResponse(data, status)
+
+
+class _StubResponse:
+    """Drop-in replacement for aiohttp.web.Response used only when
+    aiohttp isn't installed (e.g. unit tests). The handler tests poke
+    .status and .body directly without going through aiohttp."""
+
+    def __init__(self, data: Any, status: int = 200):
+        self.status = status
+        if isinstance(data, (bytes, bytearray)):
+            self.body = bytes(data)
+        elif isinstance(data, str):
+            self.body = data.encode()
+        else:
+            self.body = json.dumps(data, ensure_ascii=False).encode()
+        self._data = data
+
+    def __repr__(self) -> str:
+        return f"_StubResponse(status={self.status}, body={self.body[:80]!r})"
 
 
 def _parse_int(value: str | None, default: int, *, field: str) -> int:
@@ -331,6 +362,49 @@ async def update_handler(request) -> "web.Response":  # type: ignore[name-define
     })
 
 
+async def reorder_handler(request) -> "web.Response":  # type: ignore[name-defined]
+    """POST /api/schedule/reorder/{job_id}
+
+    Body: ``{"direction": -1 | 1}``.
+    Swaps the job's ``queue_order`` with its pending neighbour. No-op
+    (200 with ``"moved": false``) when the job is at the edge or not in a
+    pending state. 404 if the job doesn't exist.
+    """
+    db = request.app.get("sq_db")
+    if db is None:
+        return _server_error("db not initialized")
+
+    job_id = request.match_info.get("job_id", "").strip()
+    if not job_id:
+        return _bad_request("job_id is required")
+
+    try:
+        body = await request.json()
+    except Exception:
+        return _bad_request("body must be valid JSON")
+    if not isinstance(body, dict):
+        return _bad_request("body must be a JSON object")
+
+    direction = body.get("direction")
+    if not isinstance(direction, int) or isinstance(direction, bool):
+        return _bad_request("direction must be an integer")
+    if direction not in (-1, 1):
+        return _bad_request("direction must be -1 or 1")
+
+    if db.get_job(job_id) is None:
+        return _not_found("job not found")
+
+    try:
+        moved = db.reorder_job(job_id, direction)
+    except ValueError as e:
+        return _bad_request(str(e))
+    except Exception:
+        _log.exception("reorder_job failed")
+        return _server_error("database error")
+
+    return _json_response({"id": job_id, "direction": direction, "moved": moved})
+
+
 async def status_handler(request) -> "web.Response":  # type: ignore[name-defined]
     """GET /api/schedule/status
 
@@ -345,6 +419,9 @@ async def status_handler(request) -> "web.Response":  # type: ignore[name-define
     try:
         last_dispatch_raw = db.get_state("last_dispatch_at")
         last_error = db.get_state("last_error")
+        paused_raw = db.get_state("paused")
+        # Default to "1" (paused) when never set; treat any non-"0" as paused.
+        paused = paused_raw != "0"
 
         # Parse last_dispatch_at as float if present.
         last_dispatch_at: float | None
@@ -376,8 +453,7 @@ async def status_handler(request) -> "web.Response":  # type: ignore[name-define
         return _server_error("database error")
 
     return _json_response({
-        # Stage 1: always True because no scheduler thread runs yet.
-        "paused": True,
+        "paused": paused,
         "last_dispatch_at": last_dispatch_at,
         "last_error": last_error,
         "counts": counts,
@@ -609,6 +685,7 @@ def setup_routes(db, interceptor=None) -> None:
     app.router.add_post("/api/schedule/add", add_handler)
     app.router.add_post("/api/schedule/cancel/{job_id}", cancel_handler)
     app.router.add_post("/api/schedule/update/{job_id}", update_handler)
+    app.router.add_post("/api/schedule/reorder/{job_id}", reorder_handler)
     app.router.add_get("/api/schedule/status", status_handler)
 
     # Stage 2 additions (spec section 3) — appended, never reorder stage-1.
@@ -624,6 +701,7 @@ __all__ = [
     "add_handler",
     "cancel_handler",
     "update_handler",
+    "reorder_handler",
     "status_handler",
     "pause_all_handler",
     "resume_all_handler",

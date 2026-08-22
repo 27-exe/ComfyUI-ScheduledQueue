@@ -1,10 +1,14 @@
 # ComfyUI-ScheduledQueue
 
-**Status: under development.** 本插件仍在快速迭代中 — 浏览器侧边栏 UI 在
-ComfyUI 1.49.6 前端下存在已知的切换冲突与控件缺失,排序/刷新反馈也还在打磨。
-API (`/api/schedule/*`) 与 CLI (`comfy-schedule`) 工作正常,但 Web 端不推荐
-日常使用。生产环境请先用 CLI/curl 直到 0.4.0 修复 UI 行为。仓库已开放,欢迎
-试用 + 反馈,但请勿将其作为唯一队列管理路径。
+**Status: under development.** 本插件仍在快速迭代中。最近修复(0.3.2):
+- sidebar tab 切换冲突(`activeSidebarTabId` watcher 同步)
+- 全局 Pause/Resume 按钮真实反映 DB 状态
+- ▲/▼ reorder 持久化(新增 `/api/schedule/reorder/{id}`)
+- Schedule 对话框提交后 panel 自动刷新
+
+CLI (`comfy-schedule`) 与 HTTP API 一直工作正常。Web 端已修到接近可用,
+但仍可能有边缘问题。生产环境请先用 CLI/curl。仓库已开放,欢迎试用
++ 反馈,但请勿将其作为唯一队列管理路径。
 
 ---
 

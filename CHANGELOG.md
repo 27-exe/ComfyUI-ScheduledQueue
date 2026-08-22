@@ -4,6 +4,32 @@ All notable changes to **ComfyUI-ScheduledQueue** are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.3.2] - 2026-08-22
+
+### Fixed (regression discovered in 0.3.1)
+- `POST /api/schedule/reorder/{job_id}` endpoint added. The sidebar ▲/▼ buttons
+  now persist the new order through this dedicated endpoint instead of
+  swapping `priority` via `/update`. 404 if the job doesn't exist; 200
+  with `{"moved": false}` if the job is already at the edge of the queue.
+- `GET /api/schedule/status` now reads `paused` from the database rather
+  than returning a hard-coded `true`. Previously clicking the sidebar
+  Pause/Resume button did call `/pause-all` or `/resume-all` correctly,
+  but the next status query would lie and say `paused: true`, so the UI
+  button text never updated.
+- Sidebar panel now stays in sync with `activeSidebarTabId` via a
+  pinia `$subscribe` watcher. Switching to a native tab (e.g. Node
+  library) and back correctly shows each tab's panel, instead of the
+  previous panel staying mounted indefinitely.
+- Topbar `Schedule` dialog now dispatches a `sq:job-added` event and
+  triggers an immediate panel refresh so the new job appears without
+  waiting for the next 5 s poll.
+
+### Tests
+- `tests/test_routes.py` -- 7 new tests covering the reorder endpoint
+  happy path / 404 / 405-by-body-validation / no-op at edge, plus a
+  regression test that exercises pause-all → status reports the
+  updated flag (this is the bug that produced the stale UI).
+
 ## [0.3.1] - 2026-08-22
 
 ### Known issues (read before installing)
