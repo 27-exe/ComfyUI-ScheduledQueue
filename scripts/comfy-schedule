@@ -1,0 +1,283 @@
+#!/usr/bin/env python3
+"""comfy-schedule - Command-line wrapper for ComfyUI-ScheduledQueue HTTP API.
+
+Mirrors the curl examples in custom_nodes/ComfyUI-ScheduledQueue/README.md.
+Designed for shell scripting - all output is parseable JSON.
+
+Usage:
+  comfy-schedule status
+  comfy-schedule list
+  comfy-schedule add /path/to/workflow.json --in 10m --note "morning batch"
+  comfy-schedule add - --in 1h --priority 200   # stdin
+  comfy-schedule cancel <job_id>
+  comfy-schedule update <job_id> --in 2h --priority 200
+  comfy-schedule pause
+  comfy-schedule resume
+  comfy-schedule orphans
+  comfy-schedule run-now <job_id>
+  comfy-schedule watch [--interval 2]
+
+Exit codes: 0 success, 1 HTTP error, 2 bad args, 3 connection refused
+"""
+
+import argparse
+import json
+import os
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+DEFAULT_URL = "http://127.0.0.1:8188"
+
+
+def _request(method, url, body=None, timeout=10.0):
+    """Return (status_code, parsed_json_or_text)."""
+    headers = {"Content-Type": "application/json"} if body is not None else {}
+    data = json.dumps(body).encode("utf-8") if body is not None else None
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read().decode("utf-8", "replace")
+            try:
+                return resp.status, json.loads(raw)
+            except json.JSONDecodeError:
+                return resp.status, raw
+    except urllib.error.HTTPError as e:
+        raw = e.read().decode("utf-8", "replace")
+        try:
+            return e.code, json.loads(raw)
+        except json.JSONDecodeError:
+            return e.code, raw
+    except urllib.error.URLError as e:
+        print(f"comfy-schedule: connection error: {e}", file=sys.stderr)
+        sys.exit(3)
+
+
+def cmd_status(args):
+    code, body = _request("GET", f"{args.url}/api/schedule/status")
+    if code != 200:
+        print(f"HTTP {code}: {body}", file=sys.stderr)
+        return 1
+    print(json.dumps(body, indent=2, ensure_ascii=False))
+    return 0
+
+
+def cmd_list(args):
+    qs = {}
+    if args.status:
+        qs["status"] = ",".join(args.status)
+    if args.limit is not None:
+        qs["limit"] = args.limit
+    url = f"{args.url}/api/schedule/list"
+    if qs:
+        url += "?" + urllib.parse.urlencode(qs)
+    code, body = _request("GET", url)
+    if code != 200:
+        print(f"HTTP {code}: {body}", file=sys.stderr)
+        return 1
+    if args.ids_only:
+        ids = [j["id"] for j in body.get("jobs", [])]
+        for i in ids:
+            print(i)
+    else:
+        print(json.dumps(body, indent=2, ensure_ascii=False))
+    return 0
+
+
+def _read_payload(arg):
+    """Read workflow JSON payload from a file path or '-' for stdin."""
+    if arg == "-":
+        raw = sys.stdin.read()
+    else:
+        p = Path(arg)
+        if not p.exists():
+            print(f"comfy-schedule: file not found: {arg}", file=sys.stderr)
+            sys.exit(2)
+        raw = p.read_text()
+    try:
+        obj = json.loads(raw)
+    except json.JSONDecodeError as e:
+        print(f"comfy-schedule: invalid JSON in {arg}: {e}", file=sys.stderr)
+        sys.exit(2)
+    if "prompt" in obj and isinstance(obj["prompt"], dict):
+        return obj
+    return {"prompt": obj}
+
+
+def _parse_in(arg):
+    """Parse a duration string like '10m' / '2h' / '1d' / '30s' or absolute ISO timestamp."""
+    s = arg.strip()
+    if s and s[-1] in ("s", "m", "h", "d") and s[:-1].replace(".", "").isdigit():
+        n = float(s[:-1])
+        mult = {"s": 1, "m": 60, "h": 3600, "d": 86400}[s[-1]]
+        return time.time() + n * mult
+    try:
+        from datetime import datetime
+        return datetime.fromisoformat(s).timestamp()
+    except ValueError:
+        print(f"comfy-schedule: invalid --in value: {arg}", file=sys.stderr)
+        sys.exit(2)
+
+
+def cmd_add(args):
+    payload = _read_payload(args.workflow)
+    body = {
+        "payload": payload,
+        "scheduled_at": _parse_in(args.in_),
+    }
+    if args.note:
+        body["note"] = args.note
+    if args.priority is not None:
+        body["priority"] = args.priority
+    if args.client_id:
+        body["client_id"] = args.client_id
+    code, resp = _request("POST", f"{args.url}/api/schedule/add", body)
+    if code not in (200, 201):
+        print(f"HTTP {code}: {resp}", file=sys.stderr)
+        return 1
+    print(json.dumps(resp, indent=2, ensure_ascii=False))
+    return 0
+
+
+def cmd_cancel(args):
+    code, resp = _request("POST", f"{args.url}/api/schedule/cancel/{args.job_id}")
+    if code != 200:
+        print(f"HTTP {code}: {resp}", file=sys.stderr)
+        return 1
+    print(json.dumps(resp, indent=2, ensure_ascii=False))
+    return 0
+
+
+def cmd_update(args):
+    body = {}
+    if args.in_:
+        body["scheduled_at"] = _parse_in(args.in_)
+    if args.priority is not None:
+        body["priority"] = args.priority
+    if args.note:
+        body["note"] = args.note
+    if args.auto_retry is not None:
+        body["auto_retry"] = args.auto_retry
+    if not body:
+        print("comfy-schedule update: at least one of --in / --priority / --note / --auto-retry required",
+              file=sys.stderr)
+        return 2
+    code, resp = _request("POST", f"{args.url}/api/schedule/update/{args.job_id}", body)
+    if code != 200:
+        print(f"HTTP {code}: {resp}", file=sys.stderr)
+        return 1
+    print(json.dumps(resp, indent=2, ensure_ascii=False))
+    return 0
+
+
+def cmd_pause(args):
+    code, resp = _request("POST", f"{args.url}/api/schedule/pause-all")
+    print(json.dumps(resp, indent=2, ensure_ascii=False))
+    return 0 if code == 200 else 1
+
+
+def cmd_resume(args):
+    code, resp = _request("POST", f"{args.url}/api/schedule/resume-all")
+    print(json.dumps(resp, indent=2, ensure_ascii=False))
+    return 0 if code == 200 else 1
+
+
+def cmd_orphans(args):
+    code, resp = _request("GET", f"{args.url}/api/schedule/orphan-status")
+    print(json.dumps(resp, indent=2, ensure_ascii=False))
+    return 0 if code == 200 else 1
+
+
+def cmd_run_now(args):
+    code, resp = _request("POST", f"{args.url}/api/schedule/run-now/{args.job_id}")
+    if code != 200:
+        print(f"HTTP {code}: {resp}", file=sys.stderr)
+        return 1
+    print(json.dumps(resp, indent=2, ensure_ascii=False))
+    return 0
+
+
+def cmd_watch(args):
+    """Poll status until interrupted or timeout."""
+    interval = args.interval
+    end_at = time.time() + args.seconds if args.seconds else None
+    try:
+        while True:
+            ts = time.strftime("%Y-%m-%d %H:%M:%S")
+            code, body = _request("GET", f"{args.url}/api/schedule/status")
+            print(f"[{ts}] {json.dumps(body, ensure_ascii=False)}")
+            if end_at and time.time() >= end_at:
+                return 0
+            time.sleep(interval)
+    except KeyboardInterrupt:
+        print("\nwatch: interrupted", file=sys.stderr)
+        return 0
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="comfy-schedule",
+        description="Control ComfyUI-ScheduledQueue from the shell.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="Examples:\n"
+               "  comfy-schedule status\n"
+               "  comfy-schedule list --status scheduled\n"
+               "  comfy-schedule add workflow.json --in 10m --note morning\n"
+               "  comfy-schedule pause && comfy-schedule resume\n"
+               "  comfy-schedule orphans\n",
+    )
+    parser.add_argument("--url", default=os.environ.get("COMFYUI_URL", DEFAULT_URL),
+                        help="ComfyUI base URL (default: http://127.0.0.1:8188)")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    p_status = sub.add_parser("status", help="global scheduler status")
+    p_status.set_defaults(func=cmd_status)
+
+    p_list = sub.add_parser("list", help="list scheduled jobs")
+    p_list.add_argument("--status", nargs="+", help="filter by status")
+    p_list.add_argument("--limit", type=int, help="max rows (default 200)")
+    p_list.add_argument("--ids-only", action="store_true", help="print only job IDs")
+    p_list.set_defaults(func=cmd_list)
+
+    p_add = sub.add_parser("add", help="add a new scheduled job")
+    p_add.add_argument("workflow", help="path to workflow JSON file, or '-' for stdin")
+    p_add.add_argument("--in", dest="in_", required=True, help="when to run: '10m', '2h', '1d', or ISO timestamp")
+    p_add.add_argument("--note", help="free-form note")
+    p_add.add_argument("--priority", type=int, help="priority (higher = sooner)")
+    p_add.add_argument("--client-id", dest="client_id", help="ComfyUI client_id")
+    p_add.set_defaults(func=cmd_add)
+
+    p_cancel = sub.add_parser("cancel", help="soft-cancel a job")
+    p_cancel.add_argument("job_id")
+    p_cancel.set_defaults(func=cmd_cancel)
+
+    p_update = sub.add_parser("update", help="patch a job")
+    p_update.add_argument("job_id")
+    p_update.add_argument("--in", dest="in_", help="reschedule to a new time")
+    p_update.add_argument("--priority", type=int, help="new priority")
+    p_update.add_argument("--note", help="new note")
+    p_update.add_argument("--auto-retry", dest="auto_retry", type=int, help="0 or 1")
+    p_update.set_defaults(func=cmd_update)
+
+    sub.add_parser("pause", help="pause scheduler (new dispatches)").set_defaults(func=cmd_pause)
+    sub.add_parser("resume", help="resume + reset interrupted jobs").set_defaults(func=cmd_resume)
+    sub.add_parser("orphans", help="show interrupted jobs from previous ComfyUI run").set_defaults(func=cmd_orphans)
+
+    p_run = sub.add_parser("run-now", help="dispatch a job immediately")
+    p_run.add_argument("job_id")
+    p_run.set_defaults(func=cmd_run_now)
+
+    p_watch = sub.add_parser("watch", help="poll status periodically")
+    p_watch.add_argument("--interval", type=float, default=2.0, help="poll interval seconds (default 2)")
+    p_watch.add_argument("--seconds", type=int, help="stop after N seconds")
+    p_watch.set_defaults(func=cmd_watch)
+
+    args = parser.parse_args()
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

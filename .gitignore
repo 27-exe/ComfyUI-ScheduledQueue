@@ -1,0 +1,36 @@
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+build/
+dist/
+.eggs/
+
+# ComfyUI state generated when importing the package outside of ComfyUI
+user/
+
+# Editor / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Test artefacts
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Local DB files (created by running tests against a temp DB)
+/*.sqlite3
+/*.sqlite3-shm
+/*.sqlite3-wal
+
+# Real ComfyUI state (do not commit user database)
+scheduled_queue.sqlite3
+
+# Internal design scratch (not published)
+IMPLEMENTATION_BRIEF.md
+docs/00-requirements-user-facing.md
+docs/01-implementation-spec-stage-1-agent-facing.md
+docs/02-implementation-spec-stage-2-agent-facing.md
+.scratch/
