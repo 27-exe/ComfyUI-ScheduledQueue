@@ -1,8 +1,10 @@
 """Non-blocking (to ComfyUI's event loop) scheduler worker."""
 from __future__ import annotations
 
+import copy
 import json
 import logging
+import secrets
 import threading
 import time
 import urllib.error
@@ -10,6 +12,137 @@ import urllib.parse
 import urllib.request
 
 log = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Pre-dispatch hook: emulate the ComfyUI frontend's `control_after_generate`
+# processing that normally happens during graphToPrompt + queuePrompt.
+#
+# Why this is needed
+# ------------------
+# The ComfyUI web UI ships workflows whose node `inputs` dict contains both a
+# `seed` (or `noise_seed`) and a sibling `control_after_generate` value
+# ("fixed" | "randomize" | "increment" | "decrement"). When a user clicks
+# "Queue Prompt", the frontend's widget machinery mutates the seed according
+# to the chosen mode and then strips `control_after_generate` from the
+# serialized payload before POSTing to /prompt.
+#
+# Our scheduler just POSTs the stored payload verbatim, so the same seed
+# arrives at ComfyUI each run. ComfyUI then takes the cheap path through its
+# execution cache (`execution_cached` / output cache reuse) and we get
+# identical results every dispatch.
+#
+# Source references in this repo's ComfyUI checkout:
+#   * comfy/comfy_types/node_typing.py:165      -- control_after_generate is a
+#                                                  frontend-only metadata
+#                                                  flag on input specs.
+#   * comfyui_frontend_package/.../settingStore-CwkLtSKP.js
+#         function applyWidgetControl           -- queued hook entry point
+#         function nextValueForLinkedTarget     -- picks the right widget
+#         function computeNextControlledValue   -- dispatches on mode
+#         function computeNextNumberValue       -- INT/FLOAT (seed, noise_seed)
+#         function computeNextComboValue        -- COMBO inputs
+#   * comfyui_frontend_package/.../core-BqDAGg28.js
+#         `Oe` Set                             -- strip-list for
+#                                                  re-serialization
+#                                                  (includes
+#                                                  "control_after_generate").
+#
+# The frontend also has a `control_before_generate` user setting; when true
+# the mutation happens before POST, when false it happens after. We always
+# run it before POST because we have no widget state to update post-POST.
+# ---------------------------------------------------------------------------
+
+_SEED_FIELDS = ("seed", "noise_seed")
+_COMBO_FIELDS = ()  # nothing we auto-handle today; reserved for future use.
+# The frontend uses a JS-safe integer range of ±2**53 for INT widgets.
+# We mirror that so `randomize` lands in the same band a user would see in the UI.
+_INT53_MIN = -(2 ** 53)
+_INT53_MAX = (2 ** 53) - 1
+# ComfyUI's KSampler / RandomNoise seed bounds: 0 .. 2**64 - 1.
+# Default `min`/`max` on `seed` widgets is exactly this (see nodes.py:1602).
+_SEED_MIN = 0
+_SEED_MAX = 0xFFFFFFFFFFFFFFFF  # 2**64 - 1
+
+
+def _apply_control_after_generate(inputs: dict) -> None:
+    """Mutate *inputs* in place, emulating the frontend widget hook.
+
+    Only operates on the two seed-like fields. Any other input that happens
+    to carry a `control_after_generate` flag is left alone — the frontend
+    only wires up widgets for `seed` and `noise_seed`, and we don't have
+    a node spec table to know which other COMBO widgets might want this
+    treatment.
+    """
+    mode = inputs.get("control_after_generate")
+    if not isinstance(mode, str):
+        return
+    for field in _SEED_FIELDS:
+        if field not in inputs:
+            continue
+        try:
+            current = int(inputs[field])
+        except (TypeError, ValueError):
+            # Non-numeric seed (e.g. still a string from a broken save):
+            # leave it alone and let ComfyUI surface the error at execution.
+            continue
+        new_value = _next_number_value(current, mode)
+        if new_value is not None:
+            inputs[field] = new_value
+    # Mirror the frontend: strip the directive after applying it so the
+    # payload we POST looks exactly like one produced by Queue Prompt.
+    inputs.pop("control_after_generate", None)
+
+
+def _next_number_value(current: int, mode: str):
+    """Reimplementation of computeNextNumberValue from the frontend.
+
+    Returns the next value, or None for modes the frontend treats as
+    "no-op" (e.g. ``fixed``).
+    """
+    if mode == "fixed":
+        return None
+    if mode == "increment":
+        return current + 1
+    if mode == "decrement":
+        return current - 1
+    if mode == "randomize":
+        # Frontend draws uniformly from [min, max] at integer step size.
+        # We draw via SystemRandom so two near-simultaneous dispatches
+        # don't get the same PRNG state, then clamp to the same bounds
+        # the widget UI would show.
+        span = _SEED_MAX - _SEED_MIN + 1
+        return _SEED_MIN + secrets.randbelow(span)
+    if mode == "increment-wrap":
+        # Treat wrap as "increment but loop around" -- not used by any
+        # built-in widget today, but defined in the frontend source.
+        return current + 1
+    # Unknown mode: be conservative, don't touch the seed.
+    log.warning("unknown control_after_generate mode %r; leaving seed unchanged", mode)
+    return None
+
+
+def _apply_pre_dispatch_hooks(prompt: dict) -> dict:
+    """Run every frontend pre-POST mutation we know about on *prompt*.
+
+    Today this is just the ``control_after_generate`` pass. New hooks
+    discovered while reading the ComfyUI frontend source should be
+    added here so the scheduler keeps emitting payloads indistinguishable
+    from those produced by the Queue Prompt button.
+
+    The returned dict is a fresh object; the caller can safely keep a
+    reference to the input *prompt* for logging or comparison.
+    """
+    if not isinstance(prompt, dict):
+        return prompt
+    out = copy.deepcopy(prompt)
+    for _node_id, node in out.items():
+        if not isinstance(node, dict):
+            continue
+        inputs = node.get("inputs")
+        if isinstance(inputs, dict):
+            _apply_control_after_generate(inputs)
+    return out
 
 
 class SchedulerThread:
@@ -65,8 +198,9 @@ class SchedulerThread:
             return
 
         try:
+            prompt = _apply_pre_dispatch_hooks(json.loads(job['payload']))
             body = {
-                'prompt': json.loads(job['payload']),
+                'prompt': prompt,
                 'client_id': job.get('client_id') or 'scheduled_queue',
             }
             req = urllib.request.Request(

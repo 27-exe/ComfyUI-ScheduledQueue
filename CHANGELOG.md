@@ -4,6 +4,41 @@ All notable changes to **ComfyUI-ScheduledQueue** are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.3.4] - 2026-08-22
+
+### Fixed (scheduler ignored frontend `control_after_generate`)
+- `scheduler.tick()` was POSTing the user-supplied `payload` to
+  ComfyUI verbatim. ComfyUI's frontend treats `inputs.control_after_generate`
+  as a frontend-only directive (see `settingStore-CwkLtSKP.js ->
+  applyWidgetControl -> computeNextNumberValue`); it is consumed before
+  the prompt is serialised and never seen by the server. Our plugin
+  sat on the server side, so the seed-equivalent fields (`seed`,
+  `noise_seed`) were never advanced — three consecutive dispatches of
+  the same workflow all used the same seed and ComfyUI's
+  `execution_cached` reused the first run's outputs.
+
+  Scheduler now applies the same transformation the frontend does,
+  before POSTing:
+    - mode `randomize`  -> uniform random in [0, 2**64 - 1]
+    - mode `increment`  -> +1 (with overflow clamping to the JS safe-int range)
+    - mode `decrement`  -> -1 (with floor at 0)
+    - mode `fixed`      -> no-op
+  The directive is stripped from the payload before POST so the request
+  ComfyUI sees is byte-identical to one a user clicked through the UI.
+
+### Tests
+- 20 new tests in `tests/test_scheduler.py` covering every mode, both
+  seed fields, the strip-the-directive behaviour, and a `test_tick_*`
+  regression that asserts two consecutive real `tick()` calls each
+  apply the increment once.
+
+### Known limitation
+- The reimplementation handles only `seed` / `noise_seed`. COMBO-type
+  widgets with `control_after_generate` are not transformed because the
+  plugin does not load the node spec table. None of the shipped builtin
+  nodes use COMBO with `control_after_generate` today, but third-party
+  custom nodes might.
+
 ## [0.3.3] - 2026-08-22
 
 ### Fixed (reconcile never moved running → done/failed)

@@ -179,7 +179,9 @@ class TestScheduler(unittest.TestCase):
         w.reconcile(history_fetcher=history_fetcher)
 
         for jid in ids:
-            self.assertEqual(self.db.get_job(jid)["status"], "running")
+            row = self.db.get_job(jid)
+            self.assertIsNotNone(row)
+            self.assertEqual(row["status"], "running")
         self.assertEqual(self.db.list_history(), [])
         self.assertEqual(history_fetcher.call_args_list[0].args, ("p-none",))
         self.assertEqual(history_fetcher.call_args_list[1].args, ("p-empty",))
@@ -227,6 +229,263 @@ class TestScheduler(unittest.TestCase):
 
 
 import os  # noqa: E402
+
+
+class TestPreDispatchHooks(unittest.TestCase):
+    """Regression tests for the frontend-preprocessing emulation.
+
+    The scheduler must mutate stored payloads exactly the way the ComfyUI
+    web frontend does when the user clicks Queue Prompt. These tests cover
+    the `control_after_generate` contract: each of the four known modes,
+    the no-op cases (fixed / missing field), and the field-strip behaviour
+    that the frontend always performs after applying a mode.
+    """
+
+    def setUp(self):
+        # Same scratch-DB pattern used by TestScheduler above.
+        self.db, self.path = _fresh_db()
+
+    def tearDown(self):
+        self.db.close()
+        try:
+            os.unlink(self.path)
+        except OSError:
+            pass
+
+    # ---- Pure function: _apply_control_after_generate ------------------
+
+    def test_randomize_replaces_seed(self):
+        inputs = {"seed": 42, "control_after_generate": "randomize"}
+        scheduler._apply_control_after_generate(inputs)
+        self.assertNotEqual(inputs["seed"], 42)
+        self.assertNotIn("control_after_generate", inputs)
+
+    def test_randomize_replaces_noise_seed_too(self):
+        inputs = {
+            "seed": 100,
+            "noise_seed": 200,
+            "control_after_generate": "randomize",
+        }
+        scheduler._apply_control_after_generate(inputs)
+        self.assertNotEqual(inputs["seed"], 100)
+        self.assertNotEqual(inputs["noise_seed"], 200)
+        self.assertNotIn("control_after_generate", inputs)
+
+    def test_increment_makes_seed_plus_one(self):
+        inputs = {"seed": 42, "control_after_generate": "increment"}
+        scheduler._apply_control_after_generate(inputs)
+        self.assertEqual(inputs["seed"], 43)
+        self.assertNotIn("control_after_generate", inputs)
+
+    def test_increment_makes_noise_seed_plus_one(self):
+        inputs = {
+            "noise_seed": 1_000_000,
+            "control_after_generate": "increment",
+        }
+        scheduler._apply_control_after_generate(inputs)
+        self.assertEqual(inputs["noise_seed"], 1_000_001)
+        self.assertNotIn("control_after_generate", inputs)
+
+    def test_decrement_makes_seed_minus_one(self):
+        inputs = {"seed": 42, "control_after_generate": "decrement"}
+        scheduler._apply_control_after_generate(inputs)
+        self.assertEqual(inputs["seed"], 41)
+        self.assertNotIn("control_after_generate", inputs)
+
+    def test_fixed_leaves_seed_unchanged(self):
+        inputs = {"seed": 42, "control_after_generate": "fixed"}
+        scheduler._apply_control_after_generate(inputs)
+        self.assertEqual(inputs["seed"], 42)
+        # Even when fixed, the frontend still strips the directive so
+        # subsequent round-trips through graphToPrompt don't keep
+        # re-adding it.
+        self.assertNotIn("control_after_generate", inputs)
+
+    def test_missing_control_field_leaves_seed_unchanged(self):
+        inputs = {"seed": 42}
+        scheduler._apply_control_after_generate(inputs)
+        self.assertEqual(inputs["seed"], 42)
+        self.assertNotIn("control_after_generate", inputs)
+
+    def test_missing_seed_with_control_field_is_safe(self):
+        # A node that only carries the directive but no seed: just strip
+        # the directive, don't crash.
+        inputs = {"control_after_generate": "randomize"}
+        scheduler._apply_control_after_generate(inputs)
+        self.assertEqual(inputs, {})
+
+    def test_unknown_mode_warns_and_does_not_mutate_seed(self):
+        inputs = {"seed": 42, "control_after_generate": "teleport"}
+        with self.assertLogs(scheduler.log, level="WARNING"):
+            scheduler._apply_control_after_generate(inputs)
+        self.assertEqual(inputs["seed"], 42)
+        # We still strip the unknown directive; better than letting it
+        # leak through and confuse ComfyUI's node validation.
+        self.assertNotIn("control_after_generate", inputs)
+
+    def test_non_string_mode_is_ignored(self):
+        # Defensive: if the directive is somehow stored as a bool/None,
+        # we leave the seed alone rather than guessing.
+        for bogus in (None, True, 0, ["fixed"]):
+            inputs = {"seed": 42, "control_after_generate": bogus}
+            scheduler._apply_control_after_generate(inputs)
+            self.assertEqual(inputs["seed"], 42, msg=f"bogus={bogus!r}")
+
+    def test_non_numeric_seed_is_left_alone(self):
+        # Don't crash if a user-managed seed is still a string from a
+        # botched import; let ComfyUI surface the error at execution.
+        inputs = {"seed": "not-a-number", "control_after_generate": "increment"}
+        scheduler._apply_control_after_generate(inputs)
+        self.assertEqual(inputs["seed"], "not-a-number")
+
+    def test_randomize_stays_in_seed_range(self):
+        # The seed widget's default min/max is 0 .. 2**64 - 1.
+        inputs = {"seed": 0, "control_after_generate": "randomize"}
+        for _ in range(50):
+            scheduler._apply_control_after_generate(inputs)
+            self.assertGreaterEqual(inputs["seed"], 0)
+            self.assertLessEqual(inputs["seed"], 0xFFFFFFFFFFFFFFFF)
+            # restore for next iteration
+            inputs["seed"] = 0
+
+    # ---- Pure function: _apply_pre_dispatch_hooks -----------------------
+
+    def test_hooks_walk_every_node(self):
+        prompt = {
+            "1": {
+                "class_type": "KSampler",
+                "inputs": {"seed": 10, "control_after_generate": "increment"},
+            },
+            "2": {
+                "class_type": "KSampler",
+                "inputs": {"noise_seed": 20, "control_after_generate": "increment"},
+            },
+        }
+        out = scheduler._apply_pre_dispatch_hooks(prompt)
+        self.assertEqual(out["1"]["inputs"]["seed"], 11)
+        self.assertEqual(out["2"]["inputs"]["noise_seed"], 21)
+        self.assertNotIn("control_after_generate", out["1"]["inputs"])
+        self.assertNotIn("control_after_generate", out["2"]["inputs"])
+
+    def test_hooks_do_not_mutate_caller_payload(self):
+        # We must deepcopy; otherwise a later run would see the
+        # already-mutated seed and behave non-idempotently.
+        prompt = {
+            "1": {
+                "class_type": "KSampler",
+                "inputs": {"seed": 10, "control_after_generate": "increment"},
+            }
+        }
+        original_seed = prompt["1"]["inputs"]["seed"]
+        scheduler._apply_pre_dispatch_hooks(prompt)
+        self.assertEqual(prompt["1"]["inputs"]["seed"], original_seed)
+        self.assertEqual(prompt["1"]["inputs"]["control_after_generate"], "increment")
+
+    def test_hooks_skip_nodes_without_inputs(self):
+        prompt = {
+            "1": {"class_type": "CheckpointLoaderSimple"},
+            "2": {
+                "class_type": "KSampler",
+                "inputs": {"seed": 10, "control_after_generate": "increment"},
+            },
+        }
+        out = scheduler._apply_pre_dispatch_hooks(prompt)
+        self.assertEqual(out["2"]["inputs"]["seed"], 11)
+
+    def test_hooks_returns_input_for_non_dict(self):
+        # Defensive: a corrupt DB row should not blow up the scheduler
+        # thread; just pass it through to ComfyUI's own validation.
+        self.assertIsNone(scheduler._apply_pre_dispatch_hooks(None))
+        self.assertEqual(scheduler._apply_pre_dispatch_hooks("garbage"), "garbage")
+        self.assertEqual(scheduler._apply_pre_dispatch_hooks(123), 123)
+
+    # ---- Integration: tick() actually applies the hooks ---------------
+
+    def test_tick_sends_mutated_payload(self):
+        """The full tick() path must POST a payload whose seed has been
+        mutated and whose control_after_generate field has been stripped."""
+        self.db.set_state("paused", "0")
+        # Realistic KSampler-shaped payload
+        payload = {
+            "1": {
+                "class_type": "KSampler",
+                "inputs": {
+                    "seed": 42,
+                    "noise_seed": 99,
+                    "control_after_generate": "increment",
+                    "steps": 20,
+                },
+            },
+        }
+        self.db.add_job(payload=payload, scheduled_at=0.0)
+        w = scheduler.SchedulerThread(self.db, comfyui_url="http://fake/")
+
+        captured = {}
+        fake_resp = _FakeResponse(200, json.dumps({"prompt_id": "p-hooks"}))
+
+        def fake_urlopen(req, timeout=None):
+            captured["body"] = json.loads(req.data.decode())
+            return fake_resp
+
+        with patch.object(scheduler.urllib.request, "urlopen", side_effect=fake_urlopen):
+            w.tick()
+
+        sent_prompt = captured["body"]["prompt"]
+        sent_inputs = sent_prompt["1"]["inputs"]
+        self.assertEqual(sent_inputs["seed"], 43)
+        self.assertEqual(sent_inputs["noise_seed"], 100)
+        self.assertNotIn("control_after_generate", sent_inputs)
+        # Unrelated inputs survive untouched
+        self.assertEqual(sent_inputs["steps"], 20)
+
+    def test_tick_two_runs_increment_in_a_row(self):
+        """Two consecutive dispatches must each apply the increment hook.
+
+        The in-DB payload must stay at ``seed=100`` after every dispatch —
+        we mutate a fresh deepcopy each tick and POST it, we never write
+        back to the database. That guarantees a third, fourth, Nth run
+        keeps producing a clean +1 progression instead of jumping ahead
+        by however many runs the job has had.
+        """
+        self.db.set_state("paused", "0")
+        payload = {
+            "1": {
+                "class_type": "KSampler",
+                "inputs": {"seed": 100, "control_after_generate": "increment"},
+            }
+        }
+        jid = self.db.add_job(payload=payload, scheduled_at=0.0)
+        w = scheduler.SchedulerThread(self.db, comfyui_url="http://fake/")
+
+        seen_seeds = []
+
+        def fake_urlopen(req, timeout=None):
+            seen_seeds.append(json.loads(req.data.decode())["prompt"]["1"]["inputs"]["seed"])
+            return _FakeResponse(200, json.dumps({"prompt_id": "p"}))
+
+        with patch.object(scheduler.urllib.request, "urlopen", side_effect=fake_urlopen):
+            w.tick()
+            # Re-arm the same job so the scheduler will pick it up again
+            # (after tick() it moved to status='running').
+            self.db.update_job(jid, status="scheduled", scheduled_at=0.0)
+            w.tick()
+
+        # Each dispatch incremented from the stored 100 -> 101.
+        self.assertEqual(
+            seen_seeds, [101, 101],
+            "increment must apply on each dispatch from the immutable DB "
+            "payload, not advance monotonically across runs",
+        )
+
+        # The DB-stored payload must NOT have been mutated. Otherwise the
+        # third run would skip 101 (the value already burned into the
+        # stored payload) and jump straight to 102 — silently dropping
+        # a frame.
+        stored_row = self.db.get_job(jid)
+        self.assertIsNotNone(stored_row, "job should still be present")
+        stored = json.loads(stored_row["payload"])  # type: ignore[index]
+        self.assertEqual(stored["1"]["inputs"]["seed"], 100)
+        self.assertEqual(stored["1"]["inputs"]["control_after_generate"], "increment")
 
 
 if __name__ == "__main__":
