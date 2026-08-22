@@ -4,6 +4,37 @@ All notable changes to **ComfyUI-ScheduledQueue** are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.3.9] - 2026-08-23
+
+### Fixed (live bugs reported after 0.3.8 push)
+
+- **Clear panel stopped auto-collapsing on every 5 s refresh.** Previously
+  `refresh()` reset `clearPanelEl.style.display = "none"` on every poll,
+  so the moment the user opened the checkbox list a background tick
+  closed it again. The toggle button is now the only place that mutates
+  the panel's display state.
+
+- **Sidebar job title resolves to the workflow nickname, not the first
+  arbitrary node title.** The lookup now prefers `SaveImage`,
+  `PreviewImage`, then `VAEDecode` — the nodes a user mentally labels a
+  workflow by — and only falls back to the first `_meta.title` or
+  `class_type` if none of those exist. Job title + 8-char id is now
+  shown above the status badge.
+
+- **Schedule dialog time editor buttons had no click handlers.** The
+  `data-delta="-3600"` etc. buttons rendered but did nothing because no
+  listener was attached. All ten +/- buttons now wire through a single
+  `currentWhenTs += parseInt(delta)` + `refreshWhenDisplay()` flow, and
+  the editable centre input now listens to `input` events to parse
+  `YYYY-MM-DD HH:MM:SS` / ISO / `YYYY/MM/DD HH:MM:SS` and writes the
+  canonical unix-seconds into the hidden input.
+
+### Known limitation (unchanged from 0.3.8)
+- The sidebar still rebuilds its `jobsEl` innerHTML on every 5 s poll,
+  which can visibly flicker on slow sessions. The fix would require
+  row-level diffing; deferred to a follow-up since the underlying data
+  is always up to date.
+
 ## [0.3.8] - 2026-08-23
 
 ### Added (new REST endpoints + UI controls)

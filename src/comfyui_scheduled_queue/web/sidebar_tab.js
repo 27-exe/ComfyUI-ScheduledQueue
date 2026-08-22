@@ -119,25 +119,64 @@ function buildPanel() {
     // Mirror of Python `workflow_format.get_node_title`.
     //
     // The /list endpoint currently strips `payload` (see routes._strip_payload),
-    // so sidebar rows don't carry the API dict. We instead pick the first
-    // non-empty `_meta.title` (or class_type fallback) across nodes; this is
-    // the "workflow nickname" shown in the row header.
+    // so sidebar rows don't carry the API dict. We pick the most descriptive
+    // title across nodes; this is the "workflow nickname" shown in the row
+    // header.
+    //
+    // Priority:
+    //   1. SaveImage / PreviewImage / VAEDecode _meta.title   (these name the
+    //      *output* the user cares about; a vanilla KSampler-only workflow
+    //      has no SaveImage and we fall through.)
+    //   2. Any other node's _meta.title                       (catches the
+    //      common case where the user has tagged one node with a friendly
+    //      name like "portrait batch".)
+    //   3. The first node's class_type                         (last-resort
+    //      structural hint, e.g. "KSampler" — better than empty.)
+    //
+    // Callers wanting a friendlier label should pass note separately; we
+    // don't reach for it here because apiDict doesn't carry the user note.
     //
     // Input: apiDict — API-format workflow dict keyed by node id (string or int).
     // Returns: the first usable title, or null if the dict is empty / malformed.
+    const OUTPUT_NODE_PRIORITY = ["SaveImage", "PreviewImage", "VAEDecode"];
     function getNodeTitle(apiDict) {
         if (!apiDict || typeof apiDict !== "object") return null;
-        for (const k of Object.keys(apiDict)) {
+        const keys = Object.keys(apiDict);
+
+        // 1. Output-node titles first — these are what the user mentally
+        //    labels the workflow by ("portrait batch" sits on the SaveImage).
+        for (const wanted of OUTPUT_NODE_PRIORITY) {
+            for (const k of keys) {
+                const entry = apiDict[k];
+                if (!entry || typeof entry !== "object") continue;
+                if (entry.class_type !== wanted) continue;
+                const meta = entry._meta;
+                if (meta && typeof meta === "object" && typeof meta.title === "string" && meta.title) {
+                    return meta.title;
+                }
+            }
+        }
+
+        // 2. Any node's _meta.title (first match wins — preserves the legacy
+        //    behaviour where users tagged a single node to name the workflow).
+        for (const k of keys) {
             const entry = apiDict[k];
             if (!entry || typeof entry !== "object") continue;
             const meta = entry._meta;
             if (meta && typeof meta === "object" && typeof meta.title === "string" && meta.title) {
                 return meta.title;
             }
+        }
+
+        // 3. class_type of the first usable node — structural fallback.
+        for (const k of keys) {
+            const entry = apiDict[k];
+            if (!entry || typeof entry !== "object") continue;
             if (typeof entry.class_type === "string" && entry.class_type) {
                 return entry.class_type;
             }
         }
+
         return null;
     }
 
@@ -424,8 +463,12 @@ function buildPanel() {
                 renderFilterTabs();
                 renderJobs(jobs);
                 renderPager(jobs);
-                // Constraint: refresh closes the clear panel state.
-                if (clearPanelEl) clearPanelEl.style.display = "none";
+                // NOTE: do NOT auto-collapse the clear panel here. The 5 s
+                // background poll calls refresh() repeatedly; resetting
+                // clearPanelEl.style.display = "none" on every tick made the
+                // panel flicker closed and visually "flash" the whole
+                // sidebar. The user's open/closed intent for that panel is
+                // owned by the toggle button only.
             } catch (e) {
                 statusEl.innerHTML = `<div style="color:#f44;">Error: ${escapeHtml(e.message)}</div>`;
             } finally {
