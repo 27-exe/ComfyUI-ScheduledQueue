@@ -184,17 +184,31 @@ def _strip_payload(row: dict) -> dict:
 # ---------------------------------------------------------------------------
 
 _DEFAULT_COMFYUI_URL = "http://127.0.0.1:8188"
-# ComfyUI's /queue and /interrupt calls during a pause should be quick;
-# they just mutate an in-memory queue. We pick a 5s ceiling so a wedged
-# ComfyUI doesn't hold the aiohttp handler thread for ages.
-_COMFYUI_HTTP_TIMEOUT = 5.0
+# ComfyUI's /queue and /interrupt calls during a pause should be quick,
+# BUT the /interrupt call waits for the currently-running step to
+# finish first -- a H3 step can take 5-10s, so the simple 5s ceiling
+# produced bogus "HTTP 0" reports on working cancels. We give each
+# cancel attempt up to 30s, which comfortably covers one step + cleanup.
+# The HTTP helper also distinguishes between "ECONNREFUSED / ENOENT"
+# (ComfyUI genuinely unreachable -- counted as an error) and a plain
+# read timeout (ComfyUI very likely *did* process the cancel; counted
+# as a success because reconcile() will treat the prompt as gone the
+# next time it polls /history).
+_COMFYUI_HTTP_TIMEOUT = 30.0
 
 
 def _default_comfyui_fetcher(url, body, timeout):
     """Built-in fetcher: POST ``body`` (bytes) to ``url`` via urllib.
 
-    Returns ``(status, text)`` — ``status`` is the HTTP code or 0 on a
-    network error, ``text`` is whatever the body was (best-effort decode).
+    Returns ``(status, text, kind)``:
+      * status -- HTTP code on a real response, 0 on any network error
+      * text   -- response body on 2xx (best-effort decoded), else ''
+      * kind   -- 'success' / 'http_error' / 'refused' / 'unreachable' /
+                  'timeout'. ``kind`` is used by ``_comfyui_post_json``
+                  to distinguish "we never reached ComfyUI" (refused /
+                  unreachable) from "ComfyUI took longer than our
+                  timeout but probably got the message" (timeout).
+
     Never raises.
     """
     req = urllib.request.Request(
@@ -203,32 +217,56 @@ def _default_comfyui_fetcher(url, body, timeout):
     )
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
-            return r.status, r.read().decode("utf-8", errors="replace")
+            return r.status, r.read().decode("utf-8", errors="replace"), "success"
     except urllib.error.HTTPError as exc:
-        return getattr(exc, "code", 0), ""
-    except (urllib.error.URLError, TimeoutError, ConnectionError, OSError):
-        return 0, ""
+        return getattr(exc, "code", 0), "", "http_error"
+    except urllib.error.URLError as exc:
+        reason = getattr(exc, "reason", None)
+        # ``reason`` is either an ``OSError`` (e.g. ECONNREFUSED,
+        # ENOENT, EAI_AGAIN) or a ``TimeoutError``. urllib returns it
+        # as the underlying exception's instance when the wrapper
+        # catches it; we classify below.
+        if isinstance(reason, TimeoutError) or (reason is not None and
+                                                getattr(reason, "errno", None) is None and
+                                                "timed out" in str(reason).lower()):
+            return 0, "", "timeout"
+        if isinstance(reason, OSError):
+            return 0, "", "refused"
+        return 0, "", "unreachable"
+    except (TimeoutError, ConnectionError, OSError) as exc:
+        if isinstance(exc, TimeoutError):
+            return 0, "", "timeout"
+        if isinstance(exc, OSError):
+            return 0, "", "refused"
+        return 0, "", "unreachable"
 
 
 def _comfyui_post_json(url, body, *, fetcher=None):
     """POST *body* as JSON to *url*. Returns ``(ok, payload_or_err)``.
 
-    ``ok`` is True on any 2xx response. 4xx / 5xx and network errors
-    return ``ok=False`` with a short string reason. The caller decides
-    whether to log/aggregate/retry; this helper never raises.
+    ``ok`` is True on any 2xx response. 4xx / 5xx and "we never
+    reached ComfyUI" (refused / unreachable) return ``ok=False``.
+    Plain read timeouts return ``ok=True`` because ComfyUI most likely
+    did process the request -- it was busy finishing the current
+    sampling step. The caller still needs a defensive sweep via
+    reconcile() to confirm the prompt disappeared.
 
     Tests inject ``fetcher`` to avoid hitting a real ComfyUI. The fetcher
-    signature is ``fetcher(url: str, body: bytes, timeout: float)
-    -> (status: int, text: str)``; the default uses ``urllib.request``.
+    signature is ``fetcher(url, body, timeout) -> (status, text, kind)``;
+    the default uses ``urllib.request``.
     """
     payload = json.dumps(body).encode()
     do_fetch = fetcher if fetcher is not None else _default_comfyui_fetcher
     try:
-        status, text = do_fetch(url, payload, _COMFYUI_HTTP_TIMEOUT)
+        status, text, kind = do_fetch(url, payload, _COMFYUI_HTTP_TIMEOUT)
     except Exception as exc:  # noqa: BLE001 — defensive, never raise from HTTP helper
         return False, f"fetcher raised: {exc!r}"
     if 200 <= status < 300:
         return True, text
+    if kind == "timeout":
+        # Treat as success; the row is reclaimed by reconcile() if it
+        # wasn't actually accepted by ComfyUI.
+        return True, text or "timeout (assumed success)"
     return False, f"HTTP {status}"
 
 
@@ -749,19 +787,17 @@ async def pause_all_handler(request) -> "web.Response":  # type: ignore[name-def
                 db.set_state("last_error", f"pause_all cancel: {errors[0]}")
             except Exception:
                 pass
+        # For every row we *think* ComfyUI accepted, clear the prompt_id.
+        # We slice to ``cancelled_count`` because cancelled_count may
+        # over-count when the bundled /queue call succeeded but one of
+        # the per-prompt /interrupt calls failed (the bundle is silent
+        # so we have no per-id acknowledgement).
         if cancelled_count:
-            # Drop the prompt_id off rows that ComfyUI acknowledged so
-            # reconcile() doesn't fetch a /history record for a prompt
-            # that no longer exists.
             try:
                 cancelled_pids = {r["prompt_id"] for r in in_flight}
-                # `cancelled_count` is the sum of dispatched + running
-                # acks. If we ack'd the dispatched batch but one of the
-                # interrupts failed, we may have over-counted — slice
-                # to ``cancelled_count`` so we don't try to clear a
-                # prompt_id for a row whose cancel actually failed.
                 job_ids_to_clear = [
-                    r["id"] for r in in_flight if r["prompt_id"] in cancelled_pids
+                    r["id"] for r in in_flight
+                    if r.get("prompt_id") and r["prompt_id"] in cancelled_pids
                 ][:cancelled_count]
                 db.clear_prompt_id(job_ids_to_clear)
             except Exception:

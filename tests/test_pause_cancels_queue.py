@@ -45,14 +45,23 @@ class _RecordingFetcher:
     """A fetcher that records every call and returns a programmable
     response. Each ``expect`` call is consumed FIFO; if the test makes
     more calls than expected the default ``default_response`` kicks in.
+
+    Responses can be 2-tuples ``(status, text)`` (legacy / convenience)
+    or 3-tuples ``(status, text, kind)`` to exercise the new timeout
+    branch in ``_comfyui_post_json``.
     """
 
-    def __init__(self, default_response: Tuple[int, str] = (200, "")):
+    def __init__(
+        self,
+        default_response: Tuple[int, str, str] = (200, "", "success"),
+    ):
         self.calls: List[Dict[str, Any]] = []
-        self._queue: List[Tuple[int, str]] = []
+        self._queue: List[Tuple[int, str, str]] = []
         self.default_response = default_response
 
-    def expect(self, response: Tuple[int, str]) -> "_RecordingFetcher":
+    def expect(self, response) -> "_RecordingFetcher":
+        if len(response) == 2:
+            response = (response[0], response[1], "success")
         self._queue.append(response)
         return self
 
@@ -321,7 +330,7 @@ class TestCancelComfyuiQueue(unittest.TestCase):
 
     def test_network_failure_counted_as_error(self):
         # Fetcher returns status=0 — emulates URL open failure / DNS.
-        fetcher = _RecordingFetcher(default_response=(0, ""))
+        fetcher = _RecordingFetcher(default_response=(0, "", "refused"))
         in_flight = [
             {"id": "x", "prompt_id": "px", "status": "dispatched"},
         ]
@@ -608,7 +617,7 @@ class TestPauseAllCancelsQueue(unittest.TestCase):
         b = _add(self.db)
         self.db.update_job(a, status="dispatched", prompt_id="p1")
         self.db.update_job(b, status="running", prompt_id="p2")
-        self.fetcher.default_response = (0, "")
+        self.fetcher.default_response = (0, "", "refused")
         self._patch_fetcher()
 
         resp = _run(routes.pause_all_handler(_StubRequest(self.app)))
@@ -650,6 +659,30 @@ class TestPauseAllCancelsQueue(unittest.TestCase):
         self.assertEqual(self.db.get_job(a)["status"], "scheduled")
         self.assertEqual(self.db.get_job(b)["status"], "scheduled")
         self.assertEqual(self.db.get_job(c)["status"], "running")
+
+    def test_pause_timeout_is_treated_as_success(self):
+        """A read timeout (status=0, kind='timeout') on the /interrupt call
+        means ComfyUI was busy finishing the current sampling step. We
+        treat the cancel as successful so the row gets reclaimed; if
+        ComfyUI really didn't process it, reconcile() will pick up
+        the orphan on the next poll and mark it interrupted."""
+        a = _add(self.db)
+        self.db.update_job(a, status="running", prompt_id="p-busy")
+        self.fetcher.expect((0, "", "timeout"))
+        self._patch_fetcher()
+
+        resp = _run(routes.pause_all_handler(_StubRequest(self.app)))
+        self.assertEqual(resp.status, 200)
+        body = json.loads(resp.body)
+        self.assertEqual(body["cancelled_count"], 1)
+        self.assertEqual(body["error_count"], 0)
+        # Timeout-as-success: status stays running (reconcile will
+        # eventually flip it to interrupted once ComfyUI stops
+        # reporting the prompt), but prompt_id must be cleared so
+        # reconcile doesn't keep tracking a stale ComfyUI prompt.
+        row = self.db.get_job(a)
+        self.assertIsNone(row.get("prompt_id"))
+        self.assertEqual(row["status"], "running")
 
     def test_pause_without_db_returns_500(self):
         broken_app = _FakeApp(db=None)  # type: ignore[arg-type]
