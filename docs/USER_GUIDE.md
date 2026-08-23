@@ -82,6 +82,22 @@ ComfyUI 原生的 Run 按钮**完全没改**。插件只是在你 *Schedule* 一
 └────────────────────────────────────────────────────────────────────┘
 ```
 
+### 2.1 真实界面截图
+
+下面 4 张图为插件运行时的真实截图,展示从顶栏按钮到各状态队列的完整流程:
+
+![顶栏 Schedule 按钮](screenshots/01-topbar-schedule-button.png)
+*图 1: ComfyUI 顶栏的 🕒 时钟图标 plugin 投递按钮, 位于 Run 按钮左侧。点击弹出 Schedule 对话框。*
+
+![Schedule 对话框](screenshots/02-schedule-dialog.png)
+*图 2: Schedule 对话框, 内含「快捷预设 + 时间输入框 + 微调按钮 + Priority + Note + Count」三段式时间控件。*
+
+![Scheduled 队列](screenshots/03-scheduled-queue.png)
+*图 3: Scheduled 状态标签页下的队列任务列表, 每行显示 workflow_title / 状态徽章 / scheduled_at / 调整顺序按钮 / Run 按钮。*
+
+![Done 队列含缩略图](screenshots/04-done-queue-thumbnails.png)
+*图 4: Done 状态标签页, 每条任务显示完成时间、运行时长和 60×60 的预览图缩略图, 点击可放大。*
+
 ### 2.2 元素说明
 
 | 区域 | 作用 |

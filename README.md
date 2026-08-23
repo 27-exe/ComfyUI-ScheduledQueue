@@ -77,6 +77,20 @@ A ComfyUI queue extension that **persists every job to SQLite, supports pause/re
 
 Topbar **Schedule** button (clock icon, left of Run) opens a modal for adding new tasks — see [docs/USER_GUIDE.md §3](docs/USER_GUIDE.md#3-添加单个任务--schedule-对话框).
 
+### Real UI screenshots:
+
+![Topbar Schedule Button](docs/screenshots/01-topbar-schedule-button.png)
+*ComfyUI topbar 的时钟图标 plugin 投递按钮*
+
+![Schedule Dialog](docs/screenshots/02-schedule-dialog.png)
+*Schedule 对话框: 三段式时间控件 + Priority + Note + Count*
+
+![Scheduled Queue](docs/screenshots/03-scheduled-queue.png)
+*Scheduled 标签页: 队列任务显示 + 调整顺序按钮 + 分页*
+
+![Done Queue with Thumbnails](docs/screenshots/04-done-queue-thumbnails.png)
+*Done 标签页: 完成时间 + 时长 + 预览图缩略图*
+
 ---
 
 ## 主要功能 / Features
