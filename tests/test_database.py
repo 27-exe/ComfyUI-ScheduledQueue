@@ -605,5 +605,189 @@ class TestWorkflowTitle(unittest.TestCase):
                 pass
 
 
+# ---------------------------------------------------------------------------
+# job_history.dispatched_at + outputs propagation through the paginated list.
+# ---------------------------------------------------------------------------
+
+class TestJobHistoryDispatchedAt(unittest.TestCase):
+    """Cover v0.3.11: ``dispatched_at`` is copied from the live row into
+    ``job_history`` when a job finishes, and the paginated list endpoint
+    exposes both ``dispatched_at`` and a decoded ``outputs`` dict so the
+    sidebar can show "完成于 HH:MM" and a thumbnail preview for finished
+    rows without a per-row detail fetch.
+    """
+
+    def setUp(self):
+        self.db, self.path = _fresh_db()
+
+    def tearDown(self):
+        self.db.close()
+        try:
+            os.unlink(self.path)
+        except OSError:
+            pass
+
+    def _add_dispatch(self):
+        """Add a job, claim it (so dispatched_at gets stamped), then return
+        the (job_id, dispatched_at) tuple from the live row."""
+        jid = self.db.add_job(payload={"p": 1}, scheduled_at=1.0)
+        claimed = self.db.claim_next_due_job()
+        assert claimed is not None
+        self.assertEqual(claimed["id"], jid)
+        self.assertEqual(claimed["status"], "dispatched")
+        return jid, claimed["dispatched_at"]
+
+    def test_finish_copies_dispatched_at(self):
+        # When a dispatched job is marked done, the history row must carry
+        # the same dispatched_at the live row had — not NULL.
+        jid, dispatched_at = self._add_dispatch()
+        self.db.update_job(jid, status="running", prompt_id="p-1")
+        self.db.mark_done(jid, prompt_id="p-1", outputs={"images": ["a.png"]})
+
+        hist = self.db.list_history()
+        self.assertEqual(len(hist), 1)
+        h0 = hist[0]
+        assert h0 is not None  # pyright narrowing
+        # dispatched_at is preserved verbatim.
+        self.assertEqual(h0["dispatched_at"], dispatched_at)
+        self.assertIsNotNone(h0["dispatched_at"])
+        # And finished_at is freshly stamped (later than dispatched_at).
+        self.assertGreater(h0["finished_at"], h0["dispatched_at"])
+
+    def test_finish_copies_dispatched_at_for_failed(self):
+        # Same propagation rule for mark_failed — the history row keeps
+        # dispatched_at so the sidebar can show "failed after dispatch".
+        jid, dispatched_at = self._add_dispatch()
+        self.db.update_job(jid, status="running", prompt_id="p-2")
+        self.db.mark_failed(jid, error="boom")
+
+        hist = self.db.list_history()
+        self.assertEqual(len(hist), 1)
+        h0 = hist[0]
+        assert h0 is not None  # pyright narrowing
+        self.assertEqual(h0["status"], "failed")
+        self.assertEqual(h0["dispatched_at"], dispatched_at)
+
+    def test_finish_dispatched_at_null_when_never_dispatched(self):
+        # If a job finishes without dispatch (shouldn't happen in normal
+        # flow, but the schema must allow it), dispatched_at must stay NULL
+        # rather than be silently defaulted.
+        jid = self.db.add_job(payload={}, scheduled_at=1.0)
+        # Cancel directly — never reaches the dispatcher.
+        self.db.cancel_job(jid)
+        # The cancelled row is in scheduled_jobs, not job_history. Drive it
+        # through _finish to exercise the dispatched_at=NULL path.
+        # Use mark_failed after the cancel to force the live→history move.
+        # mark_failed does DELETE FROM scheduled_jobs; cancel_job already
+        # left it there, so this is the path.
+        self.db.mark_failed(jid, error="never-dispatched")
+
+        hist = self.db.list_history()
+        self.assertEqual(len(hist), 1)
+        self.assertIsNone(hist[0]["dispatched_at"])
+
+    def test_list_paginated_history_includes_dispatched_at(self):
+        # The paginated helper used by /api/schedule/list must surface
+        # dispatched_at on history rows so the sidebar can show it.
+        jid, dispatched_at = self._add_dispatch()
+        self.db.update_job(jid, status="running", prompt_id="pd")
+        self.db.mark_done(jid, prompt_id="pd", outputs={"x": 1})
+
+        rows = self.db.list_jobs_paginated(statuses=["done"], limit=50, offset=0)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["id"], jid)
+        self.assertEqual(rows[0]["dispatched_at"], dispatched_at)
+        self.assertEqual(rows[0]["finished_at"], hist_finished_at := rows[0]["finished_at"])
+        self.assertGreater(hist_finished_at, dispatched_at)
+
+        # And the unfiltered variant (statuses=None) must also surface it.
+        rows_all = self.db.list_jobs_paginated(statuses=None, limit=50, offset=0)
+        hist_rows = [r for r in rows_all if r["status"] == "done"]
+        self.assertEqual(len(hist_rows), 1)
+        self.assertEqual(hist_rows[0]["dispatched_at"], dispatched_at)
+
+    def test_list_paginated_history_includes_outputs(self):
+        # The paginated helper must decode the JSON `outputs` column into a
+        # Python dict so the sidebar's thumbnail resolver sees a structured
+        # value, not a raw string.
+        jid, _ = self._add_dispatch()
+        self.db.update_job(jid, status="running", prompt_id="po")
+        self.db.mark_done(
+            jid, prompt_id="po",
+            outputs={"images": ["a.png", "b.png"], "text": ["greetings"]},
+        )
+
+        rows = self.db.list_jobs_paginated(statuses=["done"], limit=50, offset=0)
+        self.assertEqual(len(rows), 1)
+        outs = rows[0]["outputs"]
+        # Must be a decoded dict, not the raw JSON string.
+        self.assertIsInstance(outs, dict)
+        self.assertEqual(outs["images"], ["a.png", "b.png"])
+        self.assertEqual(outs["text"], ["greetings"])
+
+        # Same guarantee via the unfiltered paginated call.
+        rows_all = self.db.list_jobs_paginated(statuses=None, limit=50, offset=0)
+        hist_rows = [r for r in rows_all if r["status"] == "done"]
+        self.assertEqual(len(hist_rows), 1)
+        self.assertIsInstance(hist_rows[0]["outputs"], dict)
+
+    def test_list_paginated_outputs_none_for_failed_without_outputs(self):
+        # When mark_failed is called without explicit outputs (the normal
+        # failure path), the history row's outputs column is NULL; the
+        # paginated list must surface that as Python None, not a string.
+        jid, _ = self._add_dispatch()
+        self.db.update_job(jid, status="running", prompt_id="pf")
+        self.db.mark_failed(jid, error="boom")
+
+        rows = self.db.list_jobs_paginated(statuses=["failed"], limit=50, offset=0)
+        self.assertEqual(len(rows), 1)
+        self.assertIsNone(rows[0]["outputs"])
+
+    def test_migration_adds_dispatched_at_to_legacy_job_history(self):
+        # Simulate a pre-v0.3.11 DB where job_history lacks dispatched_at.
+        # We can't just rebuild the schema with raw CREATE TABLE because
+        # the fresh CREATE now includes the column, so drop & recreate
+        # job_history in the legacy shape, then reopen.
+        legacy = database.ScheduledQueueDB(db_path=self.path)
+        try:
+            legacy._conn.executescript("""
+                DROP TABLE job_history;
+                CREATE TABLE job_history (
+                  id TEXT PRIMARY KEY, prompt_id TEXT, finished_at REAL NOT NULL,
+                  status TEXT NOT NULL, outputs TEXT, error TEXT, payload TEXT,
+                  workflow_title TEXT
+                );
+            """)
+            legacy._conn.commit()
+            legacy.close()
+
+            legacy2 = database.ScheduledQueueDB(db_path=self.path)
+            try:
+                cols = {r[1] for r in legacy2._conn.execute(
+                    "PRAGMA table_info(job_history)"
+                ).fetchall()}
+                self.assertIn("dispatched_at", cols)
+                # And re-running __init__ is idempotent (no second ALTER).
+                legacy2.close()
+                legacy3 = database.ScheduledQueueDB(db_path=self.path)
+                try:
+                    cols2 = {r[1] for r in legacy3._conn.execute(
+                        "PRAGMA table_info(job_history)"
+                    ).fetchall()}
+                    self.assertEqual(cols2, cols)
+                finally:
+                    legacy3.close()
+            finally:
+                try:
+                    legacy2.close()
+                except Exception:
+                    pass
+        finally:
+            try:
+                legacy.close()
+            except Exception:
+                pass
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -51,7 +51,7 @@ class ScheduledQueueDB:
             CREATE TABLE IF NOT EXISTS job_history (
               id TEXT PRIMARY KEY, prompt_id TEXT, finished_at REAL NOT NULL,
               status TEXT NOT NULL, outputs TEXT, error TEXT, payload TEXT,
-              workflow_title TEXT
+              workflow_title TEXT, dispatched_at REAL
             );
             CREATE TABLE IF NOT EXISTS scheduler_state (key TEXT PRIMARY KEY, value TEXT NOT NULL);
             CREATE INDEX IF NOT EXISTS idx_sq_due ON scheduled_jobs(status, scheduled_at);
@@ -74,6 +74,12 @@ class ScheduledQueueDB:
             # display "which workflow" after the live row is archived.
             if "workflow_title" not in hcols:
                 self._conn.execute("ALTER TABLE job_history ADD COLUMN workflow_title TEXT")
+            # Mirror dispatched_at on the history row so the sidebar's
+            # "完成于 —" field can show when the live row was actually
+            # handed off to ComfyUI (NULL for jobs that were cancelled /
+            # failed before they ever dispatched).
+            if "dispatched_at" not in hcols:
+                self._conn.execute("ALTER TABLE job_history ADD COLUMN dispatched_at REAL")
             if self.get_state("paused") is None: self.set_state("paused", "1")
 
     def add_job(self, payload, scheduled_at, priority=100, note=None, client_id=None, auto_retry=0, workflow_title=None):
@@ -196,6 +202,17 @@ class ScheduledQueueDB:
                 (limit, offset),
             ).fetchall()
             out.extend(_dict(r) for r in rows)
+
+        # job_history stores `outputs` as a JSON string and `payload` as a
+        # JSON string; decode them here so callers (and the HTTP layer that
+        # re-serialises via json.dumps) get Python objects. The live table
+        # also stores `payload` as JSON but only `outputs` matters for the
+        # list endpoint — `payload` is stripped by routes._strip_payload
+        # before it leaves the server, so we leave it alone on live rows
+        # to avoid surprising existing tests that expect raw strings.
+        for row in out:
+            if row.get("status") in TERMINAL_HISTORY:
+                row["outputs"] = _safe_json(row.get("outputs"))
 
         return out
 
@@ -359,9 +376,13 @@ class ScheduledQueueDB:
     def _finish(self, job_id, status, prompt_id=None, outputs=None, error=None):
         now=time.time()
         with self._conn:
-            r=self._conn.execute("SELECT prompt_id,payload,workflow_title FROM scheduled_jobs WHERE id=?",(job_id,)).fetchone()
+            # Read dispatched_at from the live row so the history row mirrors
+            # "when this job actually started running" (NULL for jobs that
+            # finished without ever being dispatched — e.g. auto-retry
+            # cancellations handled before claim_next_due_job).
+            r=self._conn.execute("SELECT prompt_id,payload,workflow_title,dispatched_at FROM scheduled_jobs WHERE id=?",(job_id,)).fetchone()
             if not r:return False
-            self._conn.execute("INSERT OR REPLACE INTO job_history(id,prompt_id,finished_at,status,outputs,error,payload,workflow_title) VALUES(?,?,?,?,?,?,?,?)",(job_id,prompt_id or r[0],now,status,json.dumps(outputs,ensure_ascii=False,separators=(",",":")) if outputs is not None else None,error,r['payload'],r['workflow_title']))
+            self._conn.execute("INSERT OR REPLACE INTO job_history(id,prompt_id,finished_at,status,outputs,error,payload,workflow_title,dispatched_at) VALUES(?,?,?,?,?,?,?,?,?)",(job_id,prompt_id or r[0],now,status,json.dumps(outputs,ensure_ascii=False,separators=(",",":")) if outputs is not None else None,error,r['payload'],r['workflow_title'],r['dispatched_at']))
             self._conn.execute("DELETE FROM scheduled_jobs WHERE id=?",(job_id,))
         return True
     def mark_done(self,job_id,prompt_id=None,outputs=None): return self._finish(job_id,'done',prompt_id,outputs)
