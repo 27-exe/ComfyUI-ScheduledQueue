@@ -6,6 +6,17 @@ from pathlib import Path
 STATUSES = ("scheduled", "dispatched", "running", "interrupted", "cancelled")
 TERMINAL_HISTORY = ("done", "failed")
 
+# Conservative default wall-clock estimate (seconds) for how long a ComfyUI
+# workflow takes from dispatch to finish. Used by ``list_jobs_paginated`` to
+# synthesise a synthetic ``dispatched_at`` for legacy ``job_history`` rows
+# archived before v0.3.11 added the column — there is no real timestamp to
+# recover, so we pick a small, round number that keeps the sidebar's
+# "完成于 HH:MM:SS · Ns" duration row honest (it under-reports rather than
+# invents a wildly different time). 30s lines up with typical SDXL sampling
+# runs; the sidebar tags the result with ``dispatched_at_estimated=True`` so
+# future telemetry / better backfills can replace it without losing info.
+_LEGACY_DISPATCHED_AT_ESTIMATE = 30.0
+
 def _default_db_path() -> str:
     try:
         import folder_paths
@@ -213,6 +224,22 @@ class ScheduledQueueDB:
         for row in out:
             if row.get("status") in TERMINAL_HISTORY:
                 row["outputs"] = _safe_json(row.get("outputs"))
+                # Legacy rows (archived before v0.3.11 added `dispatched_at`
+                # to job_history) carry NULL in `dispatched_at` because the
+                # column didn't exist when they were inserted; the ALTER
+                # TABLE migration above backfills the column itself, but
+                # leaves every pre-existing row at NULL. Synthesise a
+                # synthetic dispatched_at by subtracting a conservative
+                # default run-time estimate so the sidebar can still show
+                # "完成于 HH:MM:SS · ~Xs" instead of dropping the duration
+                # component. We never overwrite a real value here, and the
+                # JSON we return to callers marks the synthesis so future
+                # telemetry can distinguish real vs. estimated starts.
+                if row.get("dispatched_at") is None and row.get("finished_at") is not None:
+                    row["dispatched_at"] = max(
+                        0.0, float(row["finished_at"]) - _LEGACY_DISPATCHED_AT_ESTIMATE
+                    )
+                    row["dispatched_at_estimated"] = True
 
         return out
 

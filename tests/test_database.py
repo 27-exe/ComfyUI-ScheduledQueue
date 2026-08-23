@@ -788,6 +788,195 @@ class TestJobHistoryDispatchedAt(unittest.TestCase):
             except Exception:
                 pass
 
+    def test_list_paginated_synthesises_dispatched_at_for_legacy_history_row(self):
+        # Legacy job_history rows (archived before v0.3.11) carry NULL
+        # dispatched_at because the column didn't exist when they were
+        # inserted. ``list_jobs_paginated`` must synthesise a value so the
+        # sidebar's "完成于 HH:MM:SS · Ns" duration row has something to
+        # subtract from. The synthesis uses a conservative default
+        # (``_LEGACY_DISPATCHED_AT_ESTIMATE``) and is tagged with
+        # ``dispatched_at_estimated=True`` so callers can tell it apart
+        # from a real stamp.
+        legacy = database.ScheduledQueueDB(db_path=self.path)
+        try:
+            legacy._conn.executescript("""
+                DROP TABLE job_history;
+                CREATE TABLE job_history (
+                  id TEXT PRIMARY KEY, prompt_id TEXT, finished_at REAL NOT NULL,
+                  status TEXT NOT NULL, outputs TEXT, error TEXT, payload TEXT,
+                  workflow_title TEXT
+                );
+                INSERT INTO job_history(id, finished_at, status, payload)
+                  VALUES ('old-done', 1_000_000.0, 'done',
+                          '{"p": 1}');
+                INSERT INTO job_history(id, finished_at, status, payload, error)
+                  VALUES ('old-failed', 1_000_010.0, 'failed',
+                          '{"p": 2}', 'oops');
+            """)
+            legacy._conn.commit()
+            legacy.close()
+
+            fresh = database.ScheduledQueueDB(db_path=self.path)
+            try:
+                rows = fresh.list_jobs_paginated(
+                    statuses=["done", "failed"], limit=50, offset=0,
+                )
+                self.assertEqual(len(rows), 2)
+                by_id = {r["id"]: r for r in rows}
+
+                # dispatched_at is back-filled from finished_at minus the
+                # estimate; the marker flag is set so callers can distinguish
+                # synthetic vs. real values.
+                done_row = by_id["old-done"]
+                # The synthesis produces a concrete timestamp equal to
+                # finished_at - _LEGACY_DISPATCHED_AT_ESTIMATE (pinned in a
+                # sibling test) — not None. We just verify the marker flag
+                # here and the invariant dispatched_at < finished_at below.
+                self.assertIsNotNone(done_row["dispatched_at"])
+                self.assertTrue(done_row["dispatched_at_estimated"])
+
+                # AND the underlying stored row is untouched — the synthesis
+                # only affects the in-memory dict the API returns, not the
+                # stored row (so a future backfill pass can replace these
+                # values without losing the original NULL marker).
+                raw = fresh._conn.execute(
+                    "SELECT dispatched_at FROM job_history WHERE id=?",
+                    ("old-done",),
+                ).fetchone()
+                self.assertIsNone(raw[0])
+
+                failed_row = by_id["old-failed"]
+                self.assertIsNotNone(failed_row["dispatched_at"])
+                self.assertTrue(failed_row["dispatched_at_estimated"])
+                self.assertEqual(failed_row["error"], "oops")
+
+                # finished_at / status survive intact so the sidebar can
+                # still show the absolute time and status badge.
+                self.assertEqual(done_row["finished_at"], 1_000_000.0)
+                self.assertEqual(done_row["status"], "done")
+                self.assertEqual(failed_row["finished_at"], 1_000_010.0)
+                self.assertEqual(failed_row["status"], "failed")
+
+                # And the duration computed from the synthetic stamp is
+                # positive and matches the constant (we can't subtract
+                # directly without knowing finished_at_estimate, so verify
+                # the invariant instead: dispatched_at < finished_at).
+                self.assertLess(done_row["dispatched_at"], done_row["finished_at"])
+                self.assertLess(failed_row["dispatched_at"], failed_row["finished_at"])
+            finally:
+                fresh.close()
+        finally:
+            try:
+                legacy.close()
+            except Exception:
+                pass
+
+    def test_list_paginated_does_not_overwrite_real_dispatched_at(self):
+        # When the live row had a real dispatched_at, _finish copies it into
+        # job_history; the synthesis pass must NOT clobber it or set the
+        # ``estimated`` flag. New writes from v0.3.11+ keep their original
+        # values exactly.
+        jid, dispatched_at = self._add_dispatch()
+        self.db.update_job(jid, status="running", prompt_id="reald")
+        self.db.mark_done(jid, prompt_id="reald", outputs={"x": 1})
+
+        rows = self.db.list_jobs_paginated(statuses=["done"], limit=50, offset=0)
+        self.assertEqual(len(rows), 1)
+        row = rows[0]
+        assert row is not None
+        # Real stamp, untouched.
+        self.assertEqual(row["dispatched_at"], dispatched_at)
+        # No ``estimated`` flag means callers treat this as authoritative.
+        self.assertNotIn("dispatched_at_estimated", row)
+        # finished_at is the real one too.
+        self.assertGreater(row["finished_at"], dispatched_at)
+
+    def test_list_paginated_synthesis_uses_module_estimate(self):
+        # The synthesised value MUST equal finished_at minus the module
+        # constant, exactly. If we ever change the constant, this test
+        # becomes a single place to update the expected arithmetic.
+        legacy = database.ScheduledQueueDB(db_path=self.path)
+        try:
+            legacy._conn.executescript("""
+                DROP TABLE job_history;
+                CREATE TABLE job_history (
+                  id TEXT PRIMARY KEY, prompt_id TEXT, finished_at REAL NOT NULL,
+                  status TEXT NOT NULL, outputs TEXT, error TEXT, payload TEXT,
+                  workflow_title TEXT
+                );
+                INSERT INTO job_history(id, finished_at, status, payload)
+                  VALUES ('x', 5_000.0, 'done', '{}');
+            """)
+            legacy._conn.commit()
+            legacy.close()
+
+            fresh = database.ScheduledQueueDB(db_path=self.path)
+            try:
+                rows = fresh.list_jobs_paginated(
+                    statuses=["done"], limit=50, offset=0,
+                )
+                self.assertEqual(len(rows), 1)
+                row = rows[0]
+                assert row is not None
+                # Pin to the module constant so any change forces a deliberate
+                # review of the synthetic dispatch estimate.
+                estimate = database._LEGACY_DISPATCHED_AT_ESTIMATE
+                self.assertEqual(
+                    row["dispatched_at"],
+                    max(0.0, row["finished_at"] - estimate),
+                )
+                # And the marker is present.
+                self.assertTrue(row["dispatched_at_estimated"])
+            finally:
+                fresh.close()
+        finally:
+            try:
+                legacy.close()
+            except Exception:
+                pass
+
+    def test_list_paginated_no_synthesis_when_finished_at_missing(self):
+        # Defensive: if a (hypothetical) legacy row had dispatched_at NULL
+        # but finished_at also NULL, the synthesis must NOT try to
+        # subtract from None and blow up — it should just leave dispatched_at
+        # alone. finished_at is NOT NULL in the schema, so this is a
+        # belt-and-braces guard against future schema drift.
+        legacy = database.ScheduledQueueDB(db_path=self.path)
+        try:
+            # SQLite allows NOT NULL columns to be relaxed via table
+            # rebuild; force the shape we want to test.
+            legacy._conn.executescript("""
+                DROP TABLE job_history;
+                CREATE TABLE job_history (
+                  id TEXT PRIMARY KEY, prompt_id TEXT, finished_at REAL,
+                  status TEXT NOT NULL, outputs TEXT, error TEXT, payload TEXT,
+                  workflow_title TEXT
+                );
+                INSERT INTO job_history(id, finished_at, status, payload)
+                  VALUES ('nofin', NULL, 'done', '{}');
+            """)
+            legacy._conn.commit()
+            legacy.close()
+
+            fresh = database.ScheduledQueueDB(db_path=self.path)
+            try:
+                rows = fresh.list_jobs_paginated(
+                    statuses=["done"], limit=50, offset=0,
+                )
+                self.assertEqual(len(rows), 1)
+                row = rows[0]
+                assert row is not None
+                # No synthesis happened.
+                self.assertIsNone(row["dispatched_at"])
+                self.assertNotIn("dispatched_at_estimated", row)
+            finally:
+                fresh.close()
+        finally:
+            try:
+                legacy.close()
+            except Exception:
+                pass
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
