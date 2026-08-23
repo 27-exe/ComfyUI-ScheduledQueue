@@ -106,10 +106,29 @@ def _apply_control_after_generate(inputs: dict) -> None:
     only wires up widgets for `seed` and `noise_seed`, and we don't have
     a node spec table to know which other COMBO widgets might want this
     treatment.
+
+    Fallback policy: if the payload carries a seed field but NO
+    ``control_after_generate`` directive, treat it as ``"randomize"``.
+
+    Why: ComfyUI's execution cache keys on the serialized prompt, so a
+    repeated dispatch with the same seed hits the cache and returns the
+    previous outputs in milliseconds — the user sees "instant" runs that
+    didn't actually run. Cache reuse only matters when the user expects a
+    fresh draw (randomize); fixed/increment flows already change the seed
+    each round-trip. Defaulting to randomize for the no-directive case is
+    therefore always the safe choice: if the user actually wanted fixed,
+    they would have stored the directive, and the existing node only has a
+    seed field if it's a sampler-style node where randomize is appropriate.
     """
     mode = inputs.get("control_after_generate")
     if not isinstance(mode, str):
-        return
+        # No directive present. If the node carries a seed-like field,
+        # default to randomize so cache reuse can't silently swallow the
+        # dispatch. Nodes with neither seed nor directive are left alone.
+        if any(f in inputs for f in _SEED_FIELDS):
+            mode = "randomize"
+        else:
+            return
     for field in _SEED_FIELDS:
         if field not in inputs:
             continue

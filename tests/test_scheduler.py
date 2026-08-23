@@ -301,11 +301,32 @@ class TestPreDispatchHooks(unittest.TestCase):
         # re-adding it.
         self.assertNotIn("control_after_generate", inputs)
 
-    def test_missing_control_field_leaves_seed_unchanged(self):
+    def test_no_cag_randomizes_seed(self):
+        # Regression: without a control_after_generate directive, the hook
+        # now defaults to randomize so ComfyUI's execution cache cannot
+        # silently reuse previous outputs on repeat dispatches. The user
+        # sees a fresh draw each run; the directive is *not* stored in the
+        # input dict, so we don't add it.
         inputs = {"seed": 42}
         scheduler._apply_control_after_generate(inputs)
-        self.assertEqual(inputs["seed"], 42)
+        self.assertNotEqual(inputs["seed"], 42)
         self.assertNotIn("control_after_generate", inputs)
+        # Stays in the seed widget's default min/max range.
+        self.assertGreaterEqual(inputs["seed"], 0)
+        self.assertLessEqual(inputs["seed"], 0xFFFFFFFFFFFFFFFF)
+
+    def test_no_cag_randomizes_noise_seed(self):
+        inputs = {"noise_seed": 999}
+        scheduler._apply_control_after_generate(inputs)
+        self.assertNotEqual(inputs["noise_seed"], 999)
+        self.assertNotIn("control_after_generate", inputs)
+
+    def test_no_seed_no_directive_is_untouched(self):
+        # A node with neither seed nor directive has nothing for the hook
+        # to do; leave the inputs alone.
+        inputs = {"steps": 20, "model": ["1", 0]}
+        scheduler._apply_control_after_generate(inputs)
+        self.assertEqual(inputs, {"steps": 20, "model": ["1", 0]})
 
     def test_missing_seed_with_control_field_is_safe(self):
         # A node that only carries the directive but no seed: just strip
@@ -323,13 +344,16 @@ class TestPreDispatchHooks(unittest.TestCase):
         # leak through and confuse ComfyUI's node validation.
         self.assertNotIn("control_after_generate", inputs)
 
-    def test_non_string_mode_is_ignored(self):
-        # Defensive: if the directive is somehow stored as a bool/None,
-        # we leave the seed alone rather than guessing.
+    def test_non_string_mode_falls_through_to_randomize(self):
+        # Defensive: a malformed directive (None / bool / int / list) is
+        # not a recognized mode, so the hook falls through to the no-cag
+        # fallback policy: if a seed field is present we randomize it.
+        # Rationale: if the directive isn't a valid string, we can't trust
+        # it — randomizing is always safer than risking cache reuse.
         for bogus in (None, True, 0, ["fixed"]):
             inputs = {"seed": 42, "control_after_generate": bogus}
             scheduler._apply_control_after_generate(inputs)
-            self.assertEqual(inputs["seed"], 42, msg=f"bogus={bogus!r}")
+            self.assertNotEqual(inputs["seed"], 42, msg=f"bogus={bogus!r}")
 
     def test_non_numeric_seed_is_left_alone(self):
         # Don't crash if a user-managed seed is still a string from a
@@ -486,6 +510,54 @@ class TestPreDispatchHooks(unittest.TestCase):
         stored = json.loads(stored_row["payload"])  # type: ignore[index]
         self.assertEqual(stored["1"]["inputs"]["seed"], 100)
         self.assertEqual(stored["1"]["inputs"]["control_after_generate"], "increment")
+
+    def test_api_format_payload_no_cag_now_randomizes(self):
+        """End-to-end: an API-format payload without ``control_after_generate``
+        is randomized by the hook before it reaches ComfyUI.
+
+        This is the bug-fix regression: before the fix, a stored payload
+        missing the directive would ship with its original seed and hit
+        ComfyUI's execution cache, producing "instant" runs that reused
+        previous outputs. After the fix, the hook must produce a fresh
+        seed so the cache key changes and ComfyUI actually re-executes.
+        """
+        self.db.set_state("paused", "0")
+        # Mirrors the failing snippet from the bug report: an API-format
+        # KSampler with seed/noise_seed and no control_after_generate.
+        payload = {
+            "3": {
+                "class_type": "KSampler",
+                "inputs": {"seed": 100, "noise_seed": 200},
+            }
+        }
+        self.db.add_job(payload=payload, scheduled_at=0.0)
+        w = scheduler.SchedulerThread(self.db, comfyui_url="http://fake/")
+
+        captured = {}
+
+        def fake_urlopen(req, timeout=None):
+            captured["body"] = json.loads(req.data.decode())
+            return _FakeResponse(200, json.dumps({"prompt_id": "p-nocag"}))
+
+        with patch.object(scheduler.urllib.request, "urlopen", side_effect=fake_urlopen):
+            w.tick()
+
+        sent_inputs = captured["body"]["prompt"]["3"]["inputs"]
+        # The seed/noise_seed must have been randomized away from the
+        # stored values — otherwise ComfyUI would cache-hit and return
+        # the previous outputs instead of running.
+        self.assertNotEqual(sent_inputs["seed"], 100)
+        self.assertNotEqual(sent_inputs["noise_seed"], 200)
+        # And the stored payload itself stays at 100/200 — the scheduler
+        # mutates a deepcopy on each dispatch, never writes back.
+        jobs = self.db.list_jobs(["running"], 1)
+        self.assertEqual(len(jobs), 1)
+        stored_row = self.db.get_job(jobs[0]["id"])
+        self.assertIsNotNone(stored_row)
+        assert stored_row is not None
+        stored = json.loads(stored_row["payload"])  # type: ignore[index]
+        self.assertEqual(stored["3"]["inputs"]["seed"], 100)
+        self.assertEqual(stored["3"]["inputs"]["noise_seed"], 200)
 
 
 if __name__ == "__main__":
