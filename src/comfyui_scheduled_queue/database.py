@@ -169,7 +169,18 @@ class ScheduledQueueDB:
                 (*sched, limit, offset),
             ).fetchall()
             out.extend(_dict(r) for r in rows)
-        elif not statuses:
+        if hist:
+            placeholders = ",".join("?" * len(hist))
+            rows = self._conn.execute(
+                f"SELECT * FROM job_history WHERE status IN ({placeholders}) "
+                f"ORDER BY finished_at DESC LIMIT ? OFFSET ?",
+                (*hist, limit, offset),
+            ).fetchall()
+            out.extend(_dict(r) for r in rows)
+        if not sched and not hist:
+            # No status filter (or every provided status was unknown): return
+            # rows from BOTH stores. scheduled_jobs keeps its live-first
+            # ordering; job_history is appended most-recent-finished first.
             rows = self._conn.execute(
                 "SELECT * FROM scheduled_jobs "
                 "ORDER BY CASE WHEN status IN ('scheduled','interrupted') THEN 0 "
@@ -179,13 +190,10 @@ class ScheduledQueueDB:
                 (limit, offset),
             ).fetchall()
             out.extend(_dict(r) for r in rows)
-
-        if hist:
-            placeholders = ",".join("?" * len(hist))
             rows = self._conn.execute(
-                f"SELECT * FROM job_history WHERE status IN ({placeholders}) "
-                f"ORDER BY finished_at DESC LIMIT ? OFFSET ?",
-                (*hist, limit, offset),
+                "SELECT * FROM job_history "
+                "ORDER BY finished_at DESC LIMIT ? OFFSET ?",
+                (limit, offset),
             ).fetchall()
             out.extend(_dict(r) for r in rows)
 

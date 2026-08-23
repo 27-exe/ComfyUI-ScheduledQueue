@@ -251,6 +251,92 @@ class TestStage3Pagination(unittest.TestCase):
         self.assertEqual(self.db.count_jobs([]), 6)
         self.assertEqual(self.db.count_jobs(None), 6)
 
+    def test_list_jobs_paginated_statuses_none_returns_all(self):
+        # Regression: when statuses is None (or empty), the paginated helper
+        # used to drop the history table entirely because the `elif not
+        # statuses` branch only queried scheduled_jobs. Now both stores are
+        # returned (live rows first, finished rows after).
+        for i in range(3):
+            self.db.add_job(payload={"live": i}, scheduled_at=10.0 + i)
+        # Two finished jobs that should land in job_history.
+        h1 = self.db.add_job(payload={"h": 1}, scheduled_at=99.0)
+        self.db.update_job(h1, status="running", prompt_id="p1")
+        self.db.mark_done(h1, prompt_id="p1", outputs={"x": 1})
+        h2 = self.db.add_job(payload={"h": 2}, scheduled_at=99.5)
+        self.db.update_job(h2, status="running", prompt_id="p2")
+        self.db.mark_failed(h2, error="boom")
+
+        # statuses=None (the default).
+        rows_none = self.db.list_jobs_paginated(statuses=None, limit=50, offset=0)
+        # statuses=() explicitly.
+        rows_empty = self.db.list_jobs_paginated(statuses=(), limit=50, offset=0)
+
+        for rows, label in ((rows_none, "None"), (rows_empty, "()")):
+            self.assertEqual(
+                len(rows), 5,
+                f"statuses={label} should return 3 live + 2 history rows",
+            )
+            statuses = {r["status"] for r in rows}
+            # Live rows present.
+            self.assertIn("scheduled", statuses)
+            # History rows present — this is the regression guard.
+            self.assertIn("done", statuses, f"statuses={label} dropped history 'done'")
+            self.assertIn("failed", statuses, f"statuses={label} dropped history 'failed'")
+            # Total count must agree.
+            self.assertEqual(len(rows), self.db.count_jobs(statuses=None))
+
+    def test_list_jobs_paginated_statuses_done_returns_history_only(self):
+        # statuses=("done") maps only to hist (not in _STATUS_IN_SCHEDULED).
+        # Pre-fix this returned [] because the `if sched:` branch was skipped
+        # AND the `elif not statuses:` branch was skipped (statuses was truthy).
+        # Post-fix the `if hist:` branch fires.
+        live = self.db.add_job(payload={"live": 1}, scheduled_at=10.0)
+        done = self.db.add_job(payload={"d": 1}, scheduled_at=20.0)
+        self.db.update_job(done, status="running", prompt_id="pd")
+        self.db.mark_done(done, prompt_id="pd", outputs={"x": 1})
+
+        rows = self.db.list_jobs_paginated(["done"], limit=50, offset=0)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["id"], done)
+        self.assertEqual(rows[0]["status"], "done")
+        # The live job must NOT appear when filtering by history-only status.
+        self.assertNotIn(live, {r["id"] for r in rows})
+        # And the count must agree.
+        self.assertEqual(self.db.count_jobs(["done"]), 1)
+
+    def test_list_jobs_paginated_statuses_scheduled_returns_live_only(self):
+        # statuses=("scheduled") maps only to sched. The hist branch should
+        # not contribute anything; history rows must not leak in.
+        live = self.db.add_job(payload={"l": 1}, scheduled_at=10.0)
+        finished = self.db.add_job(payload={"f": 1}, scheduled_at=20.0)
+        self.db.update_job(finished, status="running", prompt_id="pf")
+        self.db.mark_done(finished, prompt_id="pf", outputs={"x": 1})
+
+        rows = self.db.list_jobs_paginated(["scheduled"], limit=50, offset=0)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["id"], live)
+        self.assertEqual(rows[0]["status"], "scheduled")
+        # History row must not appear.
+        self.assertNotIn(finished, {r["id"] for r in rows})
+        self.assertEqual(self.db.count_jobs(["scheduled"]), 1)
+
+    def test_list_jobs_paginated_statuses_mixed_returns_both(self):
+        # statuses=("scheduled", "done") spans both stores. Both branches fire.
+        live = self.db.add_job(payload={"l": 1}, scheduled_at=10.0)
+        finished = self.db.add_job(payload={"f": 1}, scheduled_at=20.0)
+        self.db.update_job(finished, status="running", prompt_id="pf")
+        self.db.mark_done(finished, prompt_id="pf", outputs={"x": 1})
+
+        rows = self.db.list_jobs_paginated(["scheduled", "done"], limit=50, offset=0)
+        ids = {r["id"] for r in rows}
+        self.assertEqual(len(rows), 2)
+        self.assertIn(live, ids)
+        self.assertIn(finished, ids)
+        statuses = {r["status"] for r in rows}
+        self.assertEqual(statuses, {"scheduled", "done"})
+        # Count agrees.
+        self.assertEqual(self.db.count_jobs(["scheduled", "done"]), 2)
+
     def test_list_jobs_paginated_consistent_with_count(self):
         for i in range(7):
             self.db.add_job(payload={"i": i}, scheduled_at=10.0 + i)
