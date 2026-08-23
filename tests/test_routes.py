@@ -111,6 +111,33 @@ class TestRoutes(unittest.TestCase):
             app=self.app, json_body=None, match_info={"job_id": a})))
         self.assertEqual(resp.status, 400)
 
+    def _pause_no_cancel(self):
+        """Call ``pause_all_handler`` while stubbing out the
+        ComfyUI-queue cancel layer.
+
+        The pause-all feature now POSTs to ComfyUI's ``/queue`` and
+        ``/interrupt`` endpoints to actually pull dispatched/running
+        prompts out of the executor (instead of just flipping the
+        scheduler's paused flag). Existing pause-tests in this file
+        pre-date that change and assert purely on the DB state
+        — they don't (and shouldn't) care about the HTTP layer.
+
+        Tests that DO care about the cancel layer live in
+        ``test_pause_cancels_queue.py`` and use their own fetcher
+        injection.
+        """
+        from unittest.mock import patch
+        # ``cancelled == len(in_flight)`` and no errors → the handler
+        # will reclaim every 'dispatched' row, matching the
+        # pre-feature behaviour these tests assert on.
+        patcher = patch.object(
+            self._routes, "_cancel_comfyui_queue",
+            return_value=(99, 0, []),
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return _run(self._routes.pause_all_handler(_StubRequest(app=self.app)))
+
     def test_pause_then_status_reflects_state(self):
         # status should report True before pause, and reflect the DB state
         # after a toggle (not the previously hard-coded True).
@@ -119,7 +146,7 @@ class TestRoutes(unittest.TestCase):
         body = json.loads(resp.body)
         self.assertTrue(body["paused"], "default state should be paused")
 
-        _run(self._routes.pause_all_handler(_StubRequest(app=self.app)))
+        self._pause_no_cancel()
         resp = _run(self._routes.status_handler(_StubRequest(app=self.app)))
         self.assertTrue(json.loads(resp.body)["paused"])
 
@@ -131,7 +158,7 @@ class TestRoutes(unittest.TestCase):
     def test_pause_reclaims_dispatched_and_resume_redelivers(self):
         dispatched = self._add()
         self.db.mark_dispatched(dispatched, "p-dispatched")
-        resp = _run(self._routes.pause_all_handler(_StubRequest(app=self.app)))
+        resp = self._pause_no_cancel()
         self.assertEqual(json.loads(resp.body)["reclaimed_count"], 1)
         row = self.db.get_job(dispatched)
         self.assertEqual(row["status"], "scheduled")
@@ -145,7 +172,7 @@ class TestRoutes(unittest.TestCase):
         jid = self._add()
         self.db.mark_dispatched(jid, "p-running")
         self.db.mark_running(jid, "p-running")
-        _run(self._routes.pause_all_handler(_StubRequest(app=self.app)))
+        self._pause_no_cancel()
         self.assertEqual(self.db.get_job(jid)["status"], "running")
 
     def test_status_db_state_change_is_observable(self):

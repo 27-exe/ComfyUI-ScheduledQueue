@@ -68,6 +68,7 @@ const BUILTIN_FALLBACKS = {
     "status_bar.paused_yes": "Yes",
     "status_bar.paused_no": "No",
     "status_bar.label.sched": "Scheduled",
+    "status_bar.label.dispatched": "Dispatched",
     "status_bar.label.run": "Running",
     "status_bar.label.int": "Interrupted",
     "status_bar.label.done": "Done",
@@ -482,7 +483,7 @@ function buildPanel() {
     function renderStatus(status) {
         const counters = [
             [t("status_bar.label.sched"), status.counts.scheduled],
-            [t("status_bar.label.dispatched", t("filter.dispatched", "已投递")), status.counts.dispatched || 0],
+            [t("status_bar.label.dispatched"), status.counts.dispatched || 0],
             [t("status_bar.label.run"), status.counts.running],
             [t("status_bar.label.int"), status.counts.interrupted],
             [t("status_bar.label.done"), status.counts.done],

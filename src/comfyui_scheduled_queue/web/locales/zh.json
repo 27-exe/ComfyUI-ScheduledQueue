@@ -27,6 +27,7 @@
 
     "status.scheduled": "等待中",
     "status.running": "运行中",
+    "status.dispatched": "已投递",
     "status.done": "成功",
     "status.failed": "失败",
     "status.cancelled": "已取消",
@@ -36,6 +37,7 @@
     "status_bar.paused_yes": "是",
     "status_bar.paused_no": "否",
     "status_bar.label.sched": "待",
+    "status_bar.label.dispatched": "投递",
     "status_bar.label.run": "运行",
     "status_bar.label.int": "中断",
     "status_bar.label.done": "成功",

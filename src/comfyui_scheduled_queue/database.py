@@ -478,6 +478,52 @@ class ScheduledQueueDB:
             )
         return cur.rowcount
 
+    def list_in_flight_with_prompt_id(self):
+        """Return (job_id, prompt_id, status) for every dispatched / running row.
+
+        Used by the pause-all handler to enumerate the prompt_ids that
+        still sit in ComfyUI's native queue (either in ``queue_pending``
+        for ``status='dispatched'`` rows, or actively running in
+        ``queue_running`` for ``status='running'`` rows) so the caller
+        can POST ``/queue {delete: [...]}`` or ``/interrupt {prompt_id:
+        ...}`` against ComfyUI and actually pull those jobs out of
+        ComfyUI's executor.
+
+        Rows with a NULL ``prompt_id`` (e.g. an in-flight ``claim_next_due_job``
+        that has not yet finished its POST) are skipped — there is nothing
+        for ComfyUI to cancel yet, the scheduler will simply flip their
+        status back to ``scheduled`` via ``reclaim_dispatched`` and the next
+        tick will re-dispatch them normally.
+
+        Returns a list of dicts, sorted by ``status`` (``'dispatched'``
+        first, then ``'running'``) so callers that split into two
+        ComfyUI calls (delete vs interrupt) can do so without re-sorting.
+        """
+        with self._conn:
+            rows = self._conn.execute(
+                "SELECT id, prompt_id, status FROM scheduled_jobs "
+                "WHERE status IN ('dispatched','running') AND prompt_id IS NOT NULL "
+                "ORDER BY CASE WHEN status='dispatched' THEN 0 ELSE 1 END, id"
+            ).fetchall()
+        return [_dict(r) for r in rows]
+
+    def clear_prompt_id(self, job_ids):
+        """NULL out the ``prompt_id`` (and ``dispatched_at``) for the given
+        rows. Idempotent and tolerant of missing ids — used after pause-all
+        successfully POSTed the cancel calls to ComfyUI, so the row no
+        longer mirrors a real ComfyUI prompt and ``reconcile`` will not
+        try to fetch its /history record."""
+        if not job_ids:
+            return 0
+        placeholders = ",".join("?" for _ in job_ids)
+        with self._conn:
+            cur = self._conn.execute(
+                f"UPDATE scheduled_jobs SET prompt_id=NULL, dispatched_at=NULL "
+                f"WHERE id IN ({placeholders})",
+                tuple(job_ids),
+            )
+        return cur.rowcount
+
     def increment_retry(self,job_id):
         with self._conn:self._conn.execute("UPDATE scheduled_jobs SET retry_count=retry_count+1 WHERE id=?",(job_id,))
         r=self._conn.execute("SELECT retry_count FROM scheduled_jobs WHERE id=?",(job_id,)).fetchone(); return int(r[0]) if r else 0

@@ -35,6 +35,8 @@ from __future__ import annotations
 import json
 import logging
 import time
+import urllib.error
+import urllib.request
 from typing import Any
 
 # NOTE: keep module imports minimal. aiohttp.web + server.PromptServer are
@@ -156,6 +158,150 @@ def _strip_payload(row: dict) -> dict:
     if "payload" in row:
         row = {k: v for k, v in row.items() if k != "payload"}
     return row
+
+
+# ---------------------------------------------------------------------------
+# ComfyUI queue cancellation helpers (used by pause_all_handler).
+#
+# ComfyUI exposes two distinct cancellation surfaces — both must be hit
+# for a true "pause and pull every in-flight job back":
+#
+#   POST /queue  {"delete": [<prompt_id>, ...]}   -- removes PENDING
+#                                                   entries from
+#                                                   ComfyUI's
+#                                                   queue_pending.
+#   POST /interrupt  {"prompt_id": "..."}         -- interrupts the
+#                                                   currently-RUNNING
+#                                                   prompt; we send one
+#                                                   request per running
+#                                                   job because the
+#                                                   interrupt endpoint
+#                                                   only accepts one
+#                                                   prompt_id at a time.
+#
+# All HTTP calls go through ``_comfyui_post_json`` so the unit tests can
+# inject a fake fetcher via ``patch.object(routes, '_comfyui_post_json')``.
+# ---------------------------------------------------------------------------
+
+_DEFAULT_COMFYUI_URL = "http://127.0.0.1:8188"
+# ComfyUI's /queue and /interrupt calls during a pause should be quick;
+# they just mutate an in-memory queue. We pick a 5s ceiling so a wedged
+# ComfyUI doesn't hold the aiohttp handler thread for ages.
+_COMFYUI_HTTP_TIMEOUT = 5.0
+
+
+def _default_comfyui_fetcher(url, body, timeout):
+    """Built-in fetcher: POST ``body`` (bytes) to ``url`` via urllib.
+
+    Returns ``(status, text)`` — ``status`` is the HTTP code or 0 on a
+    network error, ``text`` is whatever the body was (best-effort decode).
+    Never raises.
+    """
+    req = urllib.request.Request(
+        url, data=body, headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.status, r.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as exc:
+        return getattr(exc, "code", 0), ""
+    except (urllib.error.URLError, TimeoutError, ConnectionError, OSError):
+        return 0, ""
+
+
+def _comfyui_post_json(url, body, *, fetcher=None):
+    """POST *body* as JSON to *url*. Returns ``(ok, payload_or_err)``.
+
+    ``ok`` is True on any 2xx response. 4xx / 5xx and network errors
+    return ``ok=False`` with a short string reason. The caller decides
+    whether to log/aggregate/retry; this helper never raises.
+
+    Tests inject ``fetcher`` to avoid hitting a real ComfyUI. The fetcher
+    signature is ``fetcher(url: str, body: bytes, timeout: float)
+    -> (status: int, text: str)``; the default uses ``urllib.request``.
+    """
+    payload = json.dumps(body).encode()
+    do_fetch = fetcher if fetcher is not None else _default_comfyui_fetcher
+    try:
+        status, text = do_fetch(url, payload, _COMFYUI_HTTP_TIMEOUT)
+    except Exception as exc:  # noqa: BLE001 — defensive, never raise from HTTP helper
+        return False, f"fetcher raised: {exc!r}"
+    if 200 <= status < 300:
+        return True, text
+    return False, f"HTTP {status}"
+
+
+def _cancel_comfyui_queue(in_flight, comfyui_url, *, fetcher=None):
+    """Cancel every (job_id, prompt_id) in *in_flight* against ComfyUI.
+
+    *in_flight* is a list of dicts from
+    ``ScheduledQueueDB.list_in_flight_with_prompt_id()`` — each row
+    carries at least ``id``, ``prompt_id`` and ``status`` (``'dispatched'``
+    or ``'running'``).
+
+    Behaviour:
+      * ``dispatched`` rows are bundled into a single
+        ``POST /queue {delete: [...]}`` call (ComfyUI accepts a list).
+      * ``running`` rows are interrupted one at a time via
+        ``POST /interrupt {prompt_id: pid}`` (ComfyUI's interrupt
+        endpoint only takes one id at a time).
+
+    Returns ``(cancelled_count, error_count, error_messages)``:
+      * ``cancelled_count`` — rows whose prompt_id ComfyUI acknowledged
+        (deleted from queue_pending OR successfully interrupted from
+        queue_running). Per-prompt idempotency: a missing / already-done
+        prompt is counted as cancelled because reconcile() will not find
+        it in either queue slot either.
+      * ``error_count`` — HTTP 5xx / network errors that prevented us
+        from even reaching ComfyUI. The caller decides whether to
+        still reclaim these rows (we currently DO NOT reclaim on error,
+        so a retry of ``/pause-all`` will try again with a fresh HTTP
+        call).
+      * ``error_messages`` — short strings for logging / surfacing in
+        the HTTP response (so operators can tell "ComfyUI was down" from
+        "the cancel landed but ComfyUI returned 500").
+
+    The function never raises. ``comfyui_url`` should be a fully-qualified
+    base URL with no trailing slash.
+    """
+    if not in_flight:
+        return 0, 0, []
+
+    pending_ids = [r["prompt_id"] for r in in_flight if r["status"] == "dispatched" and r.get("prompt_id")]
+    running_ids = [r["prompt_id"] for r in in_flight if r["status"] == "running" and r.get("prompt_id")]
+    # Map pid -> job_id so the caller can clear the prompt_id off our
+    # rows after a successful cancel (so reconcile doesn't fetch a
+    # /history record for a prompt ComfyUI no longer has).
+    pid_to_job = {r["prompt_id"]: r["id"] for r in in_flight if r.get("prompt_id")}
+
+    cancelled = 0
+    errors: list[str] = []
+    base = comfyui_url.rstrip("/")
+
+    if pending_ids:
+        ok, info = _comfyui_post_json(
+            base + "/queue", {"delete": pending_ids}, fetcher=fetcher,
+        )
+        if ok:
+            # ComfyUI returns 200 with an empty body and no per-id
+            # acknowledgement; we treat the whole batch as cancelled on
+            # any 2xx because there is no public per-id status code and
+            # missing prompt_ids are silent no-ops on ComfyUI's side.
+            cancelled += len(pending_ids)
+        else:
+            errors.append(f"queue delete: {info}")
+
+    for pid in running_ids:
+        ok, info = _comfyui_post_json(
+            base + "/interrupt", {"prompt_id": pid}, fetcher=fetcher,
+        )
+        if ok:
+            cancelled += 1
+        else:
+            errors.append(f"interrupt {pid[:8]}: {info}")
+
+    return cancelled, len(errors), errors
 
 
 # ---------------------------------------------------------------------------
@@ -521,26 +667,125 @@ async def pause_all_handler(request) -> "web.Response":  # type: ignore[name-def
     """POST /api/schedule/pause-all
 
     Body: empty.
-    Response: 200 {"paused": true}.
-    Side effect: db.set_state("paused", "1").
+    Response: 200 ``{"paused": true, "reclaimed_count": N,
+    "cancelled_count": M, "error_count": K, "errors": [...]}``.
 
-    The actual scheduler thread (Stage 2 — scheduler.py) reads this
-    state every tick; flip to "1" halts dispatching immediately. In-flight
-    ComfyUI prompts are NOT cancelled (the native queue keeps running);
-    pause only stops NEW dispatches from this scheduler.
+    Side effects (in order):
+
+      1. ``db.set_state("paused", "1")`` — the scheduler thread stops
+         dispatching new jobs at the next tick.
+      2. ``db.list_in_flight_with_prompt_id()`` — enumerate every row
+         still sitting in ComfyUI's native queue (status='dispatched'
+         lives in ComfyUI's ``queue_pending``; status='running' lives in
+         ``queue_running``).
+      3. Hit ComfyUI to actually pull them out:
+
+         * ``POST /queue {delete: [...]}`` with every dispatched
+           prompt_id bundled into a single batch (ComfyUI accepts a
+           list).
+         * ``POST /interrupt {prompt_id: ...}`` once per running row
+           (ComfyUI's interrupt endpoint only takes one id at a time).
+
+      4. ``db.reclaim_dispatched()`` — flip the now-cancelled
+         'dispatched' rows back to 'scheduled' so the scheduler can
+         pick them up again on resume. ``running`` rows keep their
+         status and rely on the next reconcile() pass to finalise
+         them once ComfyUI writes a /history entry for the interrupted
+         prompt. **Skipped when any cancel call failed** — if
+         ComfyUI didn't ack the cancel, leaving the row at
+         'dispatched' preserves the prompt_id so a subsequent
+         ``/pause-all`` retry can target it again. The handler also
+         calls ``db.clear_prompt_id()`` for the successfully cancelled
+         ids so reconcile() doesn't fetch a /history record for a
+         prompt that no longer exists.
+      5. ``db.set_state("last_error")`` is touched when at least one
+         HTTP call failed so the operator can see the queue-cancel
+         failure from ``/status``.
+
+    Failure modes:
+
+      * If ComfyUI is unreachable / returns 5xx for every cancel call,
+        the in-ComfyUI jobs keep running; our DB rows stay at
+        'dispatched' / 'running' and a subsequent ``/pause-all`` retry
+        will try again with a fresh HTTP request. ``paused=True`` is
+        still returned because the scheduler is correctly paused — the
+        operator just has to retry the cancel piece.
+      * If ``reclaim_dispatched()`` raises, we still return 200 with
+        whatever the HTTP layer accomplished so a partial outage
+        doesn't leave the scheduler running. The exception is logged.
     """
     db = request.app.get("sq_db")
     if db is None:
         return _server_error("db not initialized")
 
+    # The ComfyUI URL is overridable from app state so a deployment that
+    # talks to a non-default host (cluster peer, second ComfyUI process)
+    # can wire it in without editing this file. Default matches the
+    # scheduler.py default so the two stay in lockstep.
+    comfyui_url = request.app.get("sq_comfyui_url") or _DEFAULT_COMFYUI_URL
+
     try:
         db.set_state("paused", "1")
-        reclaimed_count = db.reclaim_dispatched()
+        in_flight = db.list_in_flight_with_prompt_id()
     except Exception:
-        _log.exception("pause_all: set_state failed")
+        _log.exception("pause_all: db read failed")
         return _server_error("database error")
 
-    return _json_response({"paused": True, "reclaimed_count": int(reclaimed_count)})
+    cancelled_count = 0
+    error_count = 0
+    errors: list[str] = []
+    if in_flight:
+        cancelled_count, error_count, errors = _cancel_comfyui_queue(
+            in_flight, comfyui_url,
+        )
+        if error_count:
+            _log.warning(
+                "pause_all: %d/%d ComfyUI cancel calls failed: %s",
+                error_count, len(in_flight), errors,
+            )
+            # Surface the most recent error in /status so operators can
+            # tell why the queue still shows in-flight rows.
+            try:
+                db.set_state("last_error", f"pause_all cancel: {errors[0]}")
+            except Exception:
+                pass
+        if cancelled_count:
+            # Drop the prompt_id off rows that ComfyUI acknowledged so
+            # reconcile() doesn't fetch a /history record for a prompt
+            # that no longer exists.
+            try:
+                cancelled_pids = {r["prompt_id"] for r in in_flight}
+                # `cancelled_count` is the sum of dispatched + running
+                # acks. If we ack'd the dispatched batch but one of the
+                # interrupts failed, we may have over-counted — slice
+                # to ``cancelled_count`` so we don't try to clear a
+                # prompt_id for a row whose cancel actually failed.
+                job_ids_to_clear = [
+                    r["id"] for r in in_flight if r["prompt_id"] in cancelled_pids
+                ][:cancelled_count]
+                db.clear_prompt_id(job_ids_to_clear)
+            except Exception:
+                _log.exception("pause_all: clear_prompt_id failed (continuing)")
+
+    # Only reclaim 'dispatched' rows when the cancel calls actually
+    # landed (or there were no in-flight rows to begin with). If the
+    # cancel failed, leaving the row at 'dispatched' preserves the
+    # prompt_id so a subsequent ``/pause-all`` retry can target it
+    # again; reclaiming would NULL the prompt_id and break reconcile.
+    reclaimed_count = 0
+    if error_count == 0:
+        try:
+            reclaimed_count = db.reclaim_dispatched()
+        except Exception:
+            _log.exception("pause_all: reclaim_dispatched failed (continuing)")
+
+    return _json_response({
+        "paused": True,
+        "reclaimed_count": int(reclaimed_count),
+        "cancelled_count": int(cancelled_count),
+        "error_count": int(error_count),
+        "errors": errors,
+    })
 
 
 async def resume_all_handler(request) -> "web.Response":  # type: ignore[name-defined]
@@ -1050,4 +1295,8 @@ __all__ = [
     "clear_handler",
     "repeat_handler",
     "export_handler",
+    # Internal helpers — exported so tests can patch them.
+    "_comfyui_post_json",
+    "_cancel_comfyui_queue",
+    "_DEFAULT_COMFYUI_URL",
 ]

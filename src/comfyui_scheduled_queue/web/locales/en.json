@@ -27,6 +27,7 @@
 
     "status.scheduled": "Scheduled",
     "status.running": "Running",
+    "status.dispatched": "Dispatched",
     "status.done": "Done",
     "status.failed": "Failed",
     "status.cancelled": "Cancelled",
@@ -36,6 +37,7 @@
     "status_bar.paused_yes": "yes",
     "status_bar.paused_no": "no",
     "status_bar.label.sched": "sched",
+    "status_bar.label.dispatched": "dispatch",
     "status_bar.label.run": "run",
     "status_bar.label.int": "int",
     "status_bar.label.done": "done",
