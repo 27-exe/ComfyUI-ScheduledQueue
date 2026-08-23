@@ -1,4 +1,9 @@
-# ComfyUI-ScheduledQueue 用户指南
+---
+[中文]
+
+- **Description:** 用户视角的插件使用手册 — 介绍 ScheduledQueue 的功能边界、UI 元素含义、Schedule 对话框与批量添加的用法、队列管理 (过滤 / 分页 / Clear / Repeat / Export)、CLI 等价命令, 以及常见故障的排查步骤。
+- **Audience:** 已经装好 ComfyUI + ComfyUI-ScheduledQueue, 想搞清楚这个插件能干什么、什么时候该用、踩坑了怎么排查的使用者。不面向首次安装者 (请先看 INSTALL.md)。
+- **Contents:** §1 30 秒看懂插件 · §2 界面长什么样 · §3 添加单个任务 (Schedule 对话框) · §4 批量添加同一个工作流 · §5 队列管理 (Clear / Repeat / 分页 / 过滤) · §6 编辑已排队的任务 · §7 Cache 复用场景解释 · §8 CLI 用法 · §9 故障排查 · §10 提 issue 之前 · §11 下一步可以读的。
 
 > 目标读者: 已经装好 ComfyUI + ComfyUI-ScheduledQueue, 想搞清楚这个插件到底能干什么、什么时候该用、踩坑了怎么排查的人。
 >

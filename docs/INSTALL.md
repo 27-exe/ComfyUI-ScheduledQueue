@@ -1,4 +1,9 @@
-# Install / Upgrade / Rollback
+---
+[EN]
+
+- **Description:** End-to-end installation, upgrade, and rollback procedures for the ComfyUI-ScheduledQueue plugin — symlink vs. copy install, schema migrations, where plugin state is written, and a compatibility matrix for ComfyUI server / frontend / Python / OS versions.
+- **Audience:** Operator installing or maintaining the plugin on a host running ComfyUI. Assumes familiarity with running ComfyUI from a terminal but not with this plugin.
+- **Contents:** §1 Requirements (software, hardware, network, disk) · §2 Install (symlink / copy) · §3 Upgrade · §4 Rollback / Uninstall · §5 Where state lives · §6 Compatibility matrix · §7 Common install problems · §8 Upgrading from a pre-release snapshot.
 
 > Paths are written generically below. Replace the placeholders before
 > running the commands:

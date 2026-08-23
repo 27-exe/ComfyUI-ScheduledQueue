@@ -2,20 +2,21 @@
 
 **Status:** under development (v0.3.10). CLI and HTTP API are production-ready; the bundled sidebar UI is stable against ComfyUI ≥ 1.49.6.
 
+[简体中文](README.zh.md)
+
 ---
 
-## 项目简介 / Overview
+## Overview
 
-**持久化 + 暂停 + 重排序 + 任意时间定时投递的 ComfyUI 队列扩展。**
 A ComfyUI queue extension that **persists every job to SQLite, supports pause/resume, drag-free reorder, and arbitrary-time delivery** — without disturbing ComfyUI's native Run button.
 
-提交一个 workflow 不再等于"立刻占用 GPU"。把今晚 23:00 的批渲染、明天 9:00 的风格实验、一周后才会用到的种子复跑都加入队列，关掉浏览器，明天打开 ComfyUI，队列已经在跑了。
+Submitting a workflow no longer means "seize the GPU right now". You can queue tonight's 23:00 batch render, tomorrow's 9:00 style experiment, and a seed resweep that's only useful a week from now — close the browser, reopen ComfyUI tomorrow, and the queue is already running.
 
-> **Beta / 公测提示:** 请先阅读 [Compatibility](#compatibility)。The bundled frontend assumes ComfyUI ≥ 1.49.6 with `app.registerExtension` and `app.extensionManager.registerSidebarTab`.
+> **Beta / public preview:** Please read [Compatibility](#compatibility) first. The bundled frontend assumes ComfyUI ≥ 1.49.6 with `app.registerExtension` and `app.extensionManager.registerSidebarTab`.
 
 ---
 
-## Sidebar UI (主界面)
+## Sidebar UI (main surface)
 
 ```
 ┌──────────────────────────────────────────────────────────────────────────┐
@@ -75,41 +76,41 @@ A ComfyUI queue extension that **persists every job to SQLite, supports pause/re
 | ⑦ | 60×60 thumbnail (done jobs only); click → fullscreen modal | L570–L582, modal L575–L577 |
 | ⑧ | Pagination (Prev / Page info / Next) | `[data-role="pager"]` L86–L89 |
 
-Topbar **Schedule** button (clock icon, left of Run) opens a modal for adding new tasks — see [docs/USER_GUIDE.md §3](docs/USER_GUIDE.md#3-添加单个任务--schedule-对话框).
+The topbar **Schedule** button (clock icon, left of Run) opens a modal for adding new tasks — see [docs/USER_GUIDE.md §3](docs/USER_GUIDE.md#3-添加单个任务--schedule-对话框) (USER_GUIDE.md is currently Chinese-only).
 
-### Real UI screenshots:
+### Real UI screenshots
 
 ![Topbar Schedule Button](docs/screenshots/01-topbar-schedule-button.png)
-*ComfyUI topbar 的时钟图标 plugin 投递按钮*
+*ComfyUI topbar clock-icon plugin submit button*
 
 ![Schedule Dialog](docs/screenshots/02-schedule-dialog.png)
-*Schedule 对话框: 三段式时间控件 + Priority + Note + Count*
+*Schedule dialog: three-segment time controls + Priority + Note + Count*
 
 ![Scheduled Queue](docs/screenshots/03-scheduled-queue.png)
-*Scheduled 标签页: 队列任务显示 + 调整顺序按钮 + 分页*
+*Scheduled tab: queued tasks + reorder buttons + pagination*
 
 ![Done Queue with Thumbnails](docs/screenshots/04-done-queue-thumbnails.png)
-*Done 标签页: 完成时间 + 时长 + 预览图缩略图*
+*Done tab: completion time + duration + preview thumbnails*
 
 ---
 
-## 主要功能 / Features
+## Features
 
-| 痛点 (Pain point) | 解决 (Solution) | Where |
+| Pain point | Solution | Where |
 |---|---|---|
-| 想让 prompt 在 GPU 空闲时才跑, 又不想半夜开电脑 | **任务调度 (时间窗)** — 任意 ISO 或相对时间 (`--in 10m`, `--in 2h`, `tomorrow 9 am`) | `scheduler.tick()` → `claim_next_due_job()` |
-| ComfyUI 崩溃 / 重启会丢失内存中的队列 | **持久化** — 每个任务都进 `<ComfyUI>/user/scheduled_queue.sqlite3` (WAL 模式) | `database.py` `ScheduledQueueDB` |
-| 想做 50 张批量,但不想点 50 次 Run | **重复任务 (Clear / Repeat / Batch add)** — `Count: N` 一次提交 1–50 份; Repeat (↻) 一键克隆已完成任务 | `/api/schedule/add-batch`, `Repeat` button L542 |
-| 队列里 30 条任务, 看到的是 `KSampler-42`, 找不到第几条是哪批 | **工作流命名 (workflow_title from Pinia store)** — 提交时从 `app.extensionManager.workflow.activeWorkflow.filename` 读取并落到数据库, 侧栏优先显示它 | `add` route L249, sidebar L561–L567 |
-| 完成的任务里挑不到上次生成的图 | **预览图 (60x60 thumbnail)** — done 状态的 job 自动拉缩略图, 点击放大 | `get_job_with_outputs()` L246 → sidebar thumb L570–L582 |
-| 同一个 workflow 跑 5 次都是 cache 命中, 全是同一张图 | **Cache 复用防止 (hook 默认 randomize)** — dispatch 时自动读 `control_after_generate` 模式 (`fixed`/`randomize`/`increment`/`decrement`) 并改写 `seed` / `noise_seed`, 同时把 UI format 转为 API format 让 hook 真正能看见 seed | `scheduler.py` `_apply_pre_dispatch_hooks`, `workflow_format.py` |
-| 想让一批任务今晚跑, 又想立刻再插一条手动任务 | **暂停/恢复** — 一次 HTTP 调用暂停派发, in-flight 的 prompt 不打断 (我们到不了 ComfyUI 的 worker) | `/pause-all`, `/resume-all` |
+| I want the prompt to run when the GPU is idle but I don't want to leave my computer on at night | **Time-window scheduling** — any ISO or relative time (`--in 10m`, `--in 2h`, `tomorrow 9 am`) | `scheduler.tick()` → `claim_next_due_job()` |
+| ComfyUI crashes / restarts lose the in-memory queue | **Persistence** — every job lands in `<ComfyUI>/user/scheduled_queue.sqlite3` (WAL mode) | `database.py` `ScheduledQueueDB` |
+| I want a batch of 50 but I don't want to click Run 50 times | **Repeat (Clear / Repeat / Batch add)** — `Count: N` submits 1–50 copies at once; the Repeat (↻) button clones a finished job in one click | `/api/schedule/add-batch`, Repeat button L542 |
+| 30 items in the queue, all I see is `KSampler-42`, I can't tell which one is from which batch | **Workflow naming (`workflow_title` from Pinia store)** — read at submit time from `app.extensionManager.workflow.activeWorkflow.filename`, persisted to the DB, shown in priority in the sidebar | `add` route L249, sidebar L561–L567 |
+| I can't find the image from my last run among the completed jobs | **Preview thumbnail (60×60)** — `done` jobs auto-fetch a thumbnail; click to enlarge | `get_job_with_outputs()` L246 → sidebar thumb L570–L582 |
+| The same workflow runs 5 times, all are cache hits, all the same image | **Cache-reuse prevention (hook defaults to `randomize`)** — at dispatch, read `control_after_generate` (`fixed` / `randomize` / `increment` / `decrement`) and rewrite `seed` / `noise_seed`; also convert UI format → API format so the hook actually sees the seed | `scheduler.py` `_apply_pre_dispatch_hooks`, `workflow_format.py` |
+| I want a batch to run tonight but I also want to slot in an immediate manual job right now | **Pause / resume** — one HTTP call stops dispatching; in-flight prompts are not interrupted (we can't reach ComfyUI's worker) | `/pause-all`, `/resume-all` |
 
 ---
 
-## 安装 / Installation
+## Installation
 
-完整步骤见 [docs/INSTALL.md](docs/INSTALL.md). Quick path:
+Full steps in [docs/INSTALL.md](docs/INSTALL.md). Quick path:
 
 ```bash
 git clone https://github.com/27-exe/ComfyUI-ScheduledQueue
@@ -121,7 +122,7 @@ ln -s "$(pwd)/scripts/comfy-schedule"       "$HOME/.local/bin/comfy-schedule"
 comfy-schedule resume     # default is paused on first boot
 ```
 
-## 快速开始 / Quick start
+## Quick start
 
 ```bash
 # add a job in 10 minutes
@@ -139,11 +140,11 @@ comfy-schedule cancel <job_id>
 comfy-schedule run-now <job_id>
 ```
 
-In the UI: click the **clock icon** in the topbar → choose preset → **Schedule**.
+In the UI: click the **clock icon** in the topbar → choose a preset → **Schedule**.
 
 ---
 
-## Compatibility / 兼容性
+## Compatibility
 
 | ComfyUI | Frontend | Status |
 |---|---|---|
@@ -153,7 +154,7 @@ In the UI: click the **clock icon** in the topbar → choose preset → **Schedu
 
 Backend requires **Python ≥ 3.10**. There are **no third-party Python dependencies** (uses `urllib.request` from stdlib).
 
-## Running the test suite / 运行测试
+## Running the test suite
 
 ```bash
 python -m unittest discover tests -v
@@ -161,9 +162,11 @@ python -m unittest discover tests -v
 
 Currently **133 / 133 pass** (no `aiohttp` / no running ComfyUI required).
 
+> Note: this repo currently runs 207 tests on Python 3.14. The 33 errors under `test_routes.TestRoutes` / `TestWorkflowTitleRoutes` are pre-existing `asyncio.get_event_loop()` deprecation failures, not regressions from this README split.
+
 ---
 
-## Documentation / 文档
+## Documentation
 
 - [docs/INSTALL.md](docs/INSTALL.md) — install / upgrade / rollback / compatibility matrix / smoke test
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — process model, state machine, design decisions
@@ -172,14 +175,14 @@ Currently **133 / 133 pass** (no `aiohttp` / no running ComfyUI required).
 
 ---
 
-## Security / 安全
+## Security
 
 - **No payload over the wire from `/list`** — list endpoints strip `payload` so workflow JSON is never echoed back.
 - **Whitelist-only updates** — `/update` rejects any field outside `{scheduled_at, priority, note, auto_retry, workflow_title}`.
 - **Cancel only touches pending rows** — running jobs are not silently removed.
 - **No shell hooks** — the scheduler uses `urllib.request`, not `subprocess`.
 
-## Limitations / 局限 (read before filing a bug)
+## Limitations (read before filing a bug)
 
 - **Cancel ≠ ComfyUI native interrupt.** A row with status `running` cannot be recalled once ComfyUI's worker thread has started; we mark our copy as `cancelled` but ComfyUI will still finish the actual prompt.
 - **Reconciliation latency** is bounded by `RECONCILE_INTERVAL = 5 s`. A 1 s job may stay `running` for ~5–9 s before flipping to `done`.
@@ -189,11 +192,11 @@ Currently **133 / 133 pass** (no `aiohttp` / no running ComfyUI required).
 
 ---
 
-## License / 许可
+## License
 
 MIT — see [LICENSE](LICENSE).
 
-## Contributing / 贡献
+## Contributing
 
 Issues and PRs welcome at https://github.com/27-exe/ComfyUI-ScheduledQueue/issues.
 

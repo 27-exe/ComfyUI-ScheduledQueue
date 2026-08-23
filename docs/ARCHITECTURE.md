@@ -1,4 +1,9 @@
-# Architecture
+---
+[EN]
+
+- **Description:** Internal design of ComfyUI-ScheduledQueue — component diagram, process model, data model (SQLite schema + status state machine), HTTP route surface, frontend mount lifecycle, and the rationale behind key implementation decisions (HTTP `/history` polling, `/prompt` as the dispatch surface, `control_after_generate` seed-randomisation hook).
+- **Audience:** Contributor extending the plugin, or operator tracing a bug end-to-end. Assumes basic familiarity with ComfyUI's `/prompt` / `/history` endpoints and with SQL.
+- **Contents:** §1 Component diagram · §2 Process model · §3 Why HTTP for `/history` · §4 Frontend mount lifecycle · §5 Data model · §6 Job state machine · §7 HTTP route surface · §8 Frontend data flow · §9 Cache-reuse prevention · §10 Why no in-process prompt hook · §11 Key code references · §12 Design decisions log.
 
 This document describes the **v0.3.x** design. It is intended for
 contributors who want to extend the plugin or trace a bug end-to-end.
