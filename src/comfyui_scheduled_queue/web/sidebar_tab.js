@@ -168,17 +168,13 @@ function buildPanel() {
             <button data-act="pause-resume" data-state="running" style="padding:6px 8px;background:#444;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:11px;">${escapeHtml(t("sidebar.pause"))}</button>
         </div>
 
-        <div data-role="status" style="margin-bottom:10px;font-size:11px;color:#aaa;padding:8px;background:#252525;border-radius:4px;">Loading...</div>
+        <div data-role="status" style="margin-bottom:10px;font-size:11px;color:#aaa;padding:8px;background:#252525;border-radius:4px;">${escapeHtml(t("sidebar.loading_jobs"))}</div>
 
-        <div data-role="jobs" style="font-size:11px;">${escapeHtml(t("sidebar.loading_jobs"))}</div>
+        <div data-role="jobs" style="font-size:11px;"></div>
 
         <div data-role="pager" style="margin-top:8px;display:flex;gap:4px;align-items:center;font-size:11px;">
             <button data-role="prev" style="padding:4px 8px;background:#444;color:#fff;border:none;border-radius:3px;cursor:pointer;font-size:11px;">‹ ${escapeHtml(t("pager.prev"))}</button>
-            <span data-role="page-info" style="color:#aaa;">${escapeHtml(t("pager.page_of", "Page {0} ({1}-{2} of {3})").replace(/\{0\}|\{1\}|\{2\}|\{3\}/g, (m, _, idx) => {
-                const order = ["0", "1", "2", "3"];
-                // placeholder -- real values applied in renderPager
-                return m;
-            })) || "Page 1"}</span>
+            <span data-role="page-info" style="color:#aaa;"></span>
             <button data-role="next" style="padding:4px 8px;background:#444;color:#fff;border:none;border-radius:3px;cursor:pointer;font-size:11px;">${escapeHtml(t("pager.next"))} ›</button>
         </div>
 
@@ -197,6 +193,7 @@ function buildPanel() {
     const prevBtn = root.querySelector('[data-role="prev"]');
     const nextBtn = root.querySelector('[data-role="next"]');
     const pageInfoEl = root.querySelector('[data-role="page-info"]');
+    const langBtnEl = root.querySelector('[data-role="lang-switch"]');
 
     let _refreshTimer = null;
     let _inFlight = null; // promise of current refresh
@@ -445,21 +442,26 @@ function buildPanel() {
 
     function renderStatus(status) {
         const counters = [
-            ["sched", status.counts.scheduled],
-            ["run", status.counts.running],
-            ["int", status.counts.interrupted],
-            ["done", status.counts.done],
-            ["fail", status.counts.failed],
-            ["cncl", status.counts.cancelled],
+            [t("status_bar.label.sched"), status.counts.scheduled],
+            [t("status_bar.label.run"), status.counts.running],
+            [t("status_bar.label.int"), status.counts.interrupted],
+            [t("status_bar.label.done"), status.counts.done],
+            [t("status_bar.label.fail"), status.counts.failed],
+            [t("status_bar.label.cncl"), status.counts.cancelled],
         ];
         const parts = counters.map(([k, v]) =>
-            `<span>${k}:<b style="color:${v > 0 ? "#fa3" : "#888"}">${v}</b></span>`
+            `<span>${escapeHtml(k)}:<b style="color:${v > 0 ? "#fa3" : "#888"}">${v}</b></span>`
         ).join(" ");
         statusEl.innerHTML = `
-            <div><strong>paused:</strong> <span style="color:${status.paused ? "#fa3" : "#5a8"}">${status.paused ? "yes" : "no"}</span></div>
+            <div><strong>${escapeHtml(t("status_bar.paused"))}:</strong> <span style="color:${status.paused ? "#fa3" : "#5a8"}">${escapeHtml(status.paused ? t("status_bar.paused_yes") : t("status_bar.paused_no"))}</span></div>
             <div style="margin-top:4px;display:flex;flex-wrap:wrap;gap:8px;">${parts}</div>
         `;
-        pauseResumeBtn.textContent = status.paused ? "Resume" : "Pause";
+        // Use data-state on the button (set in buildPanel: data-state="running")
+        // rather than comparing localized text against "Pause", which is
+        // fragile after i18n. The data-state mirrors the scheduler state and
+        // is language-independent.
+        pauseResumeBtn.textContent = status.paused ? t("sidebar.resume") : t("sidebar.pause");
+        pauseResumeBtn.dataset.state = status.paused ? "paused" : "running";
         pauseResumeBtn.style.background = status.paused ? "#2d8f3e" : "#666";
     }
 
@@ -542,7 +544,7 @@ function buildPanel() {
         if (j && typeof j.note === "string" && j.note.trim()) {
             return { text: j.note.trim(), tooltip: j.note.trim() };
         }
-        return { text: "untitled", tooltip: "" };
+        return { text: t("job.untitled"), tooltip: "" };
     }
 
     function renderJobs(jobs) {
@@ -558,7 +560,7 @@ function buildPanel() {
             visibleJobs = allJobs.filter(j => j.status === activeFilter);
         }
         if (visibleJobs.length === 0) {
-            jobsEl.innerHTML = '<div style="color:#666;font-style:italic;">No jobs match this filter.</div>';
+            jobsEl.innerHTML = `<div style="color:#666;font-style:italic;">${escapeHtml(t("sidebar.empty_filter"))}</div>`;
             return;
         }
         const colors = {
@@ -606,71 +608,80 @@ function buildPanel() {
             // hydration below overwrites the span text with the computed
             // nickname when one resolves AND no workflow_title is present.
             const rowTitle = pickRowTitle(j);
-            // Status badge text: human-readable Chinese for the four
-            // terminal states, English otherwise.
-            const statusBadgeText = ({
-                failed: "失败",
-                done: "成功",
-                running: "运行中",
-                cancelled: "已取消",
-                scheduled: "等待中",
-                interrupted: "已中断",
-                paused: "暂停中",
-                dispatched: "已投递",
-            })[j.status] || j.status;
-            // Three-state time line (Improvement 2). The single line that
-            // used to show "到 Xs 投递" / "in 0:54:00" now branches on
-            // status so the user sees the right countdown for each phase:
-            //   scheduled : "X 后投递"      (countdown to scheduled_at)
-            //   dispatched: "等待运行"     (queued in ComfyUI queue)
-            //   running   : "执行 Xs"       (elapsed since dispatched_at)
-            //   paused    : "暂停中"        (no countdown; surface immediately)
-            //   interrupted|done|failed|cancelled: keep the delta to scheduled_at
-            //     so the user can still see how late a job was when it ran
-            //     (or how long ago they cancelled it).
+            // Status badge: localized. Falls back to the raw status token
+            // (e.g. an unknown future value) so the row never goes blank.
+            const statusBadgeText = t(`status.${j.status}`, j.status);
+            // Three-state time line (Improvement 2). Branch on status so the
+            // user sees the right countdown for each phase. Strings are now
+            // pulled through t() so the dialogue matches the active locale;
+            // the *structure* of the line stays the same so the column
+            // alignment across rows is unaffected by language.
             const now = Math.floor(Date.now() / 1000);
             let timeLineText;
             let timeLineHint;
             if (j.status === "scheduled") {
                 const delta = (j.scheduled_at || 0) - now;
-                timeLineText = delta > 0 ? `${formatDuration(delta)} 后投递` : "即将投递";
-                timeLineHint = `${formatTimeUntil(j.scheduled_at)} (绝对 ${formatAbsTime(j.scheduled_at)})`;
+                // Format the in-future sub-day duration through formatDuration
+                // (e.g. "5m 30s") so it pairs with the localized template.
+                if (delta > 0) {
+                    const dur = formatDuration(delta);
+                    timeLineText = LANG === "en"
+                        // English uses "in 5m 30s" prefix.
+                        ? `in ${dur}`
+                        // Chinese uses "5m 30s 后投递" suffix order.
+                        : `${dur} ${t("time.left", "后投递")}`;
+                } else {
+                    timeLineText = t("job.time.now");
+                }
+                timeLineHint = `${formatTimeUntil(j.scheduled_at)} (${t("status_bar.label.sched")} ${formatAbsTime(j.scheduled_at)})`;
             } else if (j.status === "dispatched") {
-                timeLineText = "等待运行";
-                timeLineHint = j.dispatched_at ? `投递于 ${formatAbsTime(j.dispatched_at)}` : "已投递,等待 ComfyUI 接收";
+                timeLineText = t("job.queued_in_comfyui");
+                timeLineHint = j.dispatched_at
+                    ? `${t("status.scheduled")} ${formatAbsTime(j.dispatched_at)}`
+                    : t("job.queued_in_comfyui");
             } else if (j.status === "running") {
                 const elapsed = j.dispatched_at ? (now - j.dispatched_at) : null;
-                timeLineText = elapsed != null && elapsed >= 0 ? `执行 ${formatDuration(elapsed)}` : "执行中";
-                timeLineHint = j.dispatched_at ? `开始于 ${formatAbsTime(j.dispatched_at)}` : "运行中";
+                if (elapsed != null && elapsed >= 0) {
+                    const dur = formatDuration(elapsed);
+                    timeLineText = LANG === "en"
+                        ? `running ${dur}`
+                        : `${t("job.running_label")} ${dur}`;
+                } else {
+                    timeLineText = t("job.executing");
+                }
+                timeLineHint = j.dispatched_at
+                    ? `${t("job.scheduled_label")} ${formatAbsTime(j.dispatched_at)}`
+                    : t("job.executing");
             } else if (j.status === "paused") {
-                timeLineText = "暂停中";
-                timeLineHint = j.scheduled_at ? `${formatTimeUntil(j.scheduled_at)} (暂停时已投递)` : "暂停中";
+                timeLineText = t("job.paused");
+                timeLineHint = j.scheduled_at
+                    ? `${formatTimeUntil(j.scheduled_at)} (${t("job.paused")})`
+                    : t("job.paused");
             } else {
-                // done / failed / cancelled / interrupted — keep the absolute
-                // timestamp + delta for context (e.g. "5m ago").
+                // done / failed / cancelled / interrupted — keep the delta
+                // to scheduled_at for context.
                 timeLineText = formatTimeUntil(j.scheduled_at);
-                timeLineHint = j.scheduled_at ? `调度于 ${formatAbsTime(j.scheduled_at)}` : "";
+                timeLineHint = j.scheduled_at
+                    ? `${t("job.scheduled_label")} ${formatAbsTime(j.scheduled_at)}`
+                    : "";
             }
             // Duration row: shows the absolute finished time (HH:MM:SS local) plus
             // the elapsed time between dispatched_at and finished_at. The label
-            // comes from finishedLabel below (e.g. "完成于", "失败于"). When
-            // finished_at is missing we fall back to the delta helper so the row
-            // still tells the user something useful. Returns "—" for any path with
-            // no usable timestamp.
-            const finishedLabel = j.status === "failed" ? "失败于"
-                : j.status === "done" ? "完成于"
-                : j.status === "cancelled" ? "取消于"
-                : j.status === "running" ? "运行"
-                : j.status === "interrupted" ? "中断于"
-                : j.status === "paused" ? "暂停"
-                : "调度";
+            // is status-aware and localized.
+            const finishedLabel = j.status === "failed" ? t("job.failed_at")
+                : j.status === "done" ? t("job.completed_at")
+                : j.status === "cancelled" ? t("job.cancelled_at")
+                : j.status === "running" ? t("job.running_label")
+                : j.status === "interrupted" ? t("job.interrupted_at")
+                : j.status === "paused" ? t("job.paused")
+                : t("job.scheduled_label");
             let durationText;
             if (j.finished_at && j.dispatched_at) {
                 durationText = `${formatAbsTime(j.finished_at)} · ${formatDuration(j.finished_at - j.dispatched_at)}`;
             } else if (j.finished_at) {
                 durationText = formatAbsTime(j.finished_at);
             } else if (j.status === "running") {
-                durationText = "running";
+                durationText = t("job.running_label");
             } else {
                 durationText = "—";
             }
@@ -690,12 +701,12 @@ function buildPanel() {
                         </div>
                     </div>
                     <div data-actions="${j.id}" style="display:flex;gap:2px;flex-shrink:0;margin-left:4px;">
-                        ${editable ? `<button data-act="edit" data-id="${j.id}" title="Edit scheduled time / priority" style="padding:2px 6px;background:#3a6f9e;color:#fff;border:none;border-radius:3px;font-size:11px;cursor:pointer;">✎</button>` : ""}
-                        ${actionable ? `<button data-act="up" title="Move up (higher priority)" ${isFirst ? "disabled style=\"padding:2px 6px;background:#222;color:#555;border:none;border-radius:3px;font-size:11px;cursor:not-allowed;\"" : "style=\"padding:2px 6px;background:#3a3;color:#fff;border:none;border-radius:3px;font-size:11px;cursor:pointer;\""}>↑</button><button data-act="down" title="Move down (lower priority)" ${isLast ? "disabled style=\"padding:2px 6px;background:#222;color:#555;border:none;border-radius:3px;font-size:11px;cursor:not-allowed;\"" : "style=\"padding:2px 6px;background:#3a3;color:#fff;border:none;border-radius:3px;font-size:11px;cursor:pointer;\""}>↓</button>` : ""}
-                        ${actionable ? `<button data-act="run-now" title="Run immediately" style="padding:2px 6px;background:#2d6f9e;color:#fff;border:none;border-radius:3px;font-size:11px;cursor:pointer;">Run</button>` : ""}
-                        ${cancellable ? `<button data-act="cancel" title="Cancel this job" style="padding:2px 6px;background:#7a3030;color:#fff;border:none;border-radius:3px;font-size:11px;cursor:pointer;">✕</button>` : ""}
-                        <button data-act="repeat" data-id="${j.id}" title="Repeat / clone this job" style="padding:2px 6px;background:#5a4f9e;color:#fff;border:none;border-radius:3px;font-size:11px;cursor:pointer;">↻</button>
-                        <button data-act="export" data-id="${j.id}" title="Export this job (download JSON)" style="padding:2px 6px;background:#666;color:#fff;border:none;border-radius:3px;font-size:11px;cursor:pointer;">⬇</button>
+                        ${editable ? `<button data-act="edit" data-id="${j.id}" title="${escapeHtml(t("action.schedule"))}" style="padding:2px 6px;background:#3a6f9e;color:#fff;border:none;border-radius:3px;font-size:11px;cursor:pointer;">✎</button>` : ""}
+                        ${actionable ? `<button data-act="up" title="${escapeHtml(t("action.up_title"))}" ${isFirst ? "disabled style=\"padding:2px 6px;background:#222;color:#555;border:none;border-radius:3px;font-size:11px;cursor:not-allowed;\"" : "style=\"padding:2px 6px;background:#3a3;color:#fff;border:none;border-radius:3px;font-size:11px;cursor:pointer;\""}>↑</button><button data-act="down" title="${escapeHtml(t("action.down_title"))}" ${isLast ? "disabled style=\"padding:2px 6px;background:#222;color:#555;border:none;border-radius:3px;font-size:11px;cursor:not-allowed;\"" : "style=\"padding:2px 6px;background:#3a3;color:#fff;border:none;border-radius:3px;font-size:11px;cursor:pointer;\""}>↓</button>` : ""}
+                        ${actionable ? `<button data-act="run-now" title="${escapeHtml(t("action.run_now_title"))}" style="padding:2px 6px;background:#2d6f9e;color:#fff;border:none;border-radius:3px;font-size:11px;cursor:pointer;">${escapeHtml(t("action.run_now"))}</button>` : ""}
+                        ${cancellable ? `<button data-act="cancel" title="${escapeHtml(t("action.cancel_title"))}" style="padding:2px 6px;background:#7a3030;color:#fff;border:none;border-radius:3px;font-size:11px;cursor:pointer;">✕</button>` : ""}
+                        <button data-act="repeat" data-id="${j.id}" title="${escapeHtml(t("action.repeat_title"))}" style="padding:2px 6px;background:#5a4f9e;color:#fff;border:none;border-radius:3px;font-size:11px;cursor:pointer;">↻</button>
+                        <button data-act="export" data-id="${j.id}" title="${escapeHtml(t("action.export_title"))}" style="padding:2px 6px;background:#666;color:#fff;border:none;border-radius:3px;font-size:11px;cursor:pointer;">⬇</button>
                     </div>
                 </div>
                 ${thumbHtml}
@@ -731,7 +742,7 @@ function buildPanel() {
                     const img = slot.querySelector("img");
                     if (img) img.addEventListener("click", () => openImageModal(url));
                 } else {
-                    slot.innerHTML = '<span style="color:#666;font-size:10px;">no preview</span>';
+                    slot.innerHTML = `<span style="color:#666;font-size:10px;">${escapeHtml(t("preview.no_preview"))}</span>`;
                 }
             }
         }).catch(() => {});
@@ -785,7 +796,15 @@ function buildPanel() {
                 : currentOffset + visibleJobsCount();
         currentTotal = total;
         const page = Math.floor(currentOffset / PAGE_LIMIT) + 1;
-        if (pageInfoEl) pageInfoEl.textContent = `Page ${page} (${currentOffset + 1}–${currentOffset + visibleJobsCount()} of ${currentTotal})`;
+        if (pageInfoEl) {
+            // Localized "Page X (Y-Z of W)" with positional {N} placeholders.
+            // The English template uses 1-based visibleRange; we compute the
+            // start/end indices here and pass them in.
+            const visible = visibleJobsCount();
+            const start = total > 0 ? currentOffset + 1 : 0;
+            const end = currentOffset + visible;
+            pageInfoEl.textContent = tfmt("pager.page_of", `Page ${page} (${start}-${end} of ${total})`, [page, start, end, total]);
+        }
         if (prevBtn) prevBtn.disabled = currentOffset <= 0;
         if (nextBtn) {
             // Disable Next when the current page returned fewer than limit
@@ -840,7 +859,7 @@ function buildPanel() {
                 // sidebar. The user's open/closed intent for that panel is
                 // owned by the toggle button only.
             } catch (e) {
-                statusEl.innerHTML = `<div style="color:#f44;">Error: ${escapeHtml(e.message)}</div>`;
+                statusEl.innerHTML = `<div style="color:#f44;">${escapeHtml(t("error.network"))}: ${escapeHtml(e.message)}</div>`;
             } finally {
                 if (!silent) refreshBtn.disabled = false;
                 _inFlight = null;
@@ -859,17 +878,30 @@ function buildPanel() {
     // Top-level action buttons. Each calls the API and immediately re-renders.
     refreshBtn.addEventListener("click", () => refresh());
     pauseResumeBtn.addEventListener("click", async () => {
-        const wasPaused = pauseResumeBtn.textContent === "Pause";
+        // Use data-state (set in renderStatus) rather than localized button
+        // text; this is the canonical scheduler state mirror and survives
+        // any language switch.
+        const wasPaused = pauseResumeBtn.dataset.state === "paused";
         pauseResumeBtn.disabled = true;
         try {
-            await callApi(wasPaused ? "/pause-all" : "/resume-all", { method: "POST" });
+            await callApi(wasPaused ? "/resume-all" : "/pause-all", { method: "POST" });
             await refresh({ silent: true });
         } catch (e) {
-            statusEl.innerHTML = `<div style="color:#f44;">${escapeHtml(e.message)}</div>`;
+            statusEl.innerHTML = `<div style="color:#f44;">${escapeHtml(t("error.network"))}: ${escapeHtml(e.message)}</div>`;
         } finally {
             pauseResumeBtn.disabled = false;
         }
     });
+
+    // Language switch button: flip the global LANG, persist, and re-render
+    // the whole panel so every t() lookup picks up the new locale. We
+    // rebuild root.innerHTML from scratch (cheaper than diffing nodes and
+    // catches any string we may have forgotten to mark with data-role).
+    if (langBtnEl) {
+        langBtnEl.addEventListener("click", () => {
+            setLang(LANG === "zh" ? "en" : "zh");
+        });
+    }
 
     // Status filter tabs (event delegation on the row).
     if (statusTabsEl) {
@@ -907,7 +939,7 @@ function buildPanel() {
             const selected = [];
             boxes.forEach((b) => { if (b.checked) selected.push(b.dataset.clearStatus); });
             if (selected.length === 0) {
-                statusEl.innerHTML = '<div style="color:#fa3;">No statuses selected to clear.</div>';
+                statusEl.innerHTML = `<div style="color:#fa3;">${escapeHtml(t("clear.empty"))}</div>`;
                 return;
             }
             clearExecuteBtn.disabled = true;
@@ -923,7 +955,7 @@ function buildPanel() {
                     throw new Error(msg);
                 }
             } catch (err) {
-                alert("Clear failed: " + err.message);
+                alert(t("clear.alert") + ": " + err.message);
             } finally {
                 clearExecuteBtn.disabled = false;
                 await refresh({ silent: true });
@@ -966,12 +998,18 @@ function buildPanel() {
         if (act === "cancel") {
             const status = jobEl && jobEl.dataset.status ? jobEl.dataset.status : "";
             let msg;
+            // Per-state confirm copy. Keys are intentionally distinct so
+            // translators see them individually in the JSON file. We pass
+            // fallbacks for each branch so an incomplete locale never
+            // produces an empty confirm() dialog.
             if (status === "dispatched") {
-                msg = "This job is queued in ComfyUI's queue. Cancel will pull it out. Continue?";
+                msg = t("confirm.cancel_dispatched",
+                    "This job is queued in ComfyUI's queue. Cancel will pull it out. Continue?");
             } else if (status === "running") {
-                msg = "Cancel a running job? The prompt will continue in ComfyUI; the row will be marked cancelled locally.";
+                msg = t("confirm.cancel_running",
+                    "Cancel a running job? The prompt will continue in ComfyUI; the row will be marked cancelled locally.");
             } else {
-                msg = "Cancel this scheduled job?";
+                msg = t("confirm.cancel", "Cancel this scheduled job?");
             }
             if (!window.confirm(msg)) {
                 // Re-enable the buttons we just disabled so the user can
@@ -995,7 +1033,7 @@ function buildPanel() {
                 const job = detail && detail.job ? detail.job : detail;
                 openEditJobDialog(job || { id, status: jobEl && jobEl.dataset.status ? jobEl.dataset.status : "" }, refresh);
             } catch (err) {
-                statusEl.innerHTML = `<div style="color:#f44;">Could not load job: ${escapeHtml(err.message)}</div>`;
+                statusEl.innerHTML = `<div style="color:#f44;">${escapeHtml(t("error.action_failed"))}: ${escapeHtml(err.message)}</div>`;
             } finally {
                 actionsEl.querySelectorAll("button").forEach(b => (b.disabled = false));
             }
@@ -1046,7 +1084,7 @@ function buildPanel() {
                 return; // page is navigating away; don't re-enable buttons
             }
         } catch (err) {
-            statusEl.innerHTML = `<div style="color:#f44;">Action failed: ${escapeHtml(err.message)}</div>`;
+            statusEl.innerHTML = `<div style="color:#f44;">${escapeHtml(t("error.action_failed"))}: ${escapeHtml(err.message)}</div>`;
         } finally {
             await refresh({ silent: true });
         }
@@ -1102,23 +1140,26 @@ function buildPanel() {
             font-family: system-ui, sans-serif;
         `;
         const status = job.status || "";
+        // Localized status badge text for the edit dialog. Reuses the
+        // status.* keys defined for the main sidebar so a single zh/en
+        // lookup covers both UIs.
         const statusBadge = ({
-            scheduled: "等待中",
-            dispatched: "已投递",
-            paused: "暂停中",
-        })[status] || status || "未知";
-        const titleText = (job.workflow_title || job.note || "未命名任务").trim() || "未命名任务";
+            scheduled: t("status.scheduled"),
+            dispatched: t("status.dispatched") || t("filter.dispatched"),
+            paused: t("job.paused"),
+        })[status] || t(`status.${status}`, status) || t("status.unknown", status);
+        const titleText = (job.workflow_title || job.note || t("job.untitled")).trim() || t("job.untitled");
         const editable = editableStatuses.has(status);
         const disabledAttr = editable ? "" : "disabled style=\"opacity:.5;cursor:not-allowed;\"";
         dlg.innerHTML = `
             <div style="background:#1e1e1e;color:#ccc;padding:18px;border-radius:8px;width:440px;box-shadow:0 8px 32px rgba(0,0,0,0.5);">
-                <h3 style="margin:0 0 4px 0;color:#fff;font-size:14px;">Edit job</h3>
+                <h3 style="margin:0 0 4px 0;color:#fff;font-size:14px;">${escapeHtml(t("dialog.edit_title", "Edit job"))}</h3>
                 <div style="font-size:11px;color:#888;margin-bottom:10px;">
                     <span>${escapeHtml(titleText)}</span>
                     <span style="margin-left:6px;padding:1px 5px;background:#555;color:#000;border-radius:2px;">${escapeHtml(statusBadge)}</span>
                     <span style="margin-left:6px;opacity:.6;">${escapeHtml((id || "").slice(0, 8))}</span>
                 </div>
-                ${editable ? "" : `<div style="font-size:11px;color:#fa3;margin-bottom:10px;">当前状态 (${escapeHtml(status)}) 不支持编辑时间/优先级 — 仍可保存优先级修改。</div>`}
+                ${editable ? "" : `<div style="font-size:11px;color:#fa3;margin-bottom:10px;">${escapeHtml(t("dialog.edit_not_editable", `Current status (${status}) does not allow editing time / priority — you can still save the priority change.`))}</div>`}
 
                 <div style="margin-bottom:10px;">
                     <label style="display:block;font-size:11px;color:#aaa;margin-bottom:4px;">When (local time)</label>
@@ -1289,6 +1330,41 @@ function buildPanel() {
         }
     });
 
+    // i18n: when the global LANG changes (clicking the lang switch button
+    // dispatches `sq:lang-changed`), tear down the current root and rebuild
+    // the panel from scratch so every t() lookup re-resolves against the
+    // new locale. We rebuild by re-running buildPanel() and swapping the
+    // container's child -- the simplest correct approach, since the static
+    // and dynamic parts of the panel are all generated from a single
+    // innerHTML template + refresh() cycle.
+    const langChangedHandler = () => {
+        // Tear down the existing root's MutationObserver timer first.
+        clearInterval(_refreshTimer);
+        observer.disconnect();
+        // Rebuild and swap. The framework's container is root.parentNode
+        // (we only have one level because we replace the container's
+        // contents on lang switch).
+        const parent = root.parentNode;
+        if (!parent) {
+            // Already detached -- nothing to do.
+            return;
+        }
+        const newPanel = buildPanel();
+        parent.innerHTML = "";
+        parent.appendChild(newPanel);
+        if (typeof newPanel.refresh === "function") newPanel.refresh();
+        // Notify the sidebar watcher that the container's first child
+        // changed so it doesn't try to clear us on tab toggle.
+    };
+    window.addEventListener("sq:lang-changed", langChangedHandler);
+
+    // Clean up the listener on unmount so we don't leak.
+    const _origDisconnect = observer.disconnect.bind(observer);
+    observer.disconnect = () => {
+        window.removeEventListener("sq:lang-changed", langChangedHandler);
+        _origDisconnect();
+    };
+
     return root;
 }
 
@@ -1299,18 +1375,20 @@ function buildPanel() {
 function openScheduleDialog() {
     const now = Math.floor(Date.now() / 1000);
 
+    // Preset labels -- use t() so the preset chips localize. The offset
+    // (in seconds) is language-agnostic; the label string is not.
     const presets = [
-        { label: "in 30s", offset: 30 },
-        { label: "in 5 min", offset: 300 },
-        { label: "in 30 min", offset: 1800 },
-        { label: "in 2 hours", offset: 7200 },
+        { label: t("dialog.preset.30s", "in 30s"), offset: 30 },
+        { label: t("dialog.preset.5min", "in 5 min"), offset: 300 },
+        { label: t("dialog.preset.30min", "in 30 min"), offset: 1800 },
+        { label: t("dialog.preset.2hours", "in 2 hours"), offset: 7200 },
     ];
     const tomorrow9 = (() => {
         const d = new Date(Date.now() + 86400_000);
         d.setHours(9, 0, 0, 0);
         return Math.floor(d.getTime() / 1000);
     })();
-    presets.push({ label: "tomorrow 9am", absolute: tomorrow9 });
+    presets.push({ label: t("dialog.preset.tomorrow", "tomorrow 9am"), absolute: tomorrow9 });
 
     const dlg = document.createElement("div");
     dlg.dataset.sqDialog = "1";
@@ -1364,12 +1442,12 @@ function openScheduleDialog() {
 
     dlg.innerHTML = `
         <div style="background:#1e1e1e;color:#ccc;padding:20px;border-radius:8px;width:480px;box-shadow:0 8px 32px rgba(0,0,0,0.5);">
-            <h3 style="margin:0 0 12px 0;color:#fff;font-size:15px;">Schedule current workflow</h3>
+            <h3 style="margin:0 0 12px 0;color:#fff;font-size:15px;">${escapeHtml(t("dialog.schedule_title", "Schedule current workflow"))}</h3>
 
             <div style="margin-bottom:10px;">
-                <label style="display:block;font-size:11px;color:#aaa;margin-bottom:4px;">When (local time)</label>
+                <label style="display:block;font-size:11px;color:#aaa;margin-bottom:4px;">${escapeHtml(t("dialog.when_label", "When (local time)"))}</label>
                 <div style="display:flex;flex-wrap:wrap;gap:4px;margin-bottom:6px;">
-                    ${presets.map((p, i) => `<button data-preset="${i}" style="padding:4px 8px;background:#333;color:#fff;border:none;border-radius:3px;cursor:pointer;font-size:11px;">${p.label}</button>`).join("")}
+                    ${presets.map((p, i) => `<button data-preset="${i}" style="padding:4px 8px;background:#333;color:#fff;border:none;border-radius:3px;cursor:pointer;font-size:11px;">${escapeHtml(p.label)}</button>`).join("")}
                 </div>
                 <!-- Two-row layout: input fills middle width, +/- button groups sit
                      right-aligned in both rows so the eye reads a single vertical
@@ -1378,20 +1456,20 @@ function openScheduleDialog() {
                     <div style="display:flex;gap:2px;align-items:center;">
                         <input data-role="when-display" placeholder="2026-08-22 22:30:00" style="flex:1;min-width:0;padding:6px;background:#252525;color:#fff;border:1px solid #444;border-radius:3px;font-family:monospace;text-align:center;" value="${formatWhen(currentWhenTs)}" />
                         <div data-role="when-dec" style="display:flex;gap:2px;justify-content:flex-end;">
-                            <button type="button" data-delta="-3600" style="padding:4px 6px;background:#333;color:#fff;border:none;border-radius:3px;cursor:pointer;font-size:11px;">-1h</button>
-                            <button type="button" data-delta="-600" style="padding:4px 6px;background:#333;color:#fff;border:none;border-radius:3px;cursor:pointer;font-size:11px;">-10m</button>
-                            <button type="button" data-delta="-60" style="padding:4px 6px;background:#333;color:#fff;border:none;border-radius:3px;cursor:pointer;font-size:11px;">-1m</button>
-                            <button type="button" data-delta="-10" style="padding:4px 6px;background:#333;color:#fff;border:none;border-radius:3px;cursor:pointer;font-size:11px;">-10s</button>
-                            <button type="button" data-delta="-5" style="padding:4px 6px;background:#333;color:#fff;border:none;border-radius:3px;cursor:pointer;font-size:11px;">-5s</button>
+                            <button type="button" data-delta="-3600" style="padding:4px 6px;background:#333;color:#fff;border:none;border-radius:3px;cursor:pointer;font-size:11px;">${escapeHtml(t("dialog.delta.dec_1h", "-1h"))}</button>
+                            <button type="button" data-delta="-600" style="padding:4px 6px;background:#333;color:#fff;border:none;border-radius:3px;cursor:pointer;font-size:11px;">${escapeHtml(t("dialog.delta.dec_10m", "-10m"))}</button>
+                            <button type="button" data-delta="-60" style="padding:4px 6px;background:#333;color:#fff;border:none;border-radius:3px;cursor:pointer;font-size:11px;">${escapeHtml(t("dialog.delta.dec_1m", "-1m"))}</button>
+                            <button type="button" data-delta="-10" style="padding:4px 6px;background:#333;color:#fff;border:none;border-radius:3px;cursor:pointer;font-size:11px;">${escapeHtml(t("dialog.delta.dec_10s", "-10s"))}</button>
+                            <button type="button" data-delta="-5" style="padding:4px 6px;background:#333;color:#fff;border:none;border-radius:3px;cursor:pointer;font-size:11px;">${escapeHtml(t("dialog.delta.dec_5s", "-5s"))}</button>
                         </div>
                     </div>
                     <div style="display:flex;gap:2px;justify-content:flex-end;">
                         <div data-role="when-inc" style="display:flex;gap:2px;justify-content:flex-end;">
-                            <button type="button" data-delta="5" style="padding:4px 6px;background:#333;color:#fff;border:none;border-radius:3px;cursor:pointer;font-size:11px;">+5s</button>
-                            <button type="button" data-delta="10" style="padding:4px 6px;background:#333;color:#fff;border:none;border-radius:3px;cursor:pointer;font-size:11px;">+10s</button>
-                            <button type="button" data-delta="60" style="padding:4px 6px;background:#333;color:#fff;border:none;border-radius:3px;cursor:pointer;font-size:11px;">+1m</button>
-                            <button type="button" data-delta="600" style="padding:4px 6px;background:#333;color:#fff;border:none;border-radius:3px;cursor:pointer;font-size:11px;">+10m</button>
-                            <button type="button" data-delta="3600" style="padding:4px 6px;background:#333;color:#fff;border:none;border-radius:3px;cursor:pointer;font-size:11px;">+1h</button>
+                            <button type="button" data-delta="5" style="padding:4px 6px;background:#333;color:#fff;border:none;border-radius:3px;cursor:pointer;font-size:11px;">${escapeHtml(t("dialog.delta.inc_5s", "+5s"))}</button>
+                            <button type="button" data-delta="10" style="padding:4px 6px;background:#333;color:#fff;border:none;border-radius:3px;cursor:pointer;font-size:11px;">${escapeHtml(t("dialog.delta.inc_10s", "+10s"))}</button>
+                            <button type="button" data-delta="60" style="padding:4px 6px;background:#333;color:#fff;border:none;border-radius:3px;cursor:pointer;font-size:11px;">${escapeHtml(t("dialog.delta.inc_1m", "+1m"))}</button>
+                            <button type="button" data-delta="600" style="padding:4px 6px;background:#333;color:#fff;border:none;border-radius:3px;cursor:pointer;font-size:11px;">${escapeHtml(t("dialog.delta.inc_10m", "+10m"))}</button>
+                            <button type="button" data-delta="3600" style="padding:4px 6px;background:#333;color:#fff;border:none;border-radius:3px;cursor:pointer;font-size:11px;">${escapeHtml(t("dialog.delta.inc_1h", "+1h"))}</button>
                         </div>
                     </div>
                 </div>
@@ -1400,24 +1478,24 @@ function openScheduleDialog() {
             </div>
 
             <div style="margin-bottom:10px;">
-                <label style="display:block;font-size:11px;color:#aaa;margin-bottom:4px;">Priority (0-1000, higher runs first)</label>
+                <label style="display:block;font-size:11px;color:#aaa;margin-bottom:4px;">${escapeHtml(t("dialog.priority_label", "Priority (0-1000, higher runs first)"))}</label>
                 <input data-role="priority" type="number" min="0" max="1000" value="100" style="width:100%;padding:6px;background:#252525;color:#fff;border:1px solid #444;border-radius:3px;font-family:monospace;" />
             </div>
 
             <div style="margin-bottom:14px;">
-                <label style="display:block;font-size:11px;color:#aaa;margin-bottom:4px;">Note (optional)</label>
-                <input data-role="note" type="text" placeholder="e.g. morning batch / variant 3" style="width:100%;padding:6px;background:#252525;color:#fff;border:1px solid #444;border-radius:3px;" />
+                <label style="display:block;font-size:11px;color:#aaa;margin-bottom:4px;">${escapeHtml(t("dialog.note_label", "Note (optional)"))}</label>
+                <input data-role="note" type="text" placeholder="${escapeHtml(t("dialog.note_placeholder", "e.g. morning batch / variant 3"))}" style="width:100%;padding:6px;background:#252525;color:#fff;border:1px solid #444;border-radius:3px;" />
             </div>
 
             <div data-role="count-row" style="margin-top:6px;margin-bottom:14px;display:flex;gap:6px;align-items:center;">
-                <label style="opacity:.7;font-size:11px;">Count:</label>
+                <label style="opacity:.7;font-size:11px;">${escapeHtml(t("dialog.count_label", "Count:"))}</label>
                 <input data-role="count" type="number" min="1" max="50" value="1" style="width:60px;background:#222;color:#fff;border:1px solid #555;padding:4px;border-radius:3px;" />
-                <span style="opacity:.5;font-size:11px;">(1-50, repeat same workflow)</span>
+                <span style="opacity:.5;font-size:11px;">${escapeHtml(t("dialog.count_hint", "(1-50, repeat same workflow)"))}</span>
             </div>
 
             <div style="display:flex;justify-content:flex-end;gap:8px;">
-                <button data-act="cancel" style="padding:6px 14px;background:#444;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:12px;">Cancel</button>
-                <button data-act="submit" style="padding:6px 14px;background:#0078d4;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:12px;">Schedule</button>
+                <button data-act="cancel" style="padding:6px 14px;background:#444;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:12px;">${escapeHtml(t("dialog.cancel", "Cancel"))}</button>
+                <button data-act="submit" style="padding:6px 14px;background:#0078d4;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:12px;">${escapeHtml(t("dialog.submit", "Schedule"))}</button>
             </div>
         </div>
     `;
@@ -1446,7 +1524,7 @@ function openScheduleDialog() {
         const parsedTs = parseWhen(displayEl.value);
         if (!Number.isFinite(parsedTs)) {
             displayEl.style.borderColor = "#c44";
-            alert("Invalid time");
+            alert(t("error.invalid_time", "Invalid time"));
             return;
         }
         displayEl.style.borderColor = "";  // clear any prior error highlight
@@ -1473,7 +1551,7 @@ function openScheduleDialog() {
         } catch (_e) { /* ignore -- empty title is fine */ }
 
         if (!scheduledAt || scheduledAt <= Math.floor(Date.now() / 1000)) {
-            alert("Scheduled time must be in the future.");
+            alert(t("error.scheduled_in_past", "Scheduled time must be in the future."));
             return;
         }
 
@@ -1495,7 +1573,7 @@ function openScheduleDialog() {
             // graphToPrompt returns { output: {nodes...}, workflow: {...} }
             const payload = graph.output || graph;
             if (!payload || Object.keys(payload).length === 0) {
-                alert("Current workflow is empty.");
+                alert(t("error.empty_workflow", "Current workflow is empty."));
                 return;
             }
 
@@ -1534,7 +1612,7 @@ function openScheduleDialog() {
                 }
                 const data = await resp.json();
                 if (!resp.ok) {
-                    alert("Add failed: " + (data.error || resp.statusText));
+                    alert(t("error.add_failed", "Add failed") + ": " + (data.error || resp.statusText));
                     return;
                 }
                 console.log("[ScheduledQueue] Added job(s):", data);
@@ -1549,10 +1627,10 @@ function openScheduleDialog() {
                         .forEach((b) => b.click());
                 } catch (_e) { /* best-effort */ }
             } catch (err) {
-                alert("Network error: " + err.message);
+                alert(t("error.network", "Network error") + ": " + err.message);
             }
         } catch (err) {
-            alert("Could not serialize workflow: " + err.message);
+            alert(t("error.serialize_workflow", "Could not serialize workflow") + ": " + err.message);
         } finally {
             for (const widget of calledWidgets) {
                 if (typeof widget.afterQueued !== "function") continue;
@@ -1644,7 +1722,7 @@ function openScheduleDialog() {
                 // time the value crosses into "too early" territory.
                 if (whenDisplay.dataset.sqBadAlerted !== "1") {
                     whenDisplay.dataset.sqBadAlerted = "1";
-                    alert("Scheduled time must be in the future.");
+                    alert(t("error.scheduled_in_past", "Scheduled time must be in the future."));
                 }
                 return;
             }
@@ -1698,7 +1776,7 @@ app.registerExtension({
     actionBarButtons: [
         {
             icon: "pi pi-clock",
-            tooltip: "Schedule current workflow (sends to ScheduledQueue, not ComfyUI native queue)",
+            tooltip: t("topbar.schedule_tooltip", "Schedule current workflow (sends to ScheduledQueue, not ComfyUI native queue)"),
             onClick: () => openScheduleDialog(),
         },
     ],
@@ -1711,9 +1789,9 @@ app.registerExtension({
 // toggles tabs.
 app.extensionManager.registerSidebarTab({
     id: TAB_ID,
-    title: "Scheduled Queue",
+    title: t("sidebar.title", "Scheduled Queue"),
     icon: "pi pi-clock",
-    tooltip: "Scheduled Queue (managed jobs)",
+    tooltip: t("sidebar.tab_tooltip", "Scheduled Queue (managed jobs)"),
     type: "custom",
     render: (container) => {
         const p = buildPanel();
