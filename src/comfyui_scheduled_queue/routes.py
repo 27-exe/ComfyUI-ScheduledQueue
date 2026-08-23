@@ -35,6 +35,7 @@ Module-level rules (spec section 11 risk table):
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import time
@@ -314,13 +315,14 @@ def _clear_prompt_id_dispatched_snapshot(db, snapshot_ids):
     if not snapshot_ids:
         return 0
     placeholders = ",".join("?" for _ in snapshot_ids)
-    with db._conn:
-        cur = db._conn.execute(
-            f"UPDATE scheduled_jobs "
-            f"SET prompt_id=NULL, dispatched_at=NULL "
-            f"WHERE id IN ({placeholders}) AND status='dispatched'",
-            tuple(snapshot_ids),
-        )
+    with db._IO_LOCK:
+        with db._conn:
+            cur = db._conn.execute(
+                f"UPDATE scheduled_jobs "
+                f"SET prompt_id=NULL, dispatched_at=NULL "
+                f"WHERE id IN ({placeholders}) AND status='dispatched'",
+                tuple(snapshot_ids),
+            )
     return cur.rowcount
 
 
@@ -351,14 +353,15 @@ def _reclaim_dispatched_snapshot(db, snapshot_ids):
     if not snapshot_ids:
         return 0
     placeholders = ",".join("?" for _ in snapshot_ids)
-    with db._conn:
-        cur = db._conn.execute(
-            f"UPDATE scheduled_jobs "
-            f"SET status='scheduled', prompt_id=NULL, dispatched_at=NULL, "
-            f"    started_at=NULL, scheduled_at=? "
-            f"WHERE id IN ({placeholders}) AND status='dispatched'",
-            (time.time(), *snapshot_ids),
-        )
+    with db._IO_LOCK:
+        with db._conn:
+            cur = db._conn.execute(
+                f"UPDATE scheduled_jobs "
+                f"SET status='scheduled', prompt_id=NULL, dispatched_at=NULL, "
+                f"    started_at=NULL, scheduled_at=? "
+                f"WHERE id IN ({placeholders}) AND status='dispatched'",
+                (time.time(), *snapshot_ids),
+            )
     return cur.rowcount
 
 
@@ -935,7 +938,17 @@ async def status_handler(request) -> "web.Response":  # type: ignore[name-define
 # Stage 2 handlers (spec section 3)
 # ---------------------------------------------------------------------------
 
-async def pause_all_handler(request) -> "web.Response":  # type: ignore[name-defined]
+class _PauseRequestContext:
+    def __init__(self, db, comfyui_url):
+        self.app = {"sq_db": db, "sq_comfyui_url": comfyui_url}
+
+    def get(self, key, default=None):
+        return self.app.get(key, default)
+
+
+def _pause_all_blocking(db, comfyui_url) -> "web.Response":  # type: ignore[name-defined]
+    """Run pause-all's synchronous DB and ComfyUI work off the event loop."""
+    request = _PauseRequestContext(db, comfyui_url)
     """POST /api/schedule/pause-all
 
     Body: empty.
@@ -1104,26 +1117,16 @@ async def pause_all_handler(request) -> "web.Response":  # type: ignore[name-def
     })
 
 
-async def pause_running_all_handler(request) -> "web.Response":  # type: ignore[name-defined]
-    """POST /api/schedule/pause-running-all
-
-    Interrupt every running prompt via ComfyUI's ``POST /interrupt``
-    and clear the local ``prompt_id`` / ``dispatched_at`` fields so
-    reconcile() can settle the rows. Does **not** touch ``dispatched``
-    rows (those are returned to the local queue via ``/pause-all``) and
-    does **not** flip the scheduler's ``paused`` flag.
-
-    Response: 200 ``{"paused": True, "reclaimed_count": 0,
-    "cancelled_count": M, "error_count": K, "errors": [...],
-    "interrupted_count": M}``. The shape mirrors ``/pause-all`` so
-    clients can use one response parser for both.
-    """
+async def pause_all_handler(request) -> "web.Response":  # type: ignore[name-defined]
     db = request.app.get("sq_db")
     if db is None:
         return _server_error("db not initialized")
-
     comfyui_url = request.app.get("sq_comfyui_url") or _DEFAULT_COMFYUI_URL
+    return await asyncio.to_thread(_pause_all_blocking, db, comfyui_url)
 
+
+def _pause_running_all_blocking(db, comfyui_url) -> "web.Response":  # type: ignore[name-defined]
+    """Run running-only pause work off the aiohttp event loop."""
     try:
         db.set_state("paused", "1")
         all_in_flight = db.list_in_flight_with_prompt_id()
@@ -1172,6 +1175,14 @@ async def pause_running_all_handler(request) -> "web.Response":  # type: ignore[
         "error_count": int(error_count),
         "errors": errors,
     })
+
+
+async def pause_running_all_handler(request) -> "web.Response":
+    db = request.app.get("sq_db")
+    if db is None:
+        return _server_error("db not initialized")
+    comfyui_url = request.app.get("sq_comfyui_url") or _DEFAULT_COMFYUI_URL
+    return await asyncio.to_thread(_pause_running_all_blocking, db, comfyui_url)
 
 
 async def resume_all_handler(request) -> "web.Response":  # type: ignore[name-defined]
