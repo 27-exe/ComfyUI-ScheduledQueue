@@ -322,8 +322,8 @@ end-to-end against a real running ComfyUI 0.33.0 (frontend 1.49.6):
   2. Fallback: `comfy.nodes.NODE_CLASS_MAPPINGS[type].INPUT_TYPES()`
      schema with default values.
   3. Links first (already in API format: `[node_id, output_index]`).
-- Verified end-to-end against the user's real workflow at
-  `/home/a27exe/Downloads/SD工作流 无强化.json` (UI format, 83 nodes):
+- Verified end-to-end against a representative SDXL workflow (UI format,
+  83 nodes, single `KSampler` + `UltimateSDUpscale` + `FaceDetailer` chain):
   post-conversion, KSampler / UltimateSDUpscale / FaceDetailer nodes
   all expose `inputs.seed` AND `inputs.control_after_generate` for the
   existing seed-randomisation hook to mutate.
