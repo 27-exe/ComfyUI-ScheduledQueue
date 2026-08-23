@@ -61,8 +61,12 @@ _LIST_MAX_LIMIT = 200
 _LIST_DEFAULT_LIMIT = 50
 
 # Status counts returned by /status. Keys must match spec section 5.2.
+# `dispatched` was added alongside the dispatched/running split — jobs
+# that have been POSTed to ComfyUI but are queued behind another job in
+# ComfyUI's native queue land here until reconcile promotes them.
 _STATUS_COUNT_KEYS = (
     "scheduled",
+    "dispatched",
     "running",
     "interrupted",
     "done",
@@ -486,7 +490,7 @@ async def status_handler(request) -> "web.Response":  # type: ignore[name-define
         # job_history holds terminal rows (done/failed). Done/failed are NOT
         # in scheduled_jobs anymore (they move to history once observed).
         counts: dict[str, int] = {key: 0 for key in _STATUS_COUNT_KEYS}
-        for status in ("scheduled", "running", "interrupted", "cancelled"):
+        for status in ("scheduled", "dispatched", "running", "interrupted", "cancelled"):
             rows = db.list_jobs(status_filter=[status], limit=_LIST_MAX_LIMIT)
             counts[status] = len(rows)
         try:

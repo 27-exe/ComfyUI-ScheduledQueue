@@ -400,6 +400,33 @@ class ScheduledQueueDB:
     def mark_running(self, job_id, prompt_id):
         return self.update_job(job_id,status='running',prompt_id=prompt_id)
 
+    def mark_dispatched(self, job_id, prompt_id):
+        """Flip status='dispatched' and stamp ``dispatched_at``.
+
+        Called immediately after the POST /prompt response carries a
+        ComfyUI ``prompt_id`` back. The job is now sitting in ComfyUI's
+        native queue (possibly behind another job) but has not yet been
+        picked up for execution — ``reconcile`` is responsible for
+        promoting it to ``running`` once ``/queue`` shows it as the
+        currently-running item.
+
+        ``dispatched_at`` is re-stamped here (claim_next_due_job may have
+        already set it at claim time) so the value reflects the actual
+        POST time, which is what the UI's "已派发" duration counts from.
+
+        ``prompt_id`` is the value ComfyUI returned; we trust it (ComfyUI
+        is the source of truth for prompt identity).
+        """
+        now = time.time()
+        with self._conn:
+            cur = self._conn.execute(
+                "UPDATE scheduled_jobs "
+                "SET status='dispatched', prompt_id=?, dispatched_at=? "
+                "WHERE id=?",
+                (prompt_id, now, job_id),
+            )
+        return cur.rowcount > 0
+
     def _finish(self, job_id, status, prompt_id=None, outputs=None, error=None):
         now=time.time()
         with self._conn:
