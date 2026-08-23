@@ -519,13 +519,14 @@ class TestPauseAllCancelsQueue(unittest.TestCase):
         a = _add(self.db)
         b = _add(self.db)
         c = _add(self.db)
+        # After the pause-all split, /pause-all only touches the
+        # dispatched rows. The running row is left alone (see
+        # /pause-running-all).
         self.db.update_job(a, status="dispatched", prompt_id="p-a")
         self.db.update_job(b, status="dispatched", prompt_id="p-b")
         self.db.update_job(c, status="running", prompt_id="p-c")
 
-        # Two HTTP responses: one for the /queue delete batch, one for
-        # the single /interrupt call.
-        self.fetcher.expect((200, ""))
+        # One HTTP response for the /queue delete batch.
         self.fetcher.expect((200, ""))
 
         captured = self._patch_fetcher()
@@ -533,7 +534,7 @@ class TestPauseAllCancelsQueue(unittest.TestCase):
         self.assertEqual(resp.status, 200)
         body = json.loads(resp.body)
         self.assertEqual(body["paused"], True)
-        self.assertEqual(body["cancelled_count"], 3)
+        self.assertEqual(body["cancelled_count"], 2)
         self.assertEqual(body["error_count"], 0)
         self.assertEqual(body["errors"], [])
 
@@ -541,16 +542,16 @@ class TestPauseAllCancelsQueue(unittest.TestCase):
         # and the default ComfyUI URL.
         self.assertEqual(captured["url"], routes._DEFAULT_COMFYUI_URL)
         in_flight_ids = {r["id"] for r in captured["in_flight"]}
-        self.assertEqual(in_flight_ids, {a, b, c})
+        # Only the dispatched rows are passed to /pause-all; the running
+        # row is left for /pause-running-all.
+        self.assertEqual(in_flight_ids, {a, b})
 
         # And the HTTP fetcher saw the right URLs / bodies.
-        self.assertEqual(len(self.fetcher.calls), 2)
-        first, second = self.fetcher.calls
+        self.assertEqual(len(self.fetcher.calls), 1)
+        first = self.fetcher.calls[0]
         self.assertEqual(first["url"], routes._DEFAULT_COMFYUI_URL + "/queue")
         # Order is DB-driven (sorted by id), so compare as sets.
         self.assertEqual(set(first["body"]["delete"]), {"p-a", "p-b"})
-        self.assertEqual(second["url"], routes._DEFAULT_COMFYUI_URL + "/interrupt")
-        self.assertEqual(second["body"], {"prompt_id": "p-c"})
 
     def test_pause_uses_app_overridden_comfyui_url(self):
         """If app state carries a custom sq_comfyui_url, the handler
@@ -571,21 +572,23 @@ class TestPauseAllCancelsQueue(unittest.TestCase):
     def test_pause_clears_prompt_id_after_successful_cancel(self):
         a = _add(self.db)
         b = _add(self.db)
+        # After the pause-all split, /pause-all only touches
+        # 'dispatched' rows. The running row is left alone (it is
+        # handled by /pause-running-all instead).
         self.db.update_job(a, status="dispatched", prompt_id="p-a",
                             dispatched_at=1.0)
-        self.db.update_job(b, status="running", prompt_id="p-b",
+        self.db.update_job(b, status="dispatched", prompt_id="p-b",
                             dispatched_at=2.0)
 
-        self.fetcher.expect((200, ""))
+        # /queue delete accepts a list of prompt_ids; we expect a
+        # single batched call.
         self.fetcher.expect((200, ""))
         self._patch_fetcher()
 
         _run(routes.pause_all_handler(_StubRequest(self.app)))
 
-        # Reclaim flips 'dispatched' rows back to 'scheduled' but
-        # leaves 'running' rows at 'running'. Either way, the
-        # prompt_id (and dispatched_at) should be NULL after the
-        # cancel calls ack'd.
+        # Both 'dispatched' rows are reclaimed and have their
+        # prompt_id cleared.
         for jid in (a, b):
             row = self.db.get_job(jid)
             self.assertIsNone(row["prompt_id"], jid)
@@ -612,11 +615,11 @@ class TestPauseAllCancelsQueue(unittest.TestCase):
         self.assertEqual(self.db.get_job(a)["status"], "dispatched")
 
     def test_pause_handles_comfyui_down_gracefully(self):
-        # Network down — every call returns 0.
+        # Network down — every call returns 0. After the pause-all
+        # split, /pause-all only touches dispatched rows, so we test
+        # with just one dispatched row.
         a = _add(self.db)
-        b = _add(self.db)
         self.db.update_job(a, status="dispatched", prompt_id="p1")
-        self.db.update_job(b, status="running", prompt_id="p2")
         self.fetcher.default_response = (0, "", "refused")
         self._patch_fetcher()
 
@@ -625,15 +628,12 @@ class TestPauseAllCancelsQueue(unittest.TestCase):
         body = json.loads(resp.body)
         self.assertEqual(body["paused"], True)
         self.assertEqual(body["cancelled_count"], 0)
-        # error_count covers every HTTP call (1 batched + 1 interrupt
-        # = 2 attempts).
-        self.assertEqual(body["error_count"], 2)
+        self.assertEqual(body["error_count"], 1)
         # Paused flag still set even though ComfyUI is unreachable —
         # scheduler should not start dispatching again.
         self.assertEqual(self.db.get_state("paused"), "1")
         # No prompt_id was cleared because nothing ack'd.
         self.assertEqual(self.db.get_job(a)["prompt_id"], "p1")
-        self.assertEqual(self.db.get_job(b)["prompt_id"], "p2")
 
     def test_pause_reclaims_dispatched_after_cancel(self):
         """End-to-end: after a successful pause-all, the previously
@@ -667,7 +667,7 @@ class TestPauseAllCancelsQueue(unittest.TestCase):
         ComfyUI really didn't process it, reconcile() will pick up
         the orphan on the next poll and mark it interrupted."""
         a = _add(self.db)
-        self.db.update_job(a, status="running", prompt_id="p-busy")
+        self.db.update_job(a, status="dispatched", prompt_id="p-busy")
         self.fetcher.expect((0, "", "timeout"))
         self._patch_fetcher()
 
@@ -676,10 +676,23 @@ class TestPauseAllCancelsQueue(unittest.TestCase):
         body = json.loads(resp.body)
         self.assertEqual(body["cancelled_count"], 1)
         self.assertEqual(body["error_count"], 0)
-        # Timeout-as-success: status stays running (reconcile will
-        # eventually flip it to interrupted once ComfyUI stops
-        # reporting the prompt), but prompt_id must be cleared so
-        # reconcile doesn't keep tracking a stale ComfyUI prompt.
+        self.assertEqual(self.db.get_job(a)["status"], "scheduled")
+
+    def test_pause_running_all_timeout_is_treated_as_success(self):
+        """Same timeout-as-success rule applies to /pause-running-all:
+        a timeout on /interrupt is treated as success because ComfyUI
+        was busy finishing the current step. prompt_id is cleared so
+        reconcile doesn't keep tracking the orphan."""
+        a = _add(self.db)
+        self.db.update_job(a, status="running", prompt_id="p-busy")
+        self.fetcher.expect((0, "", "timeout"))
+        self._patch_fetcher()
+
+        resp = _run(routes.pause_running_all_handler(_StubRequest(self.app)))
+        self.assertEqual(resp.status, 200)
+        body = json.loads(resp.body)
+        self.assertEqual(body["cancelled_count"], 1)
+        self.assertEqual(body["error_count"], 0)
         row = self.db.get_job(a)
         self.assertIsNone(row.get("prompt_id"))
         self.assertEqual(row["status"], "running")

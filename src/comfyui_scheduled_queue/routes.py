@@ -10,6 +10,8 @@ Endpoints (all under /api/schedule/*):
     POST   /api/schedule/add                - create a new scheduled job
     POST   /api/schedule/add-batch          - bulk create (Stage 3)
     POST   /api/schedule/cancel/{id}        - soft-delete (status='cancelled')
+    POST   /api/schedule/requeue-dispatched/{id} - pull one pending prompt back
+    POST   /api/schedule/cancel-running/{id} - interrupt and fail one running job
     POST   /api/schedule/update/{id}        - patch whitelisted fields only
     POST   /api/schedule/reorder/{id}       - move job up/down in queue
     GET    /api/schedule/job/{id}           - one job incl. outputs (Stage 3)
@@ -18,6 +20,7 @@ Endpoints (all under /api/schedule/*):
     POST   /api/schedule/repeat/{id}        - clone as new job (Stage 3)
     GET    /api/schedule/status             - global scheduler status snapshot
     POST   /api/schedule/pause-all          - Stage 2: pause scheduler
+    POST   /api/schedule/pause-running-all  - pause scheduler + interrupt all running jobs
     POST   /api/schedule/resume-all         - Stage 2: resume + reset interrupted jobs
     POST   /api/schedule/run-now/{id}       - Stage 2: immediate reschedule of a job
     GET    /api/schedule/orphan-status      - Stage 2: interrupted job inventory
@@ -195,6 +198,14 @@ _DEFAULT_COMFYUI_URL = "http://127.0.0.1:8188"
 # as a success because reconcile() will treat the prompt as gone the
 # next time it polls /history).
 _COMFYUI_HTTP_TIMEOUT = 30.0
+
+
+def _comfyui_url(request):
+    """Resolve the ComfyUI base URL from app state, falling back to the
+    process-wide default. Centralised so the row handlers and the
+    global pause handlers don't drift.
+    """
+    return request.app.get("sq_comfyui_url") or _DEFAULT_COMFYUI_URL
 
 
 def _default_comfyui_fetcher(url, body, timeout):
@@ -510,6 +521,130 @@ async def cancel_handler(request) -> "web.Response":  # type: ignore[name-define
     return _json_response({"id": job_id, "status": "cancelled"})
 
 
+async def requeue_dispatched_handler(request) -> "web.Response":  # type: ignore[name-defined]
+    """POST /api/schedule/requeue-dispatched/{id}.
+
+    Remove one prompt from ComfyUI's pending queue, then return the local row
+    to ``scheduled``.  The state transition is deliberately performed only
+    after the native queue delete succeeds, so a transient ComfyUI error
+    cannot create a duplicate prompt.
+
+    The response uses status 409 for a live row that is no longer
+    ``dispatched`` (for example, it became running while the request was in
+    flight).
+    """
+    db = request.app.get("sq_db")
+    if db is None:
+        return _server_error("db not initialized")
+
+    job_id = request.match_info.get("job_id", "").strip()
+    if not job_id:
+        return _bad_request("job_id is required")
+
+    try:
+        row = db.get_job(job_id)
+    except Exception:
+        _log.exception("requeue_dispatched: get_job failed")
+        return _server_error("database error")
+    if row is None:
+        return _not_found("job not found")
+    if row.get("status") != "dispatched":
+        return _json_response(
+            {"error": "job is no longer dispatched; it cannot be requeued"},
+            status=409,
+        )
+
+    prompt_id = row.get("prompt_id")
+    if prompt_id:
+        try:
+            ok, info = _comfyui_post_json(
+                _comfyui_url(request) + "/queue",
+                {"delete": [prompt_id]},
+            )
+        except Exception:
+            _log.exception("requeue_dispatched: ComfyUI queue delete failed")
+            return _server_error("ComfyUI queue delete failed")
+        if not ok:
+            return _json_response(
+                {"error": f"ComfyUI queue delete failed: {info}"}, status=502
+            )
+
+    try:
+        if not db.requeue_dispatched_job(job_id):
+            return _json_response(
+                {"error": "job is no longer dispatched; it cannot be requeued"},
+                status=409,
+            )
+    except Exception:
+        _log.exception("requeue_dispatched: database transition failed")
+        return _server_error("database error")
+
+    return _json_response({"id": job_id, "status": "scheduled", "requeued": True})
+
+
+# Short alias used by older clients/sidebars.  Keep the explicit name above
+# as the canonical API; both paths intentionally share the same handler.
+async def requeue_handler(request) -> "web.Response":  # type: ignore[name-defined]
+    return await requeue_dispatched_handler(request)
+
+
+async def cancel_running_handler(request) -> "web.Response":  # type: ignore[name-defined]
+    """POST /api/schedule/cancel-running/{id}.
+
+    Interrupt exactly one live prompt, then move its local row to the failed
+    history.  ComfyUI's /interrupt acknowledgement is the commit point:
+    failures leave the row in ``running`` so the operator can retry safely.
+    """
+    db = request.app.get("sq_db")
+    if db is None:
+        return _server_error("db not initialized")
+
+    job_id = request.match_info.get("job_id", "").strip()
+    if not job_id:
+        return _bad_request("job_id is required")
+
+    try:
+        row = db.get_job(job_id)
+    except Exception:
+        _log.exception("cancel_running: get_job failed")
+        return _server_error("database error")
+    if row is None:
+        return _not_found("job not found")
+    if row.get("status") != "running":
+        return _json_response(
+            {"error": "job is not running; it cannot be interrupted"},
+            status=409,
+        )
+
+    prompt_id = row.get("prompt_id")
+    if not prompt_id:
+        return _json_response(
+            {"error": "running job has no prompt_id; it cannot be interrupted"},
+            status=409,
+        )
+
+    try:
+        ok, info = _comfyui_post_json(
+            _comfyui_url(request) + "/interrupt", {"prompt_id": prompt_id}
+        )
+    except Exception:
+        _log.exception("cancel_running: ComfyUI interrupt failed")
+        return _server_error("ComfyUI interrupt failed")
+    if not ok:
+        return _json_response(
+            {"error": f"ComfyUI interrupt failed: {info}"}, status=502
+        )
+
+    try:
+        if not db.mark_failed(job_id, "cancelled by user"):
+            return _server_error("database error")
+    except Exception:
+        _log.exception("cancel_running: failed to archive job")
+        return _server_error("database error")
+
+    return _json_response({"id": job_id, "status": "failed"})
+
+
 async def update_handler(request) -> "web.Response":  # type: ignore[name-defined]
     """POST /api/schedule/update/{job_id}
 
@@ -713,40 +848,38 @@ async def pause_all_handler(request) -> "web.Response":  # type: ignore[name-def
       1. ``db.set_state("paused", "1")`` — the scheduler thread stops
          dispatching new jobs at the next tick.
       2. ``db.list_in_flight_with_prompt_id()`` — enumerate every row
-         still sitting in ComfyUI's native queue (status='dispatched'
-         lives in ComfyUI's ``queue_pending``; status='running' lives in
-         ``queue_running``).
-      3. Hit ComfyUI to actually pull them out:
+         still sitting in ComfyUI's native queue. **Only ``dispatched``
+         rows are reclaimed**: the user separates pause into two
+         buttons, so ``/pause-all`` returns queued prompts back to the
+         local queue and never interrupts a running prompt.
+      3. Hit ComfyUI to actually pull the dispatched prompts out:
 
          * ``POST /queue {delete: [...]}`` with every dispatched
            prompt_id bundled into a single batch (ComfyUI accepts a
            list).
-         * ``POST /interrupt {prompt_id: ...}`` once per running row
-           (ComfyUI's interrupt endpoint only takes one id at a time).
 
       4. ``db.reclaim_dispatched()`` — flip the now-cancelled
          'dispatched' rows back to 'scheduled' so the scheduler can
-         pick them up again on resume. ``running`` rows keep their
-         status and rely on the next reconcile() pass to finalise
-         them once ComfyUI writes a /history entry for the interrupted
-         prompt. **Skipped when any cancel call failed** — if
-         ComfyUI didn't ack the cancel, leaving the row at
-         'dispatched' preserves the prompt_id so a subsequent
+         pick them up again on resume. **Skipped when any cancel call
+         failed** — if ComfyUI didn't ack the cancel, leaving the row
+         at 'dispatched' preserves the prompt_id so a subsequent
          ``/pause-all`` retry can target it again. The handler also
          calls ``db.clear_prompt_id()`` for the successfully cancelled
          ids so reconcile() doesn't fetch a /history record for a
          prompt that no longer exists.
-      5. ``db.set_state("last_error")`` is touched when at least one
-         HTTP call failed so the operator can see the queue-cancel
-         failure from ``/status``.
+
+    Running rows are untouched. Cancel a running prompt via
+    ``/cancel-running/{id}`` (single) or ``/pause-running-all``
+    (global). Re-claim a single dispatched prompt via
+    ``/requeue-dispatched/{id}``.
 
     Failure modes:
 
-      * If ComfyUI is unreachable / returns 5xx for every cancel call,
-        the in-ComfyUI jobs keep running; our DB rows stay at
-        'dispatched' / 'running' and a subsequent ``/pause-all`` retry
-        will try again with a fresh HTTP request. ``paused=True`` is
-        still returned because the scheduler is correctly paused — the
+      * If ComfyUI is unreachable / returns 5xx for the queue delete,
+        the in-ComfyUI pending row keeps existing; our DB row stays
+        at 'dispatched' and a subsequent ``/pause-all`` retry will
+        try again with a fresh HTTP request. ``paused=True`` is still
+        returned because the scheduler is correctly paused — the
         operator just has to retry the cancel piece.
       * If ``reclaim_dispatched()`` raises, we still return 200 with
         whatever the HTTP layer accomplished so a partial outage
@@ -764,39 +897,41 @@ async def pause_all_handler(request) -> "web.Response":  # type: ignore[name-def
 
     try:
         db.set_state("paused", "1")
-        in_flight = db.list_in_flight_with_prompt_id()
+        all_in_flight = db.list_in_flight_with_prompt_id()
     except Exception:
         _log.exception("pause_all: db read failed")
         return _server_error("database error")
 
+    # Only touch 'dispatched' rows; the user wants a separate button
+    # to interrupt running prompts. See /pause-running-all.
+    dispatched_in_flight = [
+        r for r in (all_in_flight or []) if r.get("status") == "dispatched"
+    ]
+
     cancelled_count = 0
     error_count = 0
     errors: list[str] = []
-    if in_flight:
+    if dispatched_in_flight:
         cancelled_count, error_count, errors = _cancel_comfyui_queue(
-            in_flight, comfyui_url,
+            dispatched_in_flight, comfyui_url,
         )
         if error_count:
             _log.warning(
-                "pause_all: %d/%d ComfyUI cancel calls failed: %s",
-                error_count, len(in_flight), errors,
+                "pause_all: %d/%d dispatched cancel calls failed: %s",
+                error_count, len(dispatched_in_flight), errors,
             )
-            # Surface the most recent error in /status so operators can
-            # tell why the queue still shows in-flight rows.
             try:
                 db.set_state("last_error", f"pause_all cancel: {errors[0]}")
             except Exception:
                 pass
-        # For every row we *think* ComfyUI accepted, clear the prompt_id.
-        # We slice to ``cancelled_count`` because cancelled_count may
-        # over-count when the bundled /queue call succeeded but one of
-        # the per-prompt /interrupt calls failed (the bundle is silent
-        # so we have no per-id acknowledgement).
+        # For every row we *think* ComfyUI accepted, clear the prompt_id
+        # so reconcile() doesn't fetch a /history record for a prompt
+        # that no longer exists.
         if cancelled_count:
             try:
-                cancelled_pids = {r["prompt_id"] for r in in_flight}
+                cancelled_pids = {r["prompt_id"] for r in dispatched_in_flight}
                 job_ids_to_clear = [
-                    r["id"] for r in in_flight
+                    r["id"] for r in dispatched_in_flight
                     if r.get("prompt_id") and r["prompt_id"] in cancelled_pids
                 ][:cancelled_count]
                 db.clear_prompt_id(job_ids_to_clear)
@@ -819,6 +954,76 @@ async def pause_all_handler(request) -> "web.Response":  # type: ignore[name-def
         "paused": True,
         "reclaimed_count": int(reclaimed_count),
         "cancelled_count": int(cancelled_count),
+        "error_count": int(error_count),
+        "errors": errors,
+    })
+
+
+async def pause_running_all_handler(request) -> "web.Response":  # type: ignore[name-defined]
+    """POST /api/schedule/pause-running-all
+
+    Interrupt every running prompt via ComfyUI's ``POST /interrupt``
+    and clear the local ``prompt_id`` / ``dispatched_at`` fields so
+    reconcile() can settle the rows. Does **not** touch ``dispatched``
+    rows (those are returned to the local queue via ``/pause-all``) and
+    does **not** flip the scheduler's ``paused`` flag.
+
+    Response: 200 ``{"paused": True, "reclaimed_count": 0,
+    "cancelled_count": M, "error_count": K, "errors": [...],
+    "interrupted_count": M}``. The shape mirrors ``/pause-all`` so
+    clients can use one response parser for both.
+    """
+    db = request.app.get("sq_db")
+    if db is None:
+        return _server_error("db not initialized")
+
+    comfyui_url = request.app.get("sq_comfyui_url") or _DEFAULT_COMFYUI_URL
+
+    try:
+        db.set_state("paused", "1")
+        all_in_flight = db.list_in_flight_with_prompt_id()
+    except Exception:
+        _log.exception("pause_running_all: db read failed")
+        return _server_error("database error")
+
+    running_in_flight = [
+        r for r in (all_in_flight or []) if r.get("status") == "running"
+    ]
+
+    cancelled_count = 0
+    error_count = 0
+    errors: list[str] = []
+    if running_in_flight:
+        cancelled_count, error_count, errors = _cancel_comfyui_queue(
+            running_in_flight, comfyui_url,
+        )
+        if error_count:
+            _log.warning(
+                "pause_running_all: %d/%d running cancel calls failed: %s",
+                error_count, len(running_in_flight), errors,
+            )
+            try:
+                db.set_state("last_error", f"pause_running_all cancel: {errors[0]}")
+            except Exception:
+                pass
+        if cancelled_count:
+            try:
+                cancelled_pids = {r["prompt_id"] for r in running_in_flight}
+                job_ids_to_clear = [
+                    r["id"] for r in running_in_flight
+                    if r.get("prompt_id") and r["prompt_id"] in cancelled_pids
+                ][:cancelled_count]
+                db.clear_prompt_id(job_ids_to_clear)
+            except Exception:
+                _log.exception(
+                    "pause_running_all: clear_prompt_id failed (continuing)"
+                )
+
+    return _json_response({
+        "paused": True,
+        "reclaimed_count": 0,
+        "cancelled_count": int(cancelled_count),
+        "interrupted_count": int(cancelled_count),
         "error_count": int(error_count),
         "errors": errors,
     })
@@ -1296,12 +1501,15 @@ def setup_routes(db, interceptor=None) -> None:
     app.router.add_get("/api/schedule/list", list_handler)
     app.router.add_post("/api/schedule/add", add_handler)
     app.router.add_post("/api/schedule/cancel/{job_id}", cancel_handler)
+    app.router.add_post("/api/schedule/requeue-dispatched/{job_id}", requeue_dispatched_handler)
+    app.router.add_post("/api/schedule/cancel-running/{job_id}", cancel_running_handler)
     app.router.add_post("/api/schedule/update/{job_id}", update_handler)
     app.router.add_post("/api/schedule/reorder/{job_id}", reorder_handler)
     app.router.add_get("/api/schedule/status", status_handler)
 
     # Stage 2 additions (spec section 3) — appended, never reorder stage-1.
     app.router.add_post("/api/schedule/pause-all", pause_all_handler)
+    app.router.add_post("/api/schedule/pause-running-all", pause_running_all_handler)
     app.router.add_post("/api/schedule/resume-all", resume_all_handler)
     app.router.add_post("/api/schedule/run-now/{job_id}", run_now_handler)
     app.router.add_get("/api/schedule/orphan-status", orphan_status_handler)

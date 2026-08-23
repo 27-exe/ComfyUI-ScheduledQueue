@@ -370,6 +370,24 @@ class ScheduledQueueDB:
             cur=self._conn.execute("UPDATE scheduled_jobs SET status='cancelled', error=NULL WHERE id=? AND status IN ('scheduled','interrupted')",(job_id,))
         return cur.rowcount>0
 
+    def requeue_dispatched_job(self, job_id):
+        """Return one POSTed-but-not-started job to the due queue.
+
+        The caller must first remove the corresponding prompt from
+        ComfyUI's native pending queue.  Keeping this transition guarded by
+        ``status='dispatched'`` prevents a running prompt from being
+        accidentally presented for immediate redispatch.
+        """
+        with self._conn:
+            cur = self._conn.execute(
+                "UPDATE scheduled_jobs "
+                "SET status='scheduled', prompt_id=NULL, dispatched_at=NULL, "
+                "started_at=NULL, scheduled_at=? "
+                "WHERE id=? AND status='dispatched'",
+                (time.time(), job_id),
+            )
+        return cur.rowcount > 0
+
     def reorder_job(self, job_id, direction):
         if direction not in (-1,1): raise ValueError("direction must be -1 or 1")
         with self._conn:

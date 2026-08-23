@@ -64,6 +64,8 @@ const BUILTIN_FALLBACKS = {
     "sidebar.refresh": "Refresh",
     "sidebar.pause": "Pause",
     "sidebar.resume": "Resume",
+    "sidebar.pause_title": "Pause scheduler (only affects dispatched rows; running rows continue)",
+    "sidebar.resume_title": "Resume scheduler (flips interrupted rows back to scheduled)",
     "status_bar.paused": "Paused",
     "status_bar.paused_yes": "Yes",
     "status_bar.paused_no": "No",
@@ -75,6 +77,20 @@ const BUILTIN_FALLBACKS = {
     "status_bar.label.fail": "Failed",
     "status_bar.label.cncl": "Cancelled",
     "topbar.schedule_tooltip": "Schedule current workflow",
+    "action.cancel": "Cancel",
+    "action.cancel_title": "Cancel pending task",
+    "action.cancel_running": "Interrupt",
+    "action.cancel_running_title": "Interrupt this prompt in ComfyUI and mark the row as failed",
+    "action.requeue": "Requeue",
+    "action.requeue_title": "Pull this dispatched row back to scheduled (also removes it from ComfyUI's queue)",
+    "action.row_pause": "Pause",
+    "action.row_pause_title": "Pause scheduler (global; stops dispatching new jobs and reclaims all dispatched rows back to scheduled)",
+    "action.row_resume": "Resume",
+    "action.row_resume_title": "Resume scheduler (global; flips interrupted rows back to scheduled)",
+    "confirm.requeue": "Pull this dispatched row back to scheduled? ComfyUI's queued copy of this prompt will be removed.",
+    "confirm.cancel_running": "Interrupt this prompt in ComfyUI and mark the row as failed? ComfyUI's worker may keep running for a few more seconds.",
+    "confirm.row_pause": "Pause the scheduler globally? New jobs won't be dispatched and all currently-dispatched rows will be reclaimed back to scheduled. Running rows will keep running.",
+    "confirm.row_resume": "Resume the scheduler globally? Any 'interrupted' rows will be flipped back to 'scheduled' and re-dispatched at the next tick.",
 };
 
 // Asynchronous locale bootstrap: load both JSON files in parallel
@@ -205,7 +221,7 @@ function buildPanel() {
 
         <div data-role="actions" data-actions="__header__" style="margin-bottom:10px;display:grid;grid-template-columns:1fr 1fr;gap:4px;">
             <button data-act="refresh" style="padding:6px 8px;background:#0078d4;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:11px;">${escapeHtml(t("sidebar.refresh"))}</button>
-            <button data-act="pause-resume" data-state="running" style="padding:6px 8px;background:#444;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:11px;">${escapeHtml(t("sidebar.pause"))}</button>
+            <button data-act="pause-resume" data-state="running" title="${escapeHtml(t("sidebar.pause_title"))}" style="padding:6px 8px;background:#444;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:11px;">${escapeHtml(t("sidebar.pause"))}</button>
         </div>
 
         <div data-role="status" style="margin-bottom:10px;font-size:11px;color:#aaa;padding:8px;background:#252525;border-radius:4px;">${escapeHtml(t("sidebar.loading_jobs"))}</div>
@@ -503,6 +519,7 @@ function buildPanel() {
         // is language-independent.
         pauseResumeBtn.textContent = status.paused ? t("sidebar.resume") : t("sidebar.pause");
         pauseResumeBtn.dataset.state = status.paused ? "paused" : "running";
+        pauseResumeBtn.title = status.paused ? t("sidebar.resume_title") : t("sidebar.pause_title");
         pauseResumeBtn.style.background = status.paused ? "#2d8f3e" : "#666";
     }
 
@@ -616,18 +633,29 @@ function buildPanel() {
         };
         jobsEl.innerHTML = visibleJobs.map((j, idx) => {
             const col = colors[j.status] || "#888";
-            // Per-row capability flags. We split actionability into three
+            // Per-row capability flags. We split actionability into five
             // orthogonal dimensions because the buttons have different
             // backend requirements:
-            //   actionable : can be moved in the queue + run-now + cancel
+            //   actionable : can be moved in the queue + run-now + edit
             //                (only makes sense before the job is dispatched)
             //   editable   : can be edited in the mini dialog (scheduled,
             //                dispatched, paused — *not* running/interrupted
             //                because changing scheduled_at mid-flight would
             //                silently desync from the live prompt_id)
-            //   cancellable: can be cancelled (still allowed for dispatched
-            //                so the user can pull a stuck prompt; backend
-            //                now requires a confirm() step)
+            //   cancellable: can be cancelled (allowed for every active row
+            //                status — scheduled, dispatched, running,
+            //                interrupted, paused — so the user always has
+            //                an "abort" exit; the backend still requires a
+            //                confirm() for dispatched/running because those
+            //                touches reach into ComfyUI's queue)
+            //   recallable : can be requeued (only 'dispatched' — pulls the
+            //                row back from ComfyUI's queue_pending and flips
+            //                the DB row to 'scheduled')
+            //   pausable   : can pause/resume via the *global* scheduler
+            //                flag (scheduled rows show 'Pause', paused rows
+            //                show 'Resume' — both call the same global
+            //                /pause-all or /resume-all endpoint because
+            //                there is no per-row pause endpoint yet)
             const actionable = j.status === "scheduled" || j.status === "interrupted";
             const editable = j.status === "scheduled"
                 || j.status === "dispatched"
@@ -635,7 +663,10 @@ function buildPanel() {
             const cancellable = j.status === "scheduled"
                 || j.status === "interrupted"
                 || j.status === "dispatched"
+                || j.status === "running"
                 || j.status === "paused";
+            const recallable = j.status === "dispatched";
+            const pausable = j.status === "scheduled" || j.status === "paused";
             const queueIdx = pendingJobs.findIndex(p => p.id === j.id);
             const isFirst = queueIdx <= 0;
             const isLast = queueIdx < 0 || queueIdx === pendingJobs.length - 1;
@@ -743,7 +774,10 @@ function buildPanel() {
                         ${editable ? `<button data-act="edit" data-id="${j.id}" title="${escapeHtml(t("action.schedule"))}" style="padding:2px 6px;background:#3a6f9e;color:#fff;border:none;border-radius:3px;font-size:11px;cursor:pointer;">✎</button>` : ""}
                         ${actionable ? `<button data-act="up" title="${escapeHtml(t("action.up_title"))}" ${isFirst ? "disabled style=\"padding:2px 6px;background:#222;color:#555;border:none;border-radius:3px;font-size:11px;cursor:not-allowed;\"" : "style=\"padding:2px 6px;background:#3a3;color:#fff;border:none;border-radius:3px;font-size:11px;cursor:pointer;\""}>↑</button><button data-act="down" title="${escapeHtml(t("action.down_title"))}" ${isLast ? "disabled style=\"padding:2px 6px;background:#222;color:#555;border:none;border-radius:3px;font-size:11px;cursor:not-allowed;\"" : "style=\"padding:2px 6px;background:#3a3;color:#fff;border:none;border-radius:3px;font-size:11px;cursor:pointer;\""}>↓</button>` : ""}
                         ${actionable ? `<button data-act="run-now" title="${escapeHtml(t("action.run_now_title"))}" style="padding:2px 6px;background:#2d6f9e;color:#fff;border:none;border-radius:3px;font-size:11px;cursor:pointer;">${escapeHtml(t("action.run_now"))}</button>` : ""}
-                        ${cancellable ? `<button data-act="cancel" title="${escapeHtml(t("action.cancel_title"))}" style="padding:2px 6px;background:#7a3030;color:#fff;border:none;border-radius:3px;font-size:11px;cursor:pointer;">✕</button>` : ""}
+                        ${j.status === "scheduled" ? `<button data-act="row-pause" title="${escapeHtml(t("action.row_pause_title"))}" style="padding:2px 6px;background:#aa6;color:#fff;border:none;border-radius:3px;font-size:11px;cursor:pointer;">${escapeHtml(t("action.row_pause"))}</button>` : ""}
+                        ${j.status === "paused" ? `<button data-act="row-resume" title="${escapeHtml(t("action.row_resume_title"))}" style="padding:2px 6px;background:#2d8f3e;color:#fff;border:none;border-radius:3px;font-size:11px;cursor:pointer;">${escapeHtml(t("action.row_resume"))}</button>` : ""}
+                        ${recallable ? `<button data-act="requeue" title="${escapeHtml(t("action.requeue_title"))}" style="padding:2px 6px;background:#aa6;color:#fff;border:none;border-radius:3px;font-size:11px;cursor:pointer;">${escapeHtml(t("action.requeue"))}</button>` : ""}
+                        ${cancellable ? `<button data-act="cancel" ${j.status === "running" ? "data-variant=\"interrupt\" " : ""}title="${escapeHtml(j.status === "running" ? t("action.cancel_running_title") : t("action.cancel_title"))}" style="padding:2px 6px;background:#7a3030;color:#fff;border:none;border-radius:3px;font-size:11px;cursor:pointer;">${escapeHtml(j.status === "running" ? t("action.cancel_running") : t("action.cancel"))}</button>` : ""}
                         <button data-act="repeat" data-id="${j.id}" title="${escapeHtml(t("action.repeat_title"))}" style="padding:2px 6px;background:#5a4f9e;color:#fff;border:none;border-radius:3px;font-size:11px;cursor:pointer;">↻</button>
                         <button data-act="export" data-id="${j.id}" title="${escapeHtml(t("action.export_title"))}" style="padding:2px 6px;background:#666;color:#fff;border:none;border-radius:3px;font-size:11px;cursor:pointer;">⬇</button>
                     </div>
@@ -1027,35 +1061,59 @@ function buildPanel() {
         const id = actionsEl.dataset.actions;
         const jobEl = actionsEl.closest("[data-job-id]");
         const act = btn.dataset.act;
+        const variant = btn.dataset.variant || "";
+        const status = jobEl && jobEl.dataset.status ? jobEl.dataset.status : "";
 
-        // Cancel deserves a confirmation step (Improvement 1 part 2):
-        // cancelling an already-dispatched job pulls a prompt out of
-        // ComfyUI's queue; cancelling a running job is a no-op on the
-        // backend but still ratchets user intent in the local DB. Pulling
-        // a queued prompt and then regretting it requires the user to
-        // re-schedule from scratch, so we ask once.
+        // Confirmation step: actions that mutate ComfyUI's queue or
+        // the scheduler's paused flag deserve a prompt because the
+        // result is hard to undo (the user would have to re-schedule
+        // from scratch). Pure local-row mutations (edit / run-now /
+        // up / down / repeat / export) skip the confirm.
+        let needsConfirm = false;
+        let confirmMsg = "";
         if (act === "cancel") {
-            const status = jobEl && jobEl.dataset.status ? jobEl.dataset.status : "";
-            let msg;
-            // Per-state confirm copy. Keys are intentionally distinct so
-            // translators see them individually in the JSON file. We pass
-            // fallbacks for each branch so an incomplete locale never
-            // produces an empty confirm() dialog.
-            if (status === "dispatched") {
-                msg = t("confirm.cancel_dispatched",
+            needsConfirm = true;
+            // 'running' rows use the interrupt-specific copy because the
+            // new /cancel-running/{id} endpoint actually talks to
+            // ComfyUI's /interrupt (the old /cancel/{id} endpoint just
+            // soft-marks the row). Per-state confirm copy uses distinct
+            // i18n keys so translators see them individually.
+            if (status === "running") {
+                confirmMsg = t("confirm.cancel_running",
+                    "Interrupt this prompt in ComfyUI and mark the row as failed? ComfyUI's worker may keep running for a few more seconds.");
+            } else if (status === "dispatched") {
+                confirmMsg = t("confirm.cancel_dispatched",
                     "This job is queued in ComfyUI's queue. Cancel will pull it out. Continue?");
-            } else if (status === "running") {
-                msg = t("confirm.cancel_running",
-                    "Cancel a running job? The prompt will continue in ComfyUI; the row will be marked cancelled locally.");
             } else {
-                msg = t("confirm.cancel", "Cancel this scheduled job?");
+                confirmMsg = t("confirm.cancel", "Cancel this scheduled job?");
             }
-            if (!window.confirm(msg)) {
-                // Re-enable the buttons we just disabled so the user can
-                // click again without waiting for refresh().
-                actionsEl.querySelectorAll("button").forEach(b => (b.disabled = false));
-                return;
+        } else if (act === "requeue") {
+            // Pulls a dispatched row back to scheduled (also removes the
+            // prompt from ComfyUI's queue_pending). Lossy in the sense
+            // that a re-dispatch will create a new prompt_id — worth
+            // confirming.
+            needsConfirm = true;
+            confirmMsg = t("confirm.requeue",
+                "Pull this dispatched row back to scheduled? ComfyUI's queued copy of this prompt will be removed.");
+        } else if (act === "row-pause" || act === "row-resume") {
+            // Global scheduler flag toggle — affects every other row,
+            // not just this one. Worth a confirm so the user doesn't
+            // accidentally stop a long batch by clicking Pause on a
+            // single row.
+            needsConfirm = true;
+            if (act === "row-pause") {
+                confirmMsg = t("confirm.row_pause",
+                    "Pause the scheduler globally? New jobs won't be dispatched and all currently-dispatched rows will be reclaimed back to scheduled. Running rows will keep running.");
+            } else {
+                confirmMsg = t("confirm.row_resume",
+                    "Resume the scheduler globally? Any 'interrupted' rows will be flipped back to 'scheduled' and re-dispatched at the next tick.");
             }
+        }
+        if (needsConfirm && !window.confirm(confirmMsg)) {
+            // Re-enable the buttons we just disabled so the user can
+            // click again without waiting for refresh().
+            actionsEl.querySelectorAll("button").forEach(b => (b.disabled = false));
+            return;
         }
 
         if (act === "edit") {
@@ -1070,7 +1128,7 @@ function buildPanel() {
                 actionsEl.querySelectorAll("button").forEach(b => (b.disabled = true));
                 const detail = await callApi(`/job/${encodeURIComponent(id)}`);
                 const job = detail && detail.job ? detail.job : detail;
-                openEditJobDialog(job || { id, status: jobEl && jobEl.dataset.status ? jobEl.dataset.status : "" }, refresh);
+                openEditJobDialog(job || { id, status }, refresh);
             } catch (err) {
                 statusEl.innerHTML = `<div style="color:#f44;">${escapeHtml(t("error.action_failed"))}: ${escapeHtml(err.message)}</div>`;
             } finally {
@@ -1083,7 +1141,50 @@ function buildPanel() {
         actionsEl.querySelectorAll("button").forEach(b => (b.disabled = true));
         try {
             if (act === "cancel") {
-                await callApi(`/cancel/${encodeURIComponent(id)}`, { method: "POST" });
+                // 'running' rows call the new /cancel-running/{id} endpoint
+                // (which actually hits ComfyUI's /interrupt); every other
+                // row uses the legacy /cancel/{id} which only soft-marks
+                // the row. Fall back to /cancel/{id} on 404 so the UI
+                // remains usable even if the new endpoint isn't shipped.
+                if (status === "running" || variant === "interrupt") {
+                    try {
+                        await callApi(`/cancel-running/${encodeURIComponent(id)}`, { method: "POST" });
+                    } catch (err) {
+                        if (err && /HTTP\s+404/.test(String(err.message || ""))) {
+                            console.warn("[ScheduledQueue] /cancel-running/{id} missing, falling back to /cancel/{id}", err);
+                            await callApi(`/cancel/${encodeURIComponent(id)}`, { method: "POST" });
+                        } else {
+                            throw err;
+                        }
+                    }
+                } else {
+                    await callApi(`/cancel/${encodeURIComponent(id)}`, { method: "POST" });
+                }
+            } else if (act === "requeue") {
+                // Pull a dispatched row back to scheduled. Backend should
+                // also POST /queue {delete: [prompt_id]} to remove it from
+                // ComfyUI's queue_pending. Fall back to /cancel/{id} on
+                // 404 so the UI keeps working if the new endpoint isn't
+                // shipped yet.
+                try {
+                    await callApi(`/requeue-dispatched/${encodeURIComponent(id)}`, { method: "POST" });
+                } catch (err) {
+                    if (err && /HTTP\s+404/.test(String(err.message || ""))) {
+                        console.warn("[ScheduledQueue] /requeue-dispatched/{id} missing, falling back to /cancel/{id}", err);
+                        await callApi(`/cancel/${encodeURIComponent(id)}`, { method: "POST" });
+                    } else {
+                        throw err;
+                    }
+                }
+            } else if (act === "row-pause") {
+                // Per-row pause button is a *global* action — it
+                // toggles the scheduler's paused flag (and after the
+                // backend split, also reclaims every dispatched row).
+                // The button is per-row so the user can find it next
+                // to the rows it affects, but the effect is global.
+                await callApi("/pause-all", { method: "POST" });
+            } else if (act === "row-resume") {
+                await callApi("/resume-all", { method: "POST" });
             } else if (act === "run-now") {
                 await callApi(`/run-now/${encodeURIComponent(id)}`, { method: "POST" });
             } else if (act === "up" || act === "down") {
