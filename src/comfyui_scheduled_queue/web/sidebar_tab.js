@@ -30,8 +30,8 @@ const TAB_ID = "scheduled-queue";
 // i18n -- no real i18n framework in a ComfyUI JS extension, so we
 // inline a tiny lookup table driven by ./locales/{zh,en}.json.
 // The JSON files are fetched at module init; if a fetch fails we
-// silently fall back to empty dicts (and the caller-side `t()` falls
-// through to its built-in fallback or the key string itself).
+// fall back to these critical strings so registration and first paint
+// never expose raw i18n keys.
 // ===========================================================
 
 const LS_LANG_KEY = "sq.lang";
@@ -47,6 +47,28 @@ function detectInitialLang() {
 
 let LANG = detectInitialLang();
 const I18N = { zh: {}, en: {} };
+const BUILTIN_FALLBACKS = {
+    "filter.all": "All",
+    "filter.scheduled": "Scheduled",
+    "filter.running": "Running",
+    "filter.done": "Done",
+    "filter.failed": "Failed",
+    "filter.cancelled": "Cancelled",
+    "sidebar.title": "Scheduled Queue",
+    "sidebar.refresh": "Refresh",
+    "sidebar.pause": "Pause",
+    "sidebar.resume": "Resume",
+    "status_bar.paused": "Paused",
+    "status_bar.paused_yes": "Yes",
+    "status_bar.paused_no": "No",
+    "status_bar.label.sched": "Scheduled",
+    "status_bar.label.run": "Running",
+    "status_bar.label.int": "Interrupted",
+    "status_bar.label.done": "Done",
+    "status_bar.label.fail": "Failed",
+    "status_bar.label.cncl": "Cancelled",
+    "topbar.schedule_tooltip": "Schedule current workflow",
+};
 
 // Synchronous-ish locale bootstrap: load both JSON files in parallel
 // and update I18N when ready. Until both resolve, t() will fall
@@ -59,16 +81,13 @@ async function loadLocales() {
             const r = await fetch(`./locales/${lng}.json`, { cache: "no-cache" });
             if (!r.ok) throw new Error(`HTTP ${r.status}`);
             I18N[lng] = await r.json();
-        } catch (_e) {
-            // Leave I18N[lng] as empty dict; t() will fall back.
+        } catch (e) {
+            console.warn(`[ScheduledQueue] Failed to load ${lng} locale; using built-in fallbacks.`, e);
+            throw e;
         }
     };
     await Promise.all([tryLoad("zh"), tryLoad("en")]);
 }
-
-// Begin fetching locales immediately at module load. The fetch is
-// cheap (<1 KB JSON) so callers usually resolve on first refresh.
-loadLocales();
 
 function setLang(lng) {
     if (lng !== "zh" && lng !== "en") return;
@@ -90,6 +109,9 @@ function t(key, fallback) {
     }
     if (I18N.zh && Object.prototype.hasOwnProperty.call(I18N.zh, key)) {
         return I18N.zh[key];
+    }
+    if (Object.prototype.hasOwnProperty.call(BUILTIN_FALLBACKS, key)) {
+        return BUILTIN_FALLBACKS[key];
     }
     return fallback != null ? fallback : key;
 }
@@ -1770,40 +1792,50 @@ function openScheduleDialog() {
 // Registration
 // ============================================================
 
-app.registerExtension({
-    name: EXT_NAME,
+let _scheduledQueueExtensionRegistered = false;
+function registerScheduledQueueExtension() {
+    if (_scheduledQueueExtensionRegistered) return;
+    _scheduledQueueExtensionRegistered = true;
 
-    actionBarButtons: [
-        {
-            icon: "pi pi-clock",
-            tooltip: t("topbar.schedule_tooltip", "Schedule current workflow (sends to ScheduledQueue, not ComfyUI native queue)"),
-            onClick: () => openScheduleDialog(),
+    app.registerExtension({
+        name: EXT_NAME,
+
+        actionBarButtons: [
+            {
+                icon: "pi pi-clock",
+                tooltip: t("topbar.schedule_tooltip", "Schedule current workflow (sends to ScheduledQueue, not ComfyUI native queue)"),
+                onClick: () => openScheduleDialog(),
+            },
+        ],
+    });
+
+    // Sidebar tab. The 1.49.6 framework calls render(container) ONCE per tab
+    // activation -- switching to another tab and back does NOT re-invoke it.
+    // We render once, then keep the container in sync with the sidebarTab
+    // store via $subscribe so the panel swaps correctly when the user
+    // toggles tabs.
+    app.extensionManager.registerSidebarTab({
+        id: TAB_ID,
+        title: t("sidebar.title", "Scheduled Queue"),
+        icon: "pi pi-clock",
+        tooltip: t("sidebar.tab_tooltip", "Scheduled Queue (managed jobs)"),
+        type: "custom",
+        render: (container) => {
+            const p = buildPanel();
+            container.innerHTML = "";
+            container.appendChild(p);
+            if (typeof p.refresh === "function") p.refresh();
+            // Install watcher AFTER first mount so we can also clean up the
+            // container when the user navigates away.
+            installSidebarWatcher(container);
+            return p;
         },
-    ],
-});
+    });
+}
 
-// Sidebar tab. The 1.49.6 framework calls render(container) ONCE per tab
-// activation -- switching to another tab and back does NOT re-invoke it.
-// We render once, then keep the container in sync with the sidebarTab
-// store via $subscribe so the panel swaps correctly when the user
-// toggles tabs.
-app.extensionManager.registerSidebarTab({
-    id: TAB_ID,
-    title: t("sidebar.title", "Scheduled Queue"),
-    icon: "pi pi-clock",
-    tooltip: t("sidebar.tab_tooltip", "Scheduled Queue (managed jobs)"),
-    type: "custom",
-    render: (container) => {
-        const p = buildPanel();
-        container.innerHTML = "";
-        container.appendChild(p);
-        if (typeof p.refresh === "function") p.refresh();
-        // Install watcher AFTER first mount so we can also clean up the
-        // container when the user navigates away.
-        installSidebarWatcher(container);
-        return p;
-    },
-});
+loadLocales()
+    .then(registerScheduledQueueExtension)
+    .catch(() => registerScheduledQueueExtension());
 
 // Keep the container we were given in sync with activeSidebarTabId.
 let _sidebarWatcher = null;
