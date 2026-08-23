@@ -1803,17 +1803,28 @@ function registerScheduledQueueExtension() {
     if (_scheduledQueueExtensionRegistered) return;
     _scheduledQueueExtensionRegistered = true;
 
-    app.registerExtension({
-        name: EXT_NAME,
-
-        actionBarButtons: [
-            {
-                icon: "pi pi-clock",
-                tooltip: t("topbar.schedule_tooltip", "Schedule current workflow (sends to ScheduledQueue, not ComfyUI native queue)"),
-                onClick: () => openScheduleDialog(),
-            },
-        ],
-    });
+    try {
+        app.registerExtension({
+            name: EXT_NAME,
+            actionBarButtons: [
+                {
+                    icon: "pi pi-clock",
+                    tooltip: t("topbar.schedule_tooltip", "Schedule current workflow (sends to ScheduledQueue, not ComfyUI native queue)"),
+                    onClick: () => {
+                        console.log("[ScheduledQueue] topbar Schedule clicked");
+                        try {
+                            openScheduleDialog();
+                        } catch (error) {
+                            console.error("[ScheduledQueue] failed to open Schedule dialog", error);
+                        }
+                    },
+                },
+            ],
+        });
+        console.log("[ScheduledQueue] topbar Schedule action registered");
+    } catch (error) {
+        console.error("[ScheduledQueue] topbar registration failed", error);
+    }
 
     // Sidebar tab. The 1.49.6 framework calls render(container) ONCE per tab
     // activation -- switching to another tab and back does NOT re-invoke it.
