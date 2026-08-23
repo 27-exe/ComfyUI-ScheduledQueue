@@ -48,12 +48,18 @@ function detectInitialLang() {
 let LANG = detectInitialLang();
 const I18N = { zh: {}, en: {} };
 const BUILTIN_FALLBACKS = {
+    "sidebar.lang.zh": "中",
+    "sidebar.lang.en": "EN",
+    "sidebar.lang.switch_to_zh": "Switch to Chinese",
+    "sidebar.lang.switch_to_en": "Switch to English",
     "filter.all": "All",
     "filter.scheduled": "Scheduled",
     "filter.running": "Running",
     "filter.done": "Done",
     "filter.failed": "Failed",
     "filter.cancelled": "Cancelled",
+    "filter.interrupted": "Interrupted",
+    "filter.dispatched": "Dispatched",
     "sidebar.title": "Scheduled Queue",
     "sidebar.refresh": "Refresh",
     "sidebar.pause": "Pause",
@@ -70,15 +76,15 @@ const BUILTIN_FALLBACKS = {
     "topbar.schedule_tooltip": "Schedule current workflow",
 };
 
-// Synchronous-ish locale bootstrap: load both JSON files in parallel
-// and update I18N when ready. Until both resolve, t() will fall
+// Asynchronous locale bootstrap: load both JSON files in parallel
+// and update I18N when ready. Until they resolve, t() will fall
 // back to its `fallback` arg (or the key). UI strings render on
 // tab activation -- by then the fetch is usually done, but we MUST
 // guard against the race so the first paint doesn't show raw keys.
 async function loadLocales() {
     const tryLoad = async (lng) => {
         try {
-            const r = await fetch(`./locales/${lng}.json`, { cache: "no-cache" });
+            const r = await fetch(`/extensions/ComfyUI-ScheduledQueue/locales/${lng}.json`, { cache: "no-cache" });
             if (!r.ok) throw new Error(`HTTP ${r.status}`);
             I18N[lng] = await r.json();
         } catch (e) {
@@ -86,7 +92,7 @@ async function loadLocales() {
             throw e;
         }
     };
-    await Promise.all([tryLoad("zh"), tryLoad("en")]);
+    await Promise.allSettled([tryLoad("zh"), tryLoad("en")]);
 }
 
 function setLang(lng) {
@@ -1833,9 +1839,13 @@ function registerScheduledQueueExtension() {
     });
 }
 
-loadLocales()
-    .then(registerScheduledQueueExtension)
-    .catch(() => registerScheduledQueueExtension());
+// Registration must happen synchronously during extension discovery. Locale
+// loading is best-effort and may refresh already-mounted panels when complete,
+// but it must never gate the topbar/sidebar registration.
+registerScheduledQueueExtension();
+loadLocales().then(() => {
+    window.dispatchEvent(new CustomEvent("sq:lang-changed", { detail: { lang: LANG } }));
+});
 
 // Keep the container we were given in sync with activeSidebarTabId.
 let _sidebarWatcher = null;
