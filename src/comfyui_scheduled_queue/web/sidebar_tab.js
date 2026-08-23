@@ -189,6 +189,13 @@ function buildPanel() {
     // dedupe to the same network round-trip.
     const _titleInflight = new Map();
     async function resolveJobTitle(job) {
+        // workflow_title is authoritative: if the user-supplied workflow
+        // title is set (captured at Schedule submit time), never overwrite
+        // it with the SaveImage _meta.title (nickname) below. Returning null
+        // short-circuits the async hydration entirely so any subsequent
+        // code path that calls resolveJobTitle cannot clobber the row.
+        const wt = job && typeof job.workflow_title === "string" ? job.workflow_title.trim() : "";
+        if (wt) return null;
         if (job && job.payload && typeof job.payload === "object") {
             const t = getNodeTitle(job.payload);
             if (t) return t;
@@ -336,6 +343,18 @@ function buildPanel() {
         return m > 0 ? `${h}h ${m}m ago` : `${h}h ago`;
     }
 
+    // Format a unix-seconds timestamp as local "HH:MM:SS" (same shape as
+    // formatWhen in openScheduleDialog so the sidebar matches the dialog).
+    // Returns "—" for invalid inputs so missing timestamps don't break the
+    // row layout.
+    function formatAbsTime(ts) {
+        if (ts == null || !Number.isFinite(ts)) return "—";
+        const d = new Date(ts * 1000);
+        if (isNaN(d.getTime())) return "—";
+        const pad = (n) => String(n).padStart(2, "0");
+        return pad(d.getHours()) + ":" + pad(d.getMinutes()) + ":" + pad(d.getSeconds());
+    }
+
     // Resolve the row title with the documented precedence:
     //   workflow_title (sent at Schedule submit time, captured from
     //     app.extensionManager.workflow.activeWorkflow.filename) →
@@ -402,22 +421,28 @@ function buildPanel() {
                 scheduled: "等待中",
                 interrupted: "已中断",
             })[j.status] || j.status;
-            // Duration row: finished_at - dispatched_at for terminal jobs,
-            // "running Nm Ks" if still running, "—" if neither is set.
-            let durationText;
-            if (j.finished_at && j.dispatched_at) {
-                durationText = `${formatDuration(j.finished_at - j.dispatched_at)}`;
-            } else if (j.status === "running") {
-                durationText = `running`;
-            } else {
-                durationText = "—";
-            }
+            // Duration row: shows the absolute finished time (HH:MM:SS local) plus
+            // the elapsed time between dispatched_at and finished_at. The label
+            // comes from finishedLabel below (e.g. "完成于", "失败于"). When
+            // finished_at is missing we fall back to the delta helper so the row
+            // still tells the user something useful. Returns "—" for any path with
+            // no usable timestamp.
             const finishedLabel = j.status === "failed" ? "失败于"
                 : j.status === "done" ? "完成于"
                 : j.status === "cancelled" ? "取消于"
                 : j.status === "running" ? "运行"
                 : j.status === "interrupted" ? "中断于"
                 : "调度";
+            let durationText;
+            if (j.finished_at && j.dispatched_at) {
+                durationText = `${formatAbsTime(j.finished_at)} · ${formatDuration(j.finished_at - j.dispatched_at)}`;
+            } else if (j.finished_at) {
+                durationText = formatAbsTime(j.finished_at);
+            } else if (j.status === "running") {
+                durationText = "running";
+            } else {
+                durationText = "—";
+            }
             return `<div data-job-id="${j.id}" style="padding:6px;margin-bottom:4px;background:#252525;border-radius:3px;border-left:3px solid ${col};">
                 <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:4px;">
                     <div style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1;min-width:0;">
