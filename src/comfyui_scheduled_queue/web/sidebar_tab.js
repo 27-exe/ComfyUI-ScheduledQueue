@@ -951,7 +951,7 @@ function openScheduleDialog() {
         let workflowTitle = "";
         try {
             const aw = app.extensionManager?.workflow?.activeWorkflow;
-            if (aw) workflowTitle = aw.filename || aw.fullFilename || "";
+            if (aw) workflowTitle = aw.filename || aw.fullFilename || aw.name || "";
         } catch (_e) { /* ignore -- empty title is fine */ }
 
         if (!scheduledAt || scheduledAt <= Math.floor(Date.now() / 1000)) {
@@ -1081,6 +1081,15 @@ function openScheduleDialog() {
             + " (" + whenDisplay.value + ")");
     }
 
+    // Minimum offset (seconds) we allow the user to schedule for. Sub-5s
+    // timestamps would either land in the past (after a tiny input lag) or
+    // skip dispatch entirely, so we clamp every code path that mutates
+    // currentWhenTs to at least floor(Date.now()/1000) + THIS.
+    const MIN_SCHEDULE_OFFSET = 5;
+    function minWhenTs() {
+        return Math.floor(Date.now() / 1000) + MIN_SCHEDULE_OFFSET;
+    }
+
     // +/- buttons: each click adds its data-delta (seconds) to currentWhenTs.
     console.log("[ScheduledQueue] binding delta click handlers (v" + SQ_VERSION + ")");
     dlg.querySelectorAll('[data-role="when-row"] [data-delta]').forEach((btn) => {
@@ -1089,6 +1098,9 @@ function openScheduleDialog() {
             console.log("[ScheduledQueue] delta click: " + delta + "s (was " + currentWhenTs + ")");
             if (!Number.isFinite(delta)) return;
             currentWhenTs += delta;
+            // Clamp: never let the +/- buttons push the time into the past
+            // (or so close that input lag would skip dispatch entirely).
+            currentWhenTs = Math.max(currentWhenTs, minWhenTs());
             refreshWhenDisplay();
             // Green = time moves forward (button adds seconds).
             // Blue  = time moves backward (button subtracts seconds).
@@ -1099,12 +1111,30 @@ function openScheduleDialog() {
     // Display input: accept manual edits in any of the three formats.
     // Successful parse updates the canonical timestamp and the hidden
     // input; failure paints a red border without breaking the dialog.
+    // Bug 1 fix: if the user typed a parseable time that is in the past
+    // (or within MIN_SCHEDULE_OFFSET seconds of now), we reject it -- red
+    // border + alert -- rather than silently accepting and clamping,
+    // because silently rewriting what the user typed is more confusing
+    // than refusing the bad value.
     whenDisplay.addEventListener("input", () => {
         const text = whenDisplay.value;
         const parsed = parseWhen(text);
         if (Number.isFinite(parsed)) {
+            if (parsed < minWhenTs()) {
+                whenDisplay.style.borderColor = "#c44";
+                // Note: do not alert on every keystroke -- only the first
+                // time the value crosses into "too early" territory.
+                if (whenDisplay.dataset.sqBadAlerted !== "1") {
+                    whenDisplay.dataset.sqBadAlerted = "1";
+                    alert("Scheduled time must be in the future.");
+                }
+                return;
+            }
             whenDisplay.style.borderColor = "";
-            currentWhenTs = parsed;
+            whenDisplay.dataset.sqBadAlerted = "";
+            // Clamp for safety (defence-in-depth: a parallel edit path
+            // could race the input event).
+            currentWhenTs = Math.max(parsed, minWhenTs());
             whenHidden.value = String(currentWhenTs);
         } else {
             whenDisplay.style.borderColor = "#c44";
@@ -1116,6 +1146,12 @@ function openScheduleDialog() {
             const idx = parseInt(btn.dataset.preset, 10);
             const p = presets[idx];
             currentWhenTs = p.absolute !== undefined ? p.absolute : (now + p.offset);
+            // Clamp: presets are computed at dialog-open time using `now`,
+            // so they are guaranteed to be future-relative -- but if the
+            // user leaves the dialog open for minutes before clicking a
+            // preset (e.g. "tomorrow 9am" after 9:01am), clamp keeps us
+            // safe.
+            currentWhenTs = Math.max(currentWhenTs, minWhenTs());
             refreshWhenDisplay();
             flashWhenDisplay();
             dlg.querySelectorAll('[data-preset]').forEach((b) => {
