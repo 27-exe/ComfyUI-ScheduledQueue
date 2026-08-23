@@ -1798,62 +1798,58 @@ function openScheduleDialog() {
 // Registration
 // ============================================================
 
-let _scheduledQueueExtensionRegistered = false;
-function registerScheduledQueueExtension() {
-    if (_scheduledQueueExtensionRegistered) return;
-    _scheduledQueueExtensionRegistered = true;
+let _topbarRegistered = false;
+let _sidebarRegistered = false;
 
+function registerTopbarScheduleButton() {
+    if (_topbarRegistered) return;
     try {
         app.registerExtension({
             name: EXT_NAME,
-            actionBarButtons: [
-                {
-                    icon: "pi pi-clock",
-                    tooltip: t("topbar.schedule_tooltip", "Schedule current workflow (sends to ScheduledQueue, not ComfyUI native queue)"),
-                    onClick: () => {
-                        console.log("[ScheduledQueue] topbar Schedule clicked");
-                        try {
-                            openScheduleDialog();
-                        } catch (error) {
-                            console.error("[ScheduledQueue] failed to open Schedule dialog", error);
-                        }
-                    },
+            actionBarButtons: [{
+                icon: "pi pi-clock",
+                tooltip: t("topbar.schedule_tooltip", "Schedule workflow"),
+                onClick: () => {
+                    console.log("[ScheduledQueue] topbar Schedule clicked");
+                    try { openScheduleDialog(); }
+                    catch (error) { console.error("[ScheduledQueue] failed to open Schedule dialog", error); }
                 },
-            ],
+            }],
         });
+        _topbarRegistered = true;
         console.log("[ScheduledQueue] topbar Schedule action registered");
     } catch (error) {
         console.error("[ScheduledQueue] topbar registration failed", error);
     }
-
-    // Sidebar tab. The 1.49.6 framework calls render(container) ONCE per tab
-    // activation -- switching to another tab and back does NOT re-invoke it.
-    // We render once, then keep the container in sync with the sidebarTab
-    // store via $subscribe so the panel swaps correctly when the user
-    // toggles tabs.
-    app.extensionManager.registerSidebarTab({
-        id: TAB_ID,
-        title: t("sidebar.title", "Scheduled Queue"),
-        icon: "pi pi-clock",
-        tooltip: t("sidebar.tab_tooltip", "Scheduled Queue (managed jobs)"),
-        type: "custom",
-        render: (container) => {
-            const p = buildPanel();
-            container.innerHTML = "";
-            container.appendChild(p);
-            if (typeof p.refresh === "function") p.refresh();
-            // Install watcher AFTER first mount so we can also clean up the
-            // container when the user navigates away.
-            installSidebarWatcher(container);
-            return p;
-        },
-    });
 }
 
-// Registration must happen synchronously during extension discovery. Locale
-// loading is best-effort and may refresh already-mounted panels when complete,
-// but it must never gate the topbar/sidebar registration.
-registerScheduledQueueExtension();
+function registerScheduledQueueSidebar() {
+    if (_sidebarRegistered) return;
+    try {
+        app.extensionManager.registerSidebarTab({
+            id: TAB_ID,
+            title: t("sidebar.title", "Scheduled Queue"),
+            icon: "pi pi-clock",
+            tooltip: t("sidebar.tab_tooltip", "Scheduled Queue (managed jobs)"),
+            type: "custom",
+            render: (container) => {
+                const p = buildPanel();
+                container.innerHTML = "";
+                container.appendChild(p);
+                if (typeof p.refresh === "function") p.refresh();
+                installSidebarWatcher(container);
+                return p;
+            },
+        });
+        _sidebarRegistered = true;
+    } catch (error) {
+        console.error("[ScheduledQueue] sidebar registration failed", error);
+    }
+}
+
+// Registration must happen synchronously during extension discovery.
+registerTopbarScheduleButton();
+registerScheduledQueueSidebar();
 loadLocales().then(() => {
     window.dispatchEvent(new CustomEvent("sq:lang-changed", { detail: { lang: LANG } }));
 });

@@ -1,8 +1,8 @@
 {
     "sidebar.title": "Scheduled Queue",
     "sidebar.tab_tooltip": "Scheduled Queue (managed jobs)",
-    "sidebar.subtitle": "Managed by ScheduledQueue (not ComfyUI native queue)",
-    "sidebar.workflow_hint": "Workflow title = current <code>app.extensionManager.workflow.activeWorkflow.filename</code>",
+    "sidebar.subtitle": "Managed by ScheduledQueue",
+    "sidebar.workflow_hint": "Workflow name: current workflow",
     "sidebar.refresh": "Refresh",
     "sidebar.pause": "Pause",
     "sidebar.resume": "Resume",

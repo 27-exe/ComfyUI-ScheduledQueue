@@ -1,8 +1,8 @@
 {
     "sidebar.title": "调度队列",
     "sidebar.tab_tooltip": "调度队列 (由 ScheduledQueue 管理的任务)",
-    "sidebar.subtitle": "由 ScheduledQueue 管理(非 ComfyUI 原生队列)",
-    "sidebar.workflow_hint": "工作流名称 = 当前工作流的 <code>app.extensionManager.workflow.activeWorkflow.filename</code>",
+    "sidebar.subtitle": "由 ScheduledQueue 管理",
+    "sidebar.workflow_hint": "工作流名称：当前工作流",
     "sidebar.refresh": "刷新",
     "sidebar.pause": "暂停",
     "sidebar.resume": "恢复",
