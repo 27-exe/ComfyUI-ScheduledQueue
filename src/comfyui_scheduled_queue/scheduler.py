@@ -206,16 +206,51 @@ def _apply_pre_dispatch_hooks(prompt: dict) -> dict:
 
 
 class SchedulerThread:
-    POLL_INTERVAL = 1.0
+    # --- Self-adaptive polling intervals ----------------------------------
+    # The scheduler used to wake every 1s and reconcile every 5s. That works
+    # fine while jobs are flying, but for a queue that sits idle for hours
+    # it's pure CPU burn. Instead, we pick the next sleep based on what we
+    # actually saw in the current tick:
+    #
+    #   * we just POSTed a prompt this tick ............ IDLE_DISPATCH = 1s
+    #     (we want fast feedback so reconcile picks it up while the prompt
+    #      is still warm in ComfyUI's queue and not yet running)
+    #   * there's a `running` job .......................... RUNNING = 2s
+    #     (running jobs can finish any second; poll hot but not greedy)
+    #   * there's a `dispatched` job but nothing running .. QUEUED   = 3s
+    #     (queued jobs wait their turn; polling hot enough to notice
+    #      promotion to running within a few seconds)
+    #   * nothing in flight, nothing due ................... IDLE   = 5s
+    #     (the original 5s reconcile cadence was already fine for the
+    #      long-tail idle case; preserve it)
+    IDLE_INTERVAL = 5.0
+    DISPATCH_INTERVAL = 1.0
+    RUNNING_INTERVAL = 2.0
+    QUEUED_INTERVAL = 3.0
+    # --- Other constants --------------------------------------------------
     MAX_RETRIES = 3
+    # How often (at minimum) we must sweep /history when something is in
+    # flight. We only call reconcile() when there are dispatched/running
+    # jobs — see `_should_reconcile` — but the *interval* between those
+    # sweeps is still bounded so a long-running prompt doesn't go
+    # un-reconciled forever.
     RECONCILE_INTERVAL = 5.0
     HISTORY_TIMEOUT = 4.0
+    # Exponential backoff: on consecutive ComfyUI 5xx errors we double
+    # the sleep interval up to BACKOFF_MAX. The very first 5xx jumps to
+    # 2 * base, the second to 4 * base, etc.
+    BACKOFF_BASE = IDLE_INTERVAL  # start doubling from the idle base
+    BACKOFF_MAX = 30.0
 
     def __init__(self, db, comfyui_url="http://127.0.0.1:8188"):
         self.db = db
         self.comfyui_url = comfyui_url.rstrip('/')
         self._stop = threading.Event()
         self._thread = None
+        # Number of consecutive ComfyUI calls (tick POST or reconcile
+        # /history) that returned 5xx. Reset on any 2xx. Drives
+        # exponential backoff.
+        self._consecutive_5xx = 0
 
     def start(self):
         if self._thread and self._thread.is_alive():
@@ -236,27 +271,141 @@ class SchedulerThread:
     def _run(self):
         last_reconcile = 0.0
         while not self._stop.is_set():
+            # Track what happened this iteration so we can pick the right
+            # next-sleep interval. The four signals we care about:
+            #   dispatched_this_tick -- tick() actually POSTed a prompt
+            #   has_running           -- something is in ComfyUI's executor
+            #   has_dispatched        -- something is queued in ComfyUI
+            #   (idle)                -- none of the above
+            dispatched_this_tick = False
             try:
-                self.tick()
+                dispatched_this_tick = self.tick()
             except Exception:
                 log.exception('scheduler tick failed')
 
             now = time.monotonic()
-            if now - last_reconcile >= self.RECONCILE_INTERVAL:
+            # Lazy reconcile: only sweep /history if there are jobs that
+            # might have transitioned to a terminal state in ComfyUI.
+            # This saves an HTTP call + DB write per iteration when the
+            # queue is empty, which is the steady state for most of the
+            # day in a low-traffic setup.
+            if (
+                now - last_reconcile >= self.RECONCILE_INTERVAL
+                and self._has_in_flight_jobs()
+            ):
                 last_reconcile = now
                 try:
                     self.reconcile()
                 except Exception:
                     log.exception('scheduler reconcile failed')
-            self._stop.wait(self.POLL_INTERVAL)
+
+            interval = self._compute_next_interval(dispatched_this_tick)
+            self._stop.wait(interval)
+
+    def _has_in_flight_jobs(self):
+        """Cheap probe: is there any job that reconcile() could finalize?
+
+        Reconcile only does useful work when ComfyUI might have finished
+        something. We ask the DB for at most one row in
+        ``(dispatched, running)``; if the answer is empty, skip the
+        /history sweep entirely. This keeps idle costs at zero HTTP
+        calls per loop iteration.
+        """
+        try:
+            jobs = self.db.list_jobs(('dispatched', 'running'), 1)
+        except Exception:
+            # If the probe itself errors, fall through and reconcile
+            # anyway — better to over-poll than to miss a finishing job.
+            log.exception('in-flight probe failed; will reconcile anyway')
+            return True
+        return bool(jobs)
+
+    def _compute_next_interval(self, dispatched_this_tick):
+        """Pick the next sleep length based on current queue state.
+
+        Priority (highest urgency first):
+          1. just dispatched this tick ............. DISPATCH_INTERVAL
+          2. running jobs present .................. RUNNING_INTERVAL
+          3. dispatched jobs waiting in ComfyUI .... QUEUED_INTERVAL
+          4. idle .................................. IDLE_INTERVAL
+
+        Backoff (on consecutive ComfyUI 5xx) is applied as an UPPER
+        cap — it can only *slow down* the cadence, never speed it up.
+        Once ComfyUI is healthy again the cap is cleared by
+        ``_record_comfyui_success`` and we naturally snap back to the
+        right cadence for whatever state we are in.
+        """
+        # 1. What's the "natural" cadence for the current queue state?
+        if dispatched_this_tick:
+            natural = self.DISPATCH_INTERVAL
+        else:
+            try:
+                inflight = self.db.list_jobs(('dispatched', 'running'), 10)
+            except Exception:
+                inflight = []
+            has_running = any(j['status'] == 'running' for j in inflight)
+            has_queued = any(j['status'] == 'dispatched' for j in inflight)
+            if has_running:
+                natural = self.RUNNING_INTERVAL
+            elif has_queued:
+                natural = self.QUEUED_INTERVAL
+            else:
+                natural = self.IDLE_INTERVAL
+
+        # 2. If we're in a 5xx streak, the next sleep is the *max* of the
+        #    natural cadence and the backoff-doubled value (capped at
+        #    BACKOFF_MAX). Backoff is an upper bound, never a floor.
+        if self._consecutive_5xx > 0:
+            # Cap exponent so a very long outage cannot overflow;
+            # BACKOFF_MAX clamps the final answer anyway.
+            exponent = min(self._consecutive_5xx, 20)
+            backed = self.BACKOFF_BASE * (2 ** exponent)
+            backed = min(backed, self.BACKOFF_MAX)
+            natural = max(natural, backed)
+
+        # 3. Final guard: never exceed BACKOFF_MAX.
+        return min(natural, self.BACKOFF_MAX)
+
+    def _record_comfyui_success(self):
+        """Called whenever a ComfyUI round-trip (POST /prompt, GET /history)
+        returned 2xx. Resets the backoff counter."""
+        if self._consecutive_5xx:
+            log.info(
+                'comfyui recovered after %d consecutive 5xx; clearing backoff',
+                self._consecutive_5xx,
+            )
+            self._consecutive_5xx = 0
+
+    def _record_comfyui_5xx(self, where):
+        """Called on ComfyUI HTTP 5xx. Bumps the backoff counter."""
+        self._consecutive_5xx += 1
+        # Cap the exponent so we never overflow even after very long
+        # outages; BACKOFF_MAX on `min()` will clamp the result anyway.
+        log.warning(
+            'comfyui 5xx in %s; backoff streak=%d (next sleep up to %.1fs)',
+            where, self._consecutive_5xx,
+            min(self.BACKOFF_BASE * (2 ** min(self._consecutive_5xx, 20)),
+                self.BACKOFF_MAX),
+        )
 
     def tick(self):
+        """Dispatch at most one due job. Returns ``True`` if a job was
+        actually POSTed to ComfyUI (and thus the scheduler should poll
+        again quickly), ``False`` otherwise.
+
+        Side effects on ``self._consecutive_5xx``:
+          * +1 on any HTTP 5xx from ComfyUI
+          * cleared on a successful 2xx response
+        Network-level errors (URLError, timeouts, refused connections)
+        do NOT count toward backoff — those are usually transient
+        restarts, and we want to retry promptly.
+        """
         if self.db.get_state('paused') != '0':
             log.debug('tick skipped: paused')
-            return
+            return False
         job = self.db.claim_next_due_job()
         if not job:
-            return
+            return False
 
         # === DEBUG: log raw payload seed values (BEFORE hook) ===
         try:
@@ -314,20 +463,47 @@ class SchedulerThread:
                 headers={'Content-Type': 'application/json'},
                 method='POST',
             )
-            with urllib.request.urlopen(req, timeout=10) as response:
-                if response.status < 200 or response.status >= 300:
-                    raise RuntimeError(f'HTTP {response.status}')
-                result = json.loads(response.read().decode() or '{}')
+            try:
+                with urllib.request.urlopen(req, timeout=10) as response:
+                    status_code = response.status
+                    if 500 <= status_code < 600:
+                        # Server-side error: bump backoff and refuse to
+                        # mark the job running. The retry handler below
+                        # will reschedule it on the standard backoff
+                        # ladder.
+                        self._record_comfyui_5xx('tick POST')
+                        raise RuntimeError(f'HTTP {status_code}')
+                    if status_code < 200 or status_code >= 300:
+                        # 4xx — client's fault, retrying won't help, but
+                        # it's not a server outage either, so don't touch
+                        # the backoff streak.
+                        raise RuntimeError(f'HTTP {status_code}')
+                    result = json.loads(response.read().decode() or '{}')
+                self._record_comfyui_success()
+            except urllib.error.HTTPError as exc:
+                # urllib raises HTTPError for non-2xx status codes from
+                # urlopen when used in some flows; treat 5xx as backoff
+                # signal but leave 4xx as a plain client error.
+                if 500 <= getattr(exc, 'code', 0) < 600:
+                    self._record_comfyui_5xx('tick POST')
+                raise RuntimeError(f'HTTP {exc.code}') from exc
             prompt_id = result.get('prompt_id')
             log.info('[SQ-DEBUG] POST /prompt response prompt_id=%s full=%s', prompt_id, result)
             if not prompt_id:
                 raise RuntimeError('ComfyUI response did not include prompt_id')
-            self.db.mark_running(job['id'], prompt_id)
+            # POST succeeded: the prompt now lives inside ComfyUI's native
+            # queue (possibly behind another job). We mark it 'dispatched'
+            # rather than 'running' — promote-to-running is reconcile's job,
+            # which observes ComfyUI's /queue to decide when execution
+            # actually starts. See reconcile() below.
+            self.db.mark_dispatched(job['id'], prompt_id)
             self.db.set_state('last_dispatch_at', str(time.time()))
             log.info('dispatched %s as %s', job['id'], prompt_id)
+            return True
         except Exception as exc:
             log.exception('[SQ-DEBUG] dispatch failed: %s', exc)
             self._dispatch_failure(job['id'], str(exc))
+            return False
 
     def _dispatch_failure(self, job_id, error):
         n = self.db.increment_retry(job_id)
@@ -345,8 +521,29 @@ class SchedulerThread:
             )
         self.db.set_state('last_error', error)
 
-    def reconcile(self, history_fetcher=None):
-        """Finalize running jobs using ComfyUI's nested history record.
+    def reconcile(self, history_fetcher=None, queue_fetcher=None):
+        """Reconcile 'dispatched' and 'running' jobs against ComfyUI's state.
+
+        ComfyUI's two endpoints tell us everything we need:
+
+          * ``/queue`` returns ``{queue_running: [[..., prompt_id, ...], ...],
+            queue_pending: [[..., prompt_id, ...], ...]}`` — the live
+            state of ComfyUI's native queue.
+          * ``/history/<prompt_id>`` returns the terminal record once
+            execution finishes (see below for the nested-dict shape).
+
+        State machine the reconcile pass enforces:
+
+          * ``dispatched`` jobs whose prompt_id shows up in
+            ``queue_running`` get promoted to ``running``.
+          * ``dispatched`` jobs whose prompt_id shows up in
+            ``queue_pending`` stay ``dispatched`` (they're queued behind
+            another job in ComfyUI's executor — not yet running).
+          * ``dispatched`` / ``running`` jobs whose prompt_id shows up in
+            ``/history`` are finalised: success → ``done``, error →
+            ``failed``. (The job migrates to ``job_history``.)
+          * Anything else stays where it is; the next reconcile pass will
+            try again.
 
         ComfyUI 0.33.0 returns ``/history/{prompt_id}`` as::
 
@@ -365,13 +562,70 @@ class SchedulerThread:
         the job remains ``running`` for a later reconcile pass.  An explicit
         ``error`` status wins over generic completion signals; otherwise
         success, an ``outputs`` value, or ``completed`` marks the job done.
+
+        ``queue_fetcher`` (optional) is a callable ``() -> {'queue_running':
+        [...], 'queue_pending': [...]}`` for testability; defaults to
+        ``self._queue``. ``history_fetcher`` (optional) is the existing
+        ``(prompt_id) -> record`` callable.
         """
-        for job in self.db.list_jobs(['running'], 10000):
+        # Snapshot /queue once per reconcile cycle — every job in the loop
+        # below asks the same question, and we don't want N HTTP calls.
+        try:
+            queue = (
+                queue_fetcher()
+                if queue_fetcher
+                else self._queue()
+            )
+        except Exception:
+            log.exception('reconcile: /queue fetch failed; skipping queue promotion')
+            queue = None
+
+        running_pids: set[str] = set()
+        pending_pids: set[str] = set()
+        if isinstance(queue, dict):
+            for slot in ('queue_running', 'queue_pending'):
+                items = queue.get(slot) or []
+                if not isinstance(items, list):
+                    continue
+                for entry in items:
+                    # Each entry is a 5-tuple
+                    #   [job_number, prompt_id, workflow_json, metadata, output_node_ids]
+                    # — ComfyUI's openapi spec puts prompt_id at index 1.
+                    if isinstance(entry, (list, tuple)) and len(entry) >= 2:
+                        pid = entry[1]
+                        if isinstance(pid, str):
+                            (running_pids if slot == 'queue_running' else pending_pids).add(pid)
+
+        # One pass covers both 'dispatched' and 'running' rows. Status
+        # transitions inside the loop are no-ops for rows that don't
+        # qualify (e.g. a 'running' row that is also in queue_running
+        # simply has its prompt_id verified and status kept).
+        for job in self.db.list_jobs(('dispatched', 'running'), 10000):
             try:
+                pid = job.get('prompt_id')
+                if not pid:
+                    # No prompt_id yet — claim_next_due_job never finished,
+                    # or the live row predates the dispatch-state split.
+                    # Skip; we'll pick it up once mark_dispatched runs.
+                    continue
+
+                # 1. /queue membership decides dispatched -> running promotion.
+                if (
+                    job['status'] == 'dispatched'
+                    and pid in running_pids
+                ):
+                    self.db.mark_running(job['id'], pid)
+                    continue  # fresh state; don't re-finalise this tick
+
+                # 2. /history decides running/dispatched -> done/failed.
+                #    A prompt_id that vanished from both queue slots AND
+                #    has no history record yet is treated as 'still
+                #    running' — ComfyUI may have just taken it off the
+                #    queue for execution. Be patient.
                 record = (
-                    history_fetcher(job['prompt_id'])
+                    history_fetcher(pid)
                     if history_fetcher
-                    else self._history(job['prompt_id'])
+                    else self._history(pid)
                 )
                 if not record:
                     continue
@@ -389,24 +643,73 @@ class SchedulerThread:
 
                 outputs = record.get('outputs')
                 if status_str == 'success':
-                    self.db.mark_done(job['id'], job['prompt_id'], outputs)
+                    self.db.mark_done(job['id'], pid, outputs)
                 elif status_str in ('error', 'failed', 'failure'):
                     self.db.mark_failed(
                         job['id'],
                         str(error_msg or 'ComfyUI reported error'),
                     )
                 elif outputs is not None or completed:
-                    self.db.mark_done(job['id'], job['prompt_id'], outputs)
+                    self.db.mark_done(job['id'], pid, outputs)
             except Exception:
                 log.exception('reconcile failed for %s', job['id'])
 
     def _history(self, prompt_id):
+        """Fetch /history/<prompt_id>; never raises on 5xx.
+
+        On a 2xx response: clear the backoff streak.
+        On a 5xx response: bump the backoff streak and return ``None`` so
+        the caller leaves the job running. Network errors (URLError,
+        timeout, connection refused) are also swallowed and return
+        ``None`` without touching the streak — ComfyUI restarts shouldn't
+        trigger backoff.
+        """
         req = urllib.request.Request(
             self.comfyui_url + '/history/' + urllib.parse.quote(prompt_id)
         )
         try:
             with urllib.request.urlopen(req, timeout=self.HISTORY_TIMEOUT) as r:
                 data = json.loads(r.read().decode() or '{}')
+            self._record_comfyui_success()
             return data.get(prompt_id) or data
-        except (urllib.error.HTTPError, urllib.error.URLError):
+        except urllib.error.HTTPError as exc:
+            if 500 <= getattr(exc, 'code', 0) < 600:
+                self._record_comfyui_5xx(f'reconcile /history/{prompt_id[:8]}')
+            return None
+        except (urllib.error.URLError, TimeoutError, ConnectionError):
+            return None
+
+    def _queue(self):
+        """Fetch ``/queue``; return a normalised dict or ``None``.
+
+        Normalised shape::
+
+            {"queue_running": [<entry>, ...],
+             "queue_pending": [<entry>, ...]}
+
+        where each ``<entry>`` is the raw 5-tuple ComfyUI emits — the
+        reconcile pass reads ``entry[1]`` for the prompt_id.
+
+        Failure modes mirror ``_history``: HTTP 5xx and network errors
+        both return ``None`` so the caller can skip queue promotion
+        this cycle rather than guess.
+        """
+        req = urllib.request.Request(self.comfyui_url + '/queue')
+        try:
+            with urllib.request.urlopen(req, timeout=self.HISTORY_TIMEOUT) as r:
+                data = json.loads(r.read().decode() or '{}')
+            self._record_comfyui_success()
+            if not isinstance(data, dict):
+                return None
+            # Be defensive about missing slots — older ComfyUI versions
+            # may omit one of them.
+            return {
+                'queue_running': list(data.get('queue_running') or []),
+                'queue_pending': list(data.get('queue_pending') or []),
+            }
+        except urllib.error.HTTPError as exc:
+            if 500 <= getattr(exc, 'code', 0) < 600:
+                self._record_comfyui_5xx('reconcile /queue')
+            return None
+        except (urllib.error.URLError, TimeoutError, ConnectionError):
             return None

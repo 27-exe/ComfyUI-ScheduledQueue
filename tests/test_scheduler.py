@@ -61,7 +61,11 @@ class TestScheduler(unittest.TestCase):
             self.assertEqual(u.call_count, 0)
         w.stop()
 
-    def test_successful_dispatch_marks_running(self):
+    def test_successful_dispatch_marks_dispatched(self):
+        # After a successful POST /prompt the scheduler must land the job
+        # in 'dispatched' (NOT 'running') — promotion to 'running' is the
+        # reconcile loop's job, once ComfyUI's /queue shows the prompt as
+        # the currently-executing item.
         self.db.set_state("paused", "0")
         jid = self.db.add_job(payload={"x": 1}, scheduled_at=0.0, note="runme")
         w = scheduler.SchedulerThread(self.db, comfyui_url="http://fake-comfyui/")
@@ -70,7 +74,7 @@ class TestScheduler(unittest.TestCase):
             w.tick()
             self.assertGreaterEqual(u.call_count, 1)
             row = self.db.get_job(jid)
-            self.assertEqual(row["status"], "running")
+            self.assertEqual(row["status"], "dispatched")
             self.assertEqual(row["prompt_id"], "p1")
         w.stop()
 
@@ -226,6 +230,118 @@ class TestScheduler(unittest.TestCase):
         w.stop()
         time.sleep(0.1)
         self.assertFalse(w._thread.is_alive())
+
+    # ------------------------------------------------------------------
+    # Dispatched / running state separation (v0.3.x state-machine split)
+    # ------------------------------------------------------------------
+
+    def test_mark_dispatched(self):
+        """``mark_dispatched`` flips status to 'dispatched', stamps
+        ``dispatched_at``, and stores the ComfyUI prompt_id returned by
+        POST /prompt — distinct from the pre-split ``mark_running``
+        helper, which now only runs when reconcile observes the prompt
+        as the currently-executing item in ComfyUI's /queue.
+        """
+        jid = self.db.add_job(payload={"x": 1}, scheduled_at=0.0, note="go")
+        # Claim flips to 'dispatched' but leaves prompt_id NULL —
+        # exactly the state tick() should observe immediately before
+        # POSTing the prompt.
+        claimed = self.db.claim_next_due_job()
+        assert claimed is not None
+        self.assertEqual(claimed["status"], "dispatched")
+        self.assertIsNone(claimed["prompt_id"])
+        self.assertIsNotNone(claimed["dispatched_at"])
+
+        # Scheduler.tick() would call this with the prompt_id returned
+        # by ComfyUI's POST /prompt response.
+        self.assertTrue(self.db.mark_dispatched(jid, "p-from-comfyui"))
+
+        row = self.db.get_job(jid)
+        assert row is not None
+        self.assertEqual(row["status"], "dispatched",
+                         "tick() must land on 'dispatched', not 'running'")
+        self.assertEqual(row["prompt_id"], "p-from-comfyui")
+        # dispatched_at may be re-stamped by mark_dispatched (claim time
+        # vs POST time are not always identical); we only require it
+        # remains a finite, recent timestamp.
+        self.assertIsNotNone(row["dispatched_at"])
+
+    def test_reconcile_marks_dispatched_to_running(self):
+        """A 'dispatched' job whose prompt_id is in ComfyUI's
+        ``queue_running`` slot gets promoted to 'running' on the next
+        reconcile pass — this is what makes the new 'dispatched' state
+        visible to the UI as a transient state between POST and
+        execution start.
+        """
+        self.db.set_state("paused", "0")
+        jid = self.db.add_job(payload={"x": 1}, scheduled_at=0.0)
+        # State after a successful POST /prompt:
+        self.db.update_job(jid, status="dispatched", prompt_id="p-waiting")
+
+        w = scheduler.SchedulerThread(self.db)
+
+        def fake_queue():
+            # ComfyUI's /queue returns a dict with two lists of 5-tuples.
+            # prompt_id lives at index 1 of each entry.
+            return {
+                "queue_running": [
+                    [0, "p-waiting", {}, {}, []],
+                ],
+                "queue_pending": [],
+            }
+
+        def fake_history(prompt_id):
+            # No terminal record yet — we're still mid-run.
+            return None
+
+        w.reconcile(history_fetcher=fake_history, queue_fetcher=fake_queue)
+        row = self.db.get_job(jid)
+        assert row is not None
+        self.assertEqual(
+            row["status"], "running",
+            "dispatched + in queue_running must promote to running",
+        )
+        self.assertEqual(row["prompt_id"], "p-waiting")
+        # No terminal history row yet.
+        self.assertEqual(self.db.list_history(), [])
+        w.stop()
+
+    def test_reconcile_marks_dispatched_to_done(self):
+        """A 'dispatched' job whose prompt_id shows up in
+        ``/history/<id>`` is finalised straight to 'done' (or 'failed'),
+        without needing a separate 'running' leg first. This covers the
+        race where ComfyUI finishes a prompt before reconcile gets a
+        chance to promote it.
+        """
+        jid = self.db.add_job(payload={"x": 1}, scheduled_at=0.0)
+        # Same state tick() leaves behind.
+        self.db.update_job(jid, status="dispatched", prompt_id="p-fast")
+
+        w = scheduler.SchedulerThread(self.db)
+
+        def fake_queue():
+            # ComfyUI has already pulled the prompt off the queue; it
+            # shows up in NEITHER running nor pending.
+            return {"queue_running": [], "queue_pending": []}
+
+        def fake_history(prompt_id):
+            # /history/<id> returns the nested ComfyUI 1.49+ shape.
+            return {
+                "status": {"status_str": "success", "completed": True},
+                "outputs": {"images": ["out.png"]},
+            }
+
+        w.reconcile(history_fetcher=fake_history, queue_fetcher=fake_queue)
+
+        # The live row should be gone (it migrated to job_history).
+        self.assertIsNone(self.db.get_job(jid))
+        hist = self.db.list_history()
+        self.assertEqual(len(hist), 1)
+        self.assertEqual(hist[0]["status"], "done")
+        self.assertEqual(hist[0]["prompt_id"], "p-fast")
+        # And reconcile must NOT have spuriously promoted to running
+        # before finalising (no /history would have shown that).
+        w.stop()
 
 
 import os  # noqa: E402
@@ -550,7 +666,11 @@ class TestPreDispatchHooks(unittest.TestCase):
         self.assertNotEqual(sent_inputs["noise_seed"], 200)
         # And the stored payload itself stays at 100/200 — the scheduler
         # mutates a deepcopy on each dispatch, never writes back.
-        jobs = self.db.list_jobs(["running"], 1)
+        # Post-v0.3.x state machine: after POST success the job is
+        # 'dispatched', not 'running'. Reconcile is responsible for the
+        # promotion to 'running' once ComfyUI's /queue reports the
+        # prompt as the currently-executing item.
+        jobs = self.db.list_jobs(["dispatched"], 1)
         self.assertEqual(len(jobs), 1)
         stored_row = self.db.get_job(jobs[0]["id"])
         self.assertIsNotNone(stored_row)
@@ -558,6 +678,159 @@ class TestPreDispatchHooks(unittest.TestCase):
         stored = json.loads(stored_row["payload"])  # type: ignore[index]
         self.assertEqual(stored["3"]["inputs"]["seed"], 100)
         self.assertEqual(stored["3"]["inputs"]["noise_seed"], 200)
+
+
+    # ------------------------------------------------------------------
+    # Self-adaptive polling + lazy reconcile + 5xx backoff (added 2026-08-23)
+    # ------------------------------------------------------------------
+
+    def test_smart_polling_increases_interval_when_idle(self):
+        """When the queue is empty, ``_compute_next_interval`` should pick
+        the long IDLE interval, not the 1s poll-interval the old code
+        hard-coded.
+
+        With a dispatched (queued in ComfyUI but not yet running) job we
+        should poll on the QUEUED cadence (3s); once ComfyUI marks it
+        running we drop to RUNNING (2s); after it finishes we go back to
+        IDLE (5s).
+        """
+        self.db.set_state("paused", "0")
+        w = scheduler.SchedulerThread(self.db)
+
+        # 1. Idle start: nothing due, nothing in flight -> IDLE_INTERVAL.
+        self.assertEqual(w._compute_next_interval(False),
+                         scheduler.SchedulerThread.IDLE_INTERVAL)
+
+        # 2. A due job was just dispatched -> DISPATCH_INTERVAL wins,
+        #    even if there are no other in-flight jobs.
+        self.assertEqual(w._compute_next_interval(True),
+                         scheduler.SchedulerThread.DISPATCH_INTERVAL)
+
+        # 3. A `dispatched` job waiting in ComfyUI -> QUEUED_INTERVAL.
+        jid = self.db.add_job(payload={"x": 1}, scheduled_at=0.0)
+        self.db.update_job(jid, status="dispatched", prompt_id="p-q")
+        self.assertEqual(w._compute_next_interval(False),
+                         scheduler.SchedulerThread.QUEUED_INTERVAL)
+
+        # 4. Same job now `running` -> RUNNING_INTERVAL (faster than
+        #    QUEUED because ComfyUI could finish any second).
+        self.db.update_job(jid, status="running", prompt_id="p-q")
+        self.assertEqual(w._compute_next_interval(False),
+                         scheduler.SchedulerThread.RUNNING_INTERVAL)
+
+        # 5. Job finishes -> interval snaps back to IDLE. We simulate
+        #    "finished" by removing the row (mark_done does that).
+        self.db.mark_done(jid, "p-q", {})
+        self.assertEqual(w._compute_next_interval(False),
+                         scheduler.SchedulerThread.IDLE_INTERVAL)
+
+    def test_lazy_reconcile_skips_when_no_dispatched(self):
+        """``_has_in_flight_jobs`` should report False when there are no
+        ``dispatched`` or ``running`` rows, and ``reconcile`` should
+        therefore not be called from ``_run`` when there's nothing in
+        flight.
+
+        We don't spin up the real background thread; we drive ``_run``
+        exactly one iteration by patching ``_stop.wait`` to flip the
+        stop event as a side-effect (so the loop exits after the first
+        pass without sleeping), and assert that the /history endpoint
+        was NEVER hit.
+        """
+        self.db.set_state("paused", "0")
+        w = scheduler.SchedulerThread(self.db)
+
+        history_calls = []
+
+        def fake_urlopen(req, *args, **kwargs):
+            history_calls.append(req.full_url)
+            # Should never be reached when the queue is empty.
+            return _FakeResponse(200, json.dumps({}))
+
+        # Exit the loop on the very first _stop.wait() call.
+        def fake_wait(_interval):
+            w._stop.set()
+            return True
+
+        with patch.object(scheduler.urllib.request, "urlopen",
+                          side_effect=fake_urlopen), \
+             patch.object(w._stop, "wait", side_effect=fake_wait):
+            w._run()
+
+        # No history calls because there were no in-flight jobs.
+        self.assertEqual(history_calls, [],
+                         "reconcile() must NOT call /history when there "
+                         "are no dispatched/running jobs")
+
+        # Sanity: _has_in_flight_jobs agrees.
+        self.assertFalse(w._has_in_flight_jobs())
+
+        # And: even after we ADD a running job, the probe flips True.
+        jid = self.db.add_job(payload={"x": 1}, scheduled_at=0.0)
+        self.db.update_job(jid, status="running", prompt_id="p-lazy")
+        self.assertTrue(w._has_in_flight_jobs())
+
+    def test_backoff_on_comfyui_error(self):
+        """Consecutive 5xx responses must (a) bump the streak counter and
+        (b) inflate the next-sleep interval by doubling each time, capped
+        at BACKOFF_MAX. A single 2xx in between resets the streak.
+        """
+        self.db.set_state("paused", "0")
+        w = scheduler.SchedulerThread(self.db)
+
+        # Baseline: no streak, no in-flight jobs -> IDLE.
+        self.assertEqual(w._consecutive_5xx, 0)
+        self.assertEqual(w._compute_next_interval(False),
+                         scheduler.SchedulerThread.IDLE_INTERVAL)
+
+        # 1st 5xx: streak=1, interval doubles to IDLE*2 = 10s.
+        w._record_comfyui_5xx("test")
+        self.assertEqual(w._consecutive_5xx, 1)
+        interval_1 = w._compute_next_interval(False)
+        self.assertGreaterEqual(interval_1, 2 * scheduler.SchedulerThread.IDLE_INTERVAL)
+
+        # 2nd 5xx: streak=2, interval quadruples to IDLE*4 = 20s.
+        w._record_comfyui_5xx("test")
+        self.assertEqual(w._consecutive_5xx, 2)
+        interval_2 = w._compute_next_interval(False)
+        self.assertGreaterEqual(interval_2, 4 * scheduler.SchedulerThread.IDLE_INTERVAL)
+
+        # Many more 5xx -> streak keeps growing but interval caps at 30s.
+        for _ in range(10):
+            w._record_comfyui_5xx("test")
+        self.assertGreaterEqual(w._consecutive_5xx, 5)
+        capped = w._compute_next_interval(False)
+        self.assertLessEqual(capped, scheduler.SchedulerThread.BACKOFF_MAX)
+        self.assertAlmostEqual(capped,
+                               scheduler.SchedulerThread.BACKOFF_MAX,
+                               places=5)
+
+        # A success resets the streak and brings us back to IDLE.
+        w._record_comfyui_success()
+        self.assertEqual(w._consecutive_5xx, 0)
+        self.assertEqual(w._compute_next_interval(False),
+                         scheduler.SchedulerThread.IDLE_INTERVAL)
+
+        # End-to-end: a 5xx in the POST path actually bumps the streak.
+        jid = self.db.add_job(payload={"x": 1}, scheduled_at=0.0)
+        with patch.object(scheduler.urllib.request, "urlopen") as u:
+            u.return_value = _FakeResponse(503, "unavailable")
+            w.tick()
+        self.assertEqual(w._consecutive_5xx, 1,
+                         "tick POST 5xx must bump the backoff counter")
+        # The job itself got rescheduled (retry ladder), but the
+        # scheduler's streak is independent of that.
+        row = self.db.get_job(jid)
+        self.assertIsNotNone(row)
+        self.assertEqual(row["status"], "scheduled")
+
+        # ...and a subsequent 200 clears it.
+        with patch.object(scheduler.urllib.request, "urlopen") as u:
+            u.return_value = _FakeResponse(200,
+                                          json.dumps({"prompt_id": "p-backoff"}))
+            self.db.update_job(jid, status="scheduled", scheduled_at=0.0)
+            w.tick()
+        self.assertEqual(w._consecutive_5xx, 0,
+                         "tick POST 2xx must clear the backoff counter")
 
 
 if __name__ == "__main__":
