@@ -220,11 +220,16 @@ function buildPanel() {
 
     // Resolve a job's first output image (ComfyUI /view URL). Same fallback
     // pattern as resolveJobTitle. Returns Promise<string|null>.
+    //
+    // NOTE: outputs from both /list and /job/{id} is a *nested* dict keyed by
+    // node id, e.g. {"80": {"images": [{filename, subfolder, type}]}, "45": {...}}.
+    // It is NOT a flat {"images": [...]} shape. We walk the keys in insertion
+    // order and take the first node that exposes a non-empty images array.
     const _thumbInflight = new Map();
     async function resolveJobThumb(job) {
-        if (job && job.outputs && Array.isArray(job.outputs.images) && job.outputs.images[0]) {
-            const img = job.outputs.images[0];
-            return buildViewUrl(img);
+        if (job && job.outputs && typeof job.outputs === "object") {
+            const url = findFirstImageUrl(job.outputs);
+            if (url) return url;
         }
         const id = job && job.id;
         if (!id) return null;
@@ -232,8 +237,8 @@ function buildPanel() {
         const p = (async () => {
             try {
                 const data = await callApi(`/job/${encodeURIComponent(id)}`);
-                if (data && data.outputs && Array.isArray(data.outputs.images) && data.outputs.images[0]) {
-                    return buildViewUrl(data.outputs.images[0]);
+                if (data && data.outputs && typeof data.outputs === "object") {
+                    return findFirstImageUrl(data.outputs);
                 }
             } catch (_e) {
                 // ignore
@@ -244,6 +249,22 @@ function buildPanel() {
         })();
         _thumbInflight.set(id, p);
         return p;
+    }
+
+    // Walk an outputs dict (shape: {nodeId: {images: [...]}, ...}) and return
+    // a /view URL for the first image record we find, or null if none of the
+    // nodes carry an images array. Object insertion order is preserved by
+    // modern engines (V8/SpiderMonkey/JavaScriptCore), which matches the
+    // node-execution order well enough for thumbnail selection.
+    function findFirstImageUrl(outputsDict) {
+        if (!outputsDict || typeof outputsDict !== "object") return null;
+        for (const nodeId of Object.keys(outputsDict)) {
+            const node = outputsDict[nodeId];
+            if (node && Array.isArray(node.images) && node.images[0]) {
+                return buildViewUrl(node.images[0]);
+            }
+        }
+        return null;
     }
 
     // Build the ComfyUI /view URL for an output image record.
