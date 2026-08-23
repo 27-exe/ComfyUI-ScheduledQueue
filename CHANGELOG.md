@@ -4,6 +4,84 @@ All notable changes to **ComfyUI-ScheduledQueue** are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.3.11] - 2026-08-23
+
+Patch release on top of 0.3.10: bug fixes reported within hours of the
+push, sidebar UX polish, and a small scheduler default change. No schema
+changes; in-place upgrade from 0.3.10 is safe.
+
+### Fixed (live bugs reported after 0.3.10)
+
+- **Sidebar status bar showed only relative time.** Done / failed rows now
+  also render an absolute timestamp (`2026-08-23 22:31:46`) and a duration
+  suffix, matching the dialog's display style.
+- **`workflow_title` could be silently overwritten by the async nickname
+  hydrate path.** The sidebar now refuses to replace the title text when a
+  `workflow_title` is already set; the legacy `_meta.title` lookup still
+  runs only for rows without one.
+- **`list_jobs_paginated` returned zero history rows when the sidebar
+  queried with an empty status filter.** Now merges `scheduled_jobs` and
+  `job_history` correctly; pagination cursor still works on the union.
+- **Legacy `job_history` rows missing `dispatched_at` were rendered with
+  `--` and looked broken.** Synthesised `dispatched_at = finished_at` for
+  any history row that doesn't have one (one-shot backfill at query time).
+- **`outputs` field came back as a string instead of a dict** for the
+  history union. `list_jobs_paginated` now `json.loads` it before returning.
+- **Thumbnail preview was empty when outputs were nested.**
+  `get_job_with_outputs` now descends into `outputs[*][*].images[*]` (and
+  walks similar shapes) until it finds the first image entry.
+- **Schedule dialog accepted times earlier than now + 5 s.** The submit
+  handler now clamps `scheduled_at` to at least `now + 5` so the scheduler
+  has a chance to pick it up.
+- **Pre-dispatch `control_after_generate` hook defaulted to `fixed`**
+  when the widget slot was absent. Now defaults to `randomize`, matching
+  ComfyUI's own first-run behaviour and preventing the silent cache-hit
+  bug documented in `docs/USER_GUIDE.md §7`.
+
+### Changed
+
+- **Schedule dialog two-row time controls.** Decrement buttons sit above
+  increment buttons; both columns are right-aligned so the eye reads a
+  single vertical column on the right. Decrement flashes the input
+  border blue; increment flashes green. Dialog width increased from 420 px
+  to 480 px.
+- **Adaptive scheduler tick cadence.** Tick interval collapses to ~1 s
+  right after a dispatch so the next reconcile loop catches the just-POSTed
+  prompt quickly. Stretches back to the normal interval when no jobs are
+  `running`. Same overall cost; lower wall-clock latency for short jobs.
+- **Widget lifecycle preservation in UI → API conversion.** Removed
+  `widgets_values` fields are no longer dropped on the floor when the
+  matching `inputs[name]` is absent in the source graph; they're passed
+  through to the API payload so ComfyUI's downstream code can still see
+  them.
+- **Workflow title fallback chain.** When `workflow_title` is empty *and*
+  the async nickname hydrate fails, the sidebar falls back to the first
+  non-empty `_meta.title` or `class_type` instead of `untitled`. Preferable
+  to literally the word `untitled` in mixed-language installations.
+
+### UX
+
+- **Sidebar `[Print version]` watermark** in DevTools console (`SQ_VERSION`
+  log line) so users reporting bugs can copy-paste the exact build number.
+- **Per-click `console.log` for action buttons** (Pause/Resume, Run,
+  Cancel, Repeat, Export, Up/Down, Clear) so users can self-diagnose
+  button-event issues without a debugger.
+
+### Tests
+
+- 4 new scheduler tests (`TestControlAfterGenerateFallback`,
+  `TestScheduleClamp`).
+- 2 new database tests (`TestHistoryUnion`, `TestOutputsDecoded`).
+- 1 new routes test (`TestThumbnailDeepWalk`).
+- Full suite: **140 / 140 pass** (was 133).
+
+### Known limitation
+
+- `workflow_title` will read `"Unsaved Workflow"` whenever the user
+  submits a Schedule before ComfyUI's "Save As…" dialog has given the
+  workflow a real filename. That matches ComfyUI's own display and is
+  documented in `docs/USER_GUIDE.md §2.2 ①`.
+
 ## [0.3.10] - 2026-08-23
 
 ### Added (workflow title tracking)
