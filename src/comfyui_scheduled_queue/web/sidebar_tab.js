@@ -50,7 +50,7 @@ function buildPanel() {
                 Managed by ScheduledQueue (not ComfyUI native queue).
             </p>
             <p style="margin:4px 0 0 0;font-size:10px;color:#666;font-style:italic;line-height:1.4;">
-                Workflow title = current <code style="font-size:10px;color:#888;">app.graph.activeWorkflow.filename</code> from ComfyUI Pinia store.
+                Workflow title = current <code style="font-size:10px;color:#888;">app.extensionManager.workflow.activeWorkflow.filename</code> from ComfyUI Pinia store.
             </p>
         </div>
 
@@ -456,6 +456,11 @@ function buildPanel() {
         allTitles.then((arr) => {
             for (const { j, t } of arr) {
                 if (!t) continue;
+                // workflow_title is authoritative: skip the async overwrite
+                // entirely so the SaveImage _meta.title (nickname) can never
+                // clobber the user's scheduled workflow filename.
+                const wt = j && typeof j.workflow_title === "string" ? j.workflow_title.trim() : "";
+                if (wt) continue;
                 const el = jobsEl.querySelector('[data-role="job-nickname"][data-job-id="' + cssEscape(j.id) + '"]');
                 if (el && el.textContent !== t) el.textContent = t;
             }
@@ -951,7 +956,7 @@ function openScheduleDialog() {
         let workflowTitle = "";
         try {
             const aw = app.extensionManager?.workflow?.activeWorkflow;
-            if (aw) workflowTitle = aw.filename || aw.fullFilename || aw.name || "";
+            if (aw) workflowTitle = aw.filename || aw.fullFilename || "";
         } catch (_e) { /* ignore -- empty title is fine */ }
 
         if (!scheduledAt || scheduledAt <= Math.floor(Date.now() / 1000)) {
