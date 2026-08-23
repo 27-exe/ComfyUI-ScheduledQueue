@@ -589,11 +589,11 @@ function buildPanel() {
         const allJobs = jobs.jobs || [];
         const pendingJobs = allJobs.filter(j => j.status === "scheduled" || j.status === "interrupted");
         const runningJobs = allJobs.filter(j => j.status === "running");
-        // Apply active filter; "all" keeps the legacy visibleJobs (pending+running).
-        // Other filters show only jobs matching that status.
+        // "All" includes the complete lifecycle, including terminal history.
+        // Queue ordering for move-up/down still uses pendingJobs below.
         let visibleJobs;
         if (activeFilter === "all") {
-            visibleJobs = [...runningJobs, ...pendingJobs];
+            visibleJobs = allJobs;
         } else {
             visibleJobs = allJobs.filter(j => j.status === activeFilter);
         }
