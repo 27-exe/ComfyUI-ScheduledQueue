@@ -26,6 +26,86 @@ import { app } from "/scripts/app.js";
 const EXT_NAME = "ComfyUI.ScheduledQueue";
 const TAB_ID = "scheduled-queue";
 
+// ===========================================================
+// i18n -- no real i18n framework in a ComfyUI JS extension, so we
+// inline a tiny lookup table driven by ./locales/{zh,en}.json.
+// The JSON files are fetched at module init; if a fetch fails we
+// silently fall back to empty dicts (and the caller-side `t()` falls
+// through to its built-in fallback or the key string itself).
+// ===========================================================
+
+const LS_LANG_KEY = "sq.lang";
+
+function detectInitialLang() {
+    try {
+        const stored = window.localStorage?.getItem(LS_LANG_KEY);
+        if (stored === "zh" || stored === "en") return stored;
+    } catch (_e) { /* localStorage may be blocked */ }
+    const nav = (typeof navigator !== "undefined" && navigator.language) || "zh";
+    return nav.toLowerCase().startsWith("en") ? "en" : "zh";
+}
+
+let LANG = detectInitialLang();
+const I18N = { zh: {}, en: {} };
+
+// Synchronous-ish locale bootstrap: load both JSON files in parallel
+// and update I18N when ready. Until both resolve, t() will fall
+// back to its `fallback` arg (or the key). UI strings render on
+// tab activation -- by then the fetch is usually done, but we MUST
+// guard against the race so the first paint doesn't show raw keys.
+async function loadLocales() {
+    const tryLoad = async (lng) => {
+        try {
+            const r = await fetch(`./locales/${lng}.json`, { cache: "no-cache" });
+            if (!r.ok) throw new Error(`HTTP ${r.status}`);
+            I18N[lng] = await r.json();
+        } catch (_e) {
+            // Leave I18N[lng] as empty dict; t() will fall back.
+        }
+    };
+    await Promise.all([tryLoad("zh"), tryLoad("en")]);
+}
+
+// Begin fetching locales immediately at module load. The fetch is
+// cheap (<1 KB JSON) so callers usually resolve on first refresh.
+loadLocales();
+
+function setLang(lng) {
+    if (lng !== "zh" && lng !== "en") return;
+    if (LANG === lng) return;
+    LANG = lng;
+    try { window.localStorage?.setItem(LS_LANG_KEY, lng); } catch (_e) { /* ignore */ }
+    // Notify all open panels to re-render with the new language.
+    window.dispatchEvent(new CustomEvent("sq:lang-changed", { detail: { lang: lng } }));
+}
+
+// `t(key, fallback)` -- look up a translation. Resolution order:
+//   1. Current language's I18N dict
+//   2. Chinese (zh) fallback dict
+//   3. The explicit `fallback` arg
+//   4. The key string itself (last resort, makes missing keys visible)
+function t(key, fallback) {
+    if (I18N[LANG] && Object.prototype.hasOwnProperty.call(I18N[LANG], key)) {
+        return I18N[LANG][key];
+    }
+    if (I18N.zh && Object.prototype.hasOwnProperty.call(I18N.zh, key)) {
+        return I18N.zh[key];
+    }
+    return fallback != null ? fallback : key;
+}
+
+// Format a template string like "Page {0} ({1}-{2} of {3})" by
+// replacing {N} placeholders with positional args. Missing indices
+// are left in place so a translator sees the gap during QA.
+function tfmt(key, fallback, args) {
+    const tmpl = t(key, fallback);
+    if (!Array.isArray(args)) return tmpl;
+    return tmpl.replace(/\{(\d+)\}/g, (m, idx) => {
+        const i = parseInt(idx, 10);
+        return (i >= 0 && i < args.length) ? String(args[i]) : m;
+    });
+}
+
 // ============================================================
 // Sidebar panel -- framework-managed render lifecycle.
 // registerSidebarTab's render(container) is called ONCE per tab activation
@@ -43,53 +123,66 @@ function buildPanel() {
     root.dataset.sqRoot = "1";
     root.style.cssText = "padding:12px;font-family:system-ui,sans-serif;color:#ccc;background:#1a1a1a;height:100%;box-sizing:border-box;overflow-y:auto;";
 
+    // i18n: pull the current lang + the strings at render time so a
+    // language switch (sq:lang-changed) can re-render with the new set.
+    const langBtnOther = LANG === "zh" ? "en" : "zh";
+    const langBtnLabel = t(`sidebar.lang.${langBtnOther}`);
+    const langBtnTitle = t(`sidebar.lang.switch_to_${langBtnOther}`);
+
     root.innerHTML = `
+        <div style="margin-bottom:10px;display:flex;justify-content:space-between;align-items:center;gap:6px;">
+            <h3 style="margin:0 0 4px 0;font-size:14px;color:#fff;flex:1;min-width:0;">${escapeHtml(t("sidebar.title"))}</h3>
+            <button data-role="lang-switch" title="${escapeHtml(langBtnTitle)}" style="flex-shrink:0;padding:2px 6px;background:#333;color:#fff;border:1px solid #555;border-radius:3px;cursor:pointer;font-size:10px;font-weight:600;">${escapeHtml(langBtnLabel)}</button>
+        </div>
         <div style="margin-bottom:10px;">
-            <h3 style="margin:0 0 4px 0;font-size:14px;color:#fff;">Scheduled Queue</h3>
             <p style="margin:0;font-size:11px;color:#888;">
-                Managed by ScheduledQueue (not ComfyUI native queue).
+                ${escapeHtml(t("sidebar.subtitle"))}
             </p>
             <p style="margin:4px 0 0 0;font-size:10px;color:#666;font-style:italic;line-height:1.4;">
-                Workflow title = current <code style="font-size:10px;color:#888;">app.extensionManager.workflow.activeWorkflow.filename</code> from ComfyUI Pinia store.
+                ${t("sidebar.workflow_hint")}
             </p>
         </div>
 
         <div data-role="status-tabs" style="display:flex;gap:2px;margin-bottom:6px;flex-wrap:wrap;align-items:center;">
-            <button data-filter="all" style="padding:4px 6px;background:#0078d4;color:#fff;border:none;border-radius:3px;cursor:pointer;font-size:10px;">All</button>
-            <button data-filter="scheduled" style="padding:4px 6px;background:#333;color:#fff;border:none;border-radius:3px;cursor:pointer;font-size:10px;">Scheduled</button>
-            <button data-filter="running" style="padding:4px 6px;background:#333;color:#fff;border:none;border-radius:3px;cursor:pointer;font-size:10px;">Running</button>
-            <button data-filter="done" style="padding:4px 6px;background:#333;color:#fff;border:none;border-radius:3px;cursor:pointer;font-size:10px;">Done</button>
-            <button data-filter="failed" style="padding:4px 6px;background:#333;color:#fff;border:none;border-radius:3px;cursor:pointer;font-size:10px;">Failed</button>
-            <button data-filter="cancelled" style="padding:4px 6px;background:#333;color:#fff;border:none;border-radius:3px;cursor:pointer;font-size:10px;">Cancelled</button>
-            <button data-role="clear-toggle" style="margin-left:8px;padding:4px 6px;background:#444;color:#fff;border:none;border-radius:3px;cursor:pointer;font-size:10px;">Clear...</button>
+            <button data-filter="all" style="padding:4px 6px;background:#0078d4;color:#fff;border:none;border-radius:3px;cursor:pointer;font-size:10px;">${escapeHtml(t("filter.all"))}</button>
+            <button data-filter="scheduled" style="padding:4px 6px;background:#333;color:#fff;border:none;border-radius:3px;cursor:pointer;font-size:10px;">${escapeHtml(t("filter.scheduled"))}</button>
+            <button data-filter="running" style="padding:4px 6px;background:#333;color:#fff;border:none;border-radius:3px;cursor:pointer;font-size:10px;">${escapeHtml(t("filter.running"))}</button>
+            <button data-filter="done" style="padding:4px 6px;background:#333;color:#fff;border:none;border-radius:3px;cursor:pointer;font-size:10px;">${escapeHtml(t("filter.done"))}</button>
+            <button data-filter="failed" style="padding:4px 6px;background:#333;color:#fff;border:none;border-radius:3px;cursor:pointer;font-size:10px;">${escapeHtml(t("filter.failed"))}</button>
+            <button data-filter="cancelled" style="padding:4px 6px;background:#333;color:#fff;border:none;border-radius:3px;cursor:pointer;font-size:10px;">${escapeHtml(t("filter.cancelled"))}</button>
+            <button data-role="clear-toggle" style="margin-left:8px;padding:4px 6px;background:#444;color:#fff;border:none;border-radius:3px;cursor:pointer;font-size:10px;">${escapeHtml(t("clear.toggle"))}</button>
         </div>
 
         <div data-role="clear-panel" style="display:none;margin-bottom:6px;padding:6px;background:#222;border-radius:3px;font-size:11px;">
-            <label style="display:block;margin-bottom:2px;"><input type="checkbox" data-clear-status="done"/> Done (<span data-count-done>0</span>)</label>
-            <label style="display:block;margin-bottom:2px;"><input type="checkbox" data-clear-status="failed"/> Failed (<span data-count-failed>0</span>)</label>
-            <label style="display:block;margin-bottom:2px;"><input type="checkbox" data-clear-status="cancelled"/> Cancelled (<span data-count-cancelled>0</span>)</label>
-            <label style="display:block;margin-bottom:2px;"><input type="checkbox" data-clear-status="running"/> Running</label>
-            <label style="display:block;margin-bottom:2px;"><input type="checkbox" data-clear-status="scheduled"/> Scheduled</label>
-            <label style="display:block;margin-bottom:2px;"><input type="checkbox" data-clear-status="interrupted"/> Interrupted</label>
-            <button data-role="clear-execute" style="margin-top:4px;padding:4px 8px;background:#7a3030;color:#fff;border:none;border-radius:3px;cursor:pointer;font-size:11px;">Clear selected</button>
+            <label style="display:block;margin-bottom:2px;"><input type="checkbox" data-clear-status="done"/> ${escapeHtml(t("filter.done"))} (<span data-count-done>0</span>)</label>
+            <label style="display:block;margin-bottom:2px;"><input type="checkbox" data-clear-status="failed"/> ${escapeHtml(t("filter.failed"))} (<span data-count-failed>0</span>)</label>
+            <label style="display:block;margin-bottom:2px;"><input type="checkbox" data-clear-status="cancelled"/> ${escapeHtml(t("filter.cancelled"))} (<span data-count-cancelled>0</span>)</label>
+            <label style="display:block;margin-bottom:2px;"><input type="checkbox" data-clear-status="running"/> ${escapeHtml(t("filter.running"))}</label>
+            <label style="display:block;margin-bottom:2px;"><input type="checkbox" data-clear-status="scheduled"/> ${escapeHtml(t("filter.scheduled"))}</label>
+            <label style="display:block;margin-bottom:2px;"><input type="checkbox" data-clear-status="interrupted"/> ${escapeHtml(t("filter.interrupted"))}</label>
+            <button data-role="clear-execute" style="margin-top:4px;padding:4px 8px;background:#7a3030;color:#fff;border:none;border-radius:3px;cursor:pointer;font-size:11px;">${escapeHtml(t("clear.execute"))}</button>
         </div>
 
         <div data-role="actions" data-actions="__header__" style="margin-bottom:10px;display:grid;grid-template-columns:1fr 1fr;gap:4px;">
-            <button data-act="refresh" style="padding:6px 8px;background:#0078d4;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:11px;">Refresh</button>
-            <button data-act="pause-resume" style="padding:6px 8px;background:#444;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:11px;">Pause</button>
+            <button data-act="refresh" style="padding:6px 8px;background:#0078d4;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:11px;">${escapeHtml(t("sidebar.refresh"))}</button>
+            <button data-act="pause-resume" data-state="running" style="padding:6px 8px;background:#444;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:11px;">${escapeHtml(t("sidebar.pause"))}</button>
         </div>
 
         <div data-role="status" style="margin-bottom:10px;font-size:11px;color:#aaa;padding:8px;background:#252525;border-radius:4px;">Loading...</div>
 
-        <div data-role="jobs" style="font-size:11px;">Loading jobs...</div>
+        <div data-role="jobs" style="font-size:11px;">${escapeHtml(t("sidebar.loading_jobs"))}</div>
 
         <div data-role="pager" style="margin-top:8px;display:flex;gap:4px;align-items:center;font-size:11px;">
-            <button data-role="prev" style="padding:4px 8px;background:#444;color:#fff;border:none;border-radius:3px;cursor:pointer;font-size:11px;">‹ Prev</button>
-            <span data-role="page-info" style="color:#aaa;">Page 1</span>
-            <button data-role="next" style="padding:4px 8px;background:#444;color:#fff;border:none;border-radius:3px;cursor:pointer;font-size:11px;">Next ›</button>
+            <button data-role="prev" style="padding:4px 8px;background:#444;color:#fff;border:none;border-radius:3px;cursor:pointer;font-size:11px;">‹ ${escapeHtml(t("pager.prev"))}</button>
+            <span data-role="page-info" style="color:#aaa;">${escapeHtml(t("pager.page_of", "Page {0} ({1}-{2} of {3})").replace(/\{0\}|\{1\}|\{2\}|\{3\}/g, (m, _, idx) => {
+                const order = ["0", "1", "2", "3"];
+                // placeholder -- real values applied in renderPager
+                return m;
+            })) || "Page 1"}</span>
+            <button data-role="next" style="padding:4px 8px;background:#444;color:#fff;border:none;border-radius:3px;cursor:pointer;font-size:11px;">${escapeHtml(t("pager.next"))} ›</button>
         </div>
 
-        <div style="margin-top:12px;font-size:10px;color:#666;">Use the clock icon in the topbar to add a new scheduled task.</div>
+        <div style="margin-top:12px;font-size:10px;color:#666;">${escapeHtml(t("sidebar.use_topbar_hint"))}</div>
     `;
 
     const statusEl = root.querySelector('[data-role="status"]');
@@ -252,19 +345,75 @@ function buildPanel() {
     }
 
     // Walk an outputs dict (shape: {nodeId: {images: [...]}, ...}) and return
-    // a /view URL for the first image record we find, or null if none of the
-    // nodes carry an images array. Object insertion order is preserved by
-    // modern engines (V8/SpiderMonkey/JavaScriptCore), which matches the
-    // node-execution order well enough for thumbnail selection.
+    // a /view URL for the image most likely to be the workflow's *final*
+    // output, or null if no node carries an images array.
+    //
+    // Heuristic: scan every image record across every node, sort candidates
+    // by the trailing counter embedded in the filename (ComfyUI default
+    // "prefix_NNNNNN_.png" pattern, e.g. "ComfyUI_00046_.png"), and return
+    // the last one. For a single-SaveImage workflow this is identical to
+    // picking the first record, but for workflows that wire up several
+    // SaveImage / PreviewImage nodes (e.g. pass 1 -> KSampler -> Save, then
+    // pass 2 -> KSampler -> Save), file ordering maps to execution order
+    // within a node, and execution order of multiple nodes is preserved by
+    // object insertion order. The last record is therefore the newest /
+    // last-written image, which is what the user wants to see in the row.
+    //
+    // The regex /_(\d+)_/ matches an underscore-delimited integer run; on a
+    // filename without that pattern (rare — ComfyUI always adds the
+    // counter) we fall back to lexicographic comparison of the raw name so
+    // we never return null when an image exists.
     function findFirstImageUrl(outputsDict) {
         if (!outputsDict || typeof outputsDict !== "object") return null;
+        let best = null;
+        let bestKey = null;
         for (const nodeId of Object.keys(outputsDict)) {
             const node = outputsDict[nodeId];
-            if (node && Array.isArray(node.images) && node.images[0]) {
-                return buildViewUrl(node.images[0]);
+            if (!node || !Array.isArray(node.images)) continue;
+            for (const img of node.images) {
+                if (!img || typeof img !== "object" || !img.filename) continue;
+                const key = imageSortKey(img.filename);
+                if (best === null || compareImageKeys(key, bestKey) > 0) {
+                    best = img;
+                    bestKey = key;
+                }
             }
         }
-        return null;
+        return best ? buildViewUrl(best) : null;
+    }
+
+    // Build a sort key [numericRun, rawFilename] from a filename. The numeric
+    // run is the last occurrence of /_(\d+)_/ in the name (ComfyUI files
+    // look like "ComfyUI_00046_.png"). When no such run exists we use
+    // +Infinity so the filename sorts AFTER any counter-bearing file when
+    // it is the newest write; otherwise we still need a stable tiebreak so
+    // we keep the raw filename as a secondary key. Returning an array lets
+    // compareImageKeys lexicographically compare [n, raw] in one call.
+    function imageSortKey(filename) {
+        if (typeof filename !== "string" || !filename) return [Infinity, ""];
+        // Find ALL underscore-delimited integer runs and take the LAST one
+        // (matches ComfyUI's own ordering: the per-batch counter is the
+        // last _N_ token before the trailing format marker).
+        const matches = filename.match(/_(\d+)_/g);
+        if (matches && matches.length) {
+            const last = matches[matches.length - 1];
+            const n = parseInt(last.slice(1, -1), 10);
+            if (Number.isFinite(n)) return [n, filename];
+        }
+        return [Infinity, filename];
+    }
+
+    // Lexicographic comparator over [n, raw] sort keys. Coerces the numeric
+    // component to Number so "10" > "9" (string compare would invert that).
+    // The raw filename breaks ties so two files with the same counter
+    // (unusual but possible across nodes) still pick a deterministic one.
+    function compareImageKeys(a, b) {
+        const an = a[0] === Infinity ? -Infinity : a[0];
+        const bn = b[0] === Infinity ? -Infinity : b[0];
+        if (an !== bn) return an - bn;
+        if (a[1] < b[1]) return -1;
+        if (a[1] > b[1]) return 1;
+        return 0;
     }
 
     // Build the ComfyUI /view URL for an output image record.
@@ -415,10 +564,35 @@ function buildPanel() {
         const colors = {
             scheduled: "#5a8", running: "#fa3", interrupted: "#f55",
             done: "#888", failed: "#f44", cancelled: "#666",
+            // 'paused' is reserved for the Improvement 3 backend work; the
+            // scheduler doesn't yet emit it per-job, but rendering it keeps
+            // the sidebar forward-compatible without a UI rework.
+            paused: "#aa8",
+            // 'dispatched' = POSTed to ComfyUI but not yet picked up.
+            dispatched: "#7ad",
         };
         jobsEl.innerHTML = visibleJobs.map((j, idx) => {
             const col = colors[j.status] || "#888";
+            // Per-row capability flags. We split actionability into three
+            // orthogonal dimensions because the buttons have different
+            // backend requirements:
+            //   actionable : can be moved in the queue + run-now + cancel
+            //                (only makes sense before the job is dispatched)
+            //   editable   : can be edited in the mini dialog (scheduled,
+            //                dispatched, paused — *not* running/interrupted
+            //                because changing scheduled_at mid-flight would
+            //                silently desync from the live prompt_id)
+            //   cancellable: can be cancelled (still allowed for dispatched
+            //                so the user can pull a stuck prompt; backend
+            //                now requires a confirm() step)
             const actionable = j.status === "scheduled" || j.status === "interrupted";
+            const editable = j.status === "scheduled"
+                || j.status === "dispatched"
+                || j.status === "paused";
+            const cancellable = j.status === "scheduled"
+                || j.status === "interrupted"
+                || j.status === "dispatched"
+                || j.status === "paused";
             const queueIdx = pendingJobs.findIndex(p => p.id === j.id);
             const isFirst = queueIdx <= 0;
             const isLast = queueIdx < 0 || queueIdx === pendingJobs.length - 1;
@@ -441,7 +615,42 @@ function buildPanel() {
                 cancelled: "已取消",
                 scheduled: "等待中",
                 interrupted: "已中断",
+                paused: "暂停中",
+                dispatched: "已投递",
             })[j.status] || j.status;
+            // Three-state time line (Improvement 2). The single line that
+            // used to show "到 Xs 投递" / "in 0:54:00" now branches on
+            // status so the user sees the right countdown for each phase:
+            //   scheduled : "X 后投递"      (countdown to scheduled_at)
+            //   dispatched: "等待运行"     (queued in ComfyUI queue)
+            //   running   : "执行 Xs"       (elapsed since dispatched_at)
+            //   paused    : "暂停中"        (no countdown; surface immediately)
+            //   interrupted|done|failed|cancelled: keep the delta to scheduled_at
+            //     so the user can still see how late a job was when it ran
+            //     (or how long ago they cancelled it).
+            const now = Math.floor(Date.now() / 1000);
+            let timeLineText;
+            let timeLineHint;
+            if (j.status === "scheduled") {
+                const delta = (j.scheduled_at || 0) - now;
+                timeLineText = delta > 0 ? `${formatDuration(delta)} 后投递` : "即将投递";
+                timeLineHint = `${formatTimeUntil(j.scheduled_at)} (绝对 ${formatAbsTime(j.scheduled_at)})`;
+            } else if (j.status === "dispatched") {
+                timeLineText = "等待运行";
+                timeLineHint = j.dispatched_at ? `投递于 ${formatAbsTime(j.dispatched_at)}` : "已投递,等待 ComfyUI 接收";
+            } else if (j.status === "running") {
+                const elapsed = j.dispatched_at ? (now - j.dispatched_at) : null;
+                timeLineText = elapsed != null && elapsed >= 0 ? `执行 ${formatDuration(elapsed)}` : "执行中";
+                timeLineHint = j.dispatched_at ? `开始于 ${formatAbsTime(j.dispatched_at)}` : "运行中";
+            } else if (j.status === "paused") {
+                timeLineText = "暂停中";
+                timeLineHint = j.scheduled_at ? `${formatTimeUntil(j.scheduled_at)} (暂停时已投递)` : "暂停中";
+            } else {
+                // done / failed / cancelled / interrupted — keep the absolute
+                // timestamp + delta for context (e.g. "5m ago").
+                timeLineText = formatTimeUntil(j.scheduled_at);
+                timeLineHint = j.scheduled_at ? `调度于 ${formatAbsTime(j.scheduled_at)}` : "";
+            }
             // Duration row: shows the absolute finished time (HH:MM:SS local) plus
             // the elapsed time between dispatched_at and finished_at. The label
             // comes from finishedLabel below (e.g. "完成于", "失败于"). When
@@ -453,6 +662,7 @@ function buildPanel() {
                 : j.status === "cancelled" ? "取消于"
                 : j.status === "running" ? "运行"
                 : j.status === "interrupted" ? "中断于"
+                : j.status === "paused" ? "暂停"
                 : "调度";
             let durationText;
             if (j.finished_at && j.dispatched_at) {
@@ -464,7 +674,7 @@ function buildPanel() {
             } else {
                 durationText = "—";
             }
-            return `<div data-job-id="${j.id}" style="padding:6px;margin-bottom:4px;background:#252525;border-radius:3px;border-left:3px solid ${col};">
+            return `<div data-job-id="${j.id}" data-status="${escapeHtml(j.status)}" style="padding:6px;margin-bottom:4px;background:#252525;border-radius:3px;border-left:3px solid ${col};">
                 <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:4px;">
                     <div style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1;min-width:0;">
                         <div data-role="job-title" style="display:flex;justify-content:space-between;align-items:baseline;gap:6px;">
@@ -473,16 +683,17 @@ function buildPanel() {
                         </div>
                         <div style="font-size:10px;color:#aaa;margin-top:3px;display:flex;flex-wrap:wrap;gap:6px;align-items:center;">
                             <span data-role="job-status" style="padding:1px 5px;background:${col};color:#000;border-radius:2px;font-weight:600;">${escapeHtml(statusBadgeText)}</span>
-                            <span style="color:#888;">${escapeHtml(formatTimeUntil(j.scheduled_at))}</span>
+                            <span data-role="job-time" title="${escapeHtml(timeLineHint || "")}" style="color:#888;">${escapeHtml(timeLineText)}</span>
                         </div>
                         <div style="font-size:10px;color:#888;margin-top:2px;">
                             ${finishedLabel} ${escapeHtml(durationText)}
                         </div>
                     </div>
                     <div data-actions="${j.id}" style="display:flex;gap:2px;flex-shrink:0;margin-left:4px;">
+                        ${editable ? `<button data-act="edit" data-id="${j.id}" title="Edit scheduled time / priority" style="padding:2px 6px;background:#3a6f9e;color:#fff;border:none;border-radius:3px;font-size:11px;cursor:pointer;">✎</button>` : ""}
                         ${actionable ? `<button data-act="up" title="Move up (higher priority)" ${isFirst ? "disabled style=\"padding:2px 6px;background:#222;color:#555;border:none;border-radius:3px;font-size:11px;cursor:not-allowed;\"" : "style=\"padding:2px 6px;background:#3a3;color:#fff;border:none;border-radius:3px;font-size:11px;cursor:pointer;\""}>↑</button><button data-act="down" title="Move down (lower priority)" ${isLast ? "disabled style=\"padding:2px 6px;background:#222;color:#555;border:none;border-radius:3px;font-size:11px;cursor:not-allowed;\"" : "style=\"padding:2px 6px;background:#3a3;color:#fff;border:none;border-radius:3px;font-size:11px;cursor:pointer;\""}>↓</button>` : ""}
                         ${actionable ? `<button data-act="run-now" title="Run immediately" style="padding:2px 6px;background:#2d6f9e;color:#fff;border:none;border-radius:3px;font-size:11px;cursor:pointer;">Run</button>` : ""}
-                        ${actionable ? `<button data-act="cancel" title="Cancel pending task" style="padding:2px 6px;background:#7a3030;color:#fff;border:none;border-radius:3px;font-size:11px;cursor:pointer;">×</button>` : ""}
+                        ${cancellable ? `<button data-act="cancel" title="Cancel this job" style="padding:2px 6px;background:#7a3030;color:#fff;border:none;border-radius:3px;font-size:11px;cursor:pointer;">✕</button>` : ""}
                         <button data-act="repeat" data-id="${j.id}" title="Repeat / clone this job" style="padding:2px 6px;background:#5a4f9e;color:#fff;border:none;border-radius:3px;font-size:11px;cursor:pointer;">↻</button>
                         <button data-act="export" data-id="${j.id}" title="Export this job (download JSON)" style="padding:2px 6px;background:#666;color:#fff;border:none;border-radius:3px;font-size:11px;cursor:pointer;">⬇</button>
                     </div>
@@ -746,6 +957,51 @@ function buildPanel() {
         const jobEl = actionsEl.closest("[data-job-id]");
         const act = btn.dataset.act;
 
+        // Cancel deserves a confirmation step (Improvement 1 part 2):
+        // cancelling an already-dispatched job pulls a prompt out of
+        // ComfyUI's queue; cancelling a running job is a no-op on the
+        // backend but still ratchets user intent in the local DB. Pulling
+        // a queued prompt and then regretting it requires the user to
+        // re-schedule from scratch, so we ask once.
+        if (act === "cancel") {
+            const status = jobEl && jobEl.dataset.status ? jobEl.dataset.status : "";
+            let msg;
+            if (status === "dispatched") {
+                msg = "This job is queued in ComfyUI's queue. Cancel will pull it out. Continue?";
+            } else if (status === "running") {
+                msg = "Cancel a running job? The prompt will continue in ComfyUI; the row will be marked cancelled locally.";
+            } else {
+                msg = "Cancel this scheduled job?";
+            }
+            if (!window.confirm(msg)) {
+                // Re-enable the buttons we just disabled so the user can
+                // click again without waiting for refresh().
+                actionsEl.querySelectorAll("button").forEach(b => (b.disabled = false));
+                return;
+            }
+        }
+
+        if (act === "edit") {
+            // The Edit dialog needs the current job record. We can pull it
+            // from the rendered row's data attributes (id, shortId,
+            // status) but scheduled_at / priority / note need to come from
+            // the latest API snapshot. We'll re-fetch the row via /job/:id
+            // and pass the full record to the dialog. If the row is no
+            // longer editable (e.g. user has just clicked Run-now), the
+            // dialog will refuse to submit.
+            try {
+                actionsEl.querySelectorAll("button").forEach(b => (b.disabled = true));
+                const detail = await callApi(`/job/${encodeURIComponent(id)}`);
+                const job = detail && detail.job ? detail.job : detail;
+                openEditJobDialog(job || { id, status: jobEl && jobEl.dataset.status ? jobEl.dataset.status : "" }, refresh);
+            } catch (err) {
+                statusEl.innerHTML = `<div style="color:#f44;">Could not load job: ${escapeHtml(err.message)}</div>`;
+            } finally {
+                actionsEl.querySelectorAll("button").forEach(b => (b.disabled = false));
+            }
+            return;
+        }
+
         // Disable all buttons in this job's row during in-flight.
         actionsEl.querySelectorAll("button").forEach(b => (b.disabled = true));
         try {
@@ -795,6 +1051,217 @@ function buildPanel() {
             await refresh({ silent: true });
         }
     });
+
+    // Mini edit dialog for a single scheduled/dispatched/paused job.
+    // Lets the user nudge scheduled_at via the same +/- buttons used by
+    // the schedule dialog (we re-implement them locally rather than
+    // cross-call across DOM trees) and bump the priority. POSTs the patch
+    // to /api/schedule/update/{id}, which whitelists exactly the fields
+    // we send (scheduled_at + priority). After success we call onSaved()
+    // (typically `refresh`) so the row redraws with the new values.
+    function openEditJobDialog(job, onSaved) {
+        const editableStatuses = new Set(["scheduled", "dispatched", "paused"]);
+        const id = job.id;
+        const initialScheduledAt = Number.isFinite(job.scheduled_at) ? job.scheduled_at : Math.floor(Date.now() / 1000) + 60;
+        const initialPriority = Number.isFinite(job.priority) ? job.priority : 100;
+        const initialNote = typeof job.note === "string" ? job.note : "";
+        let currentWhenTs = initialScheduledAt;
+        let currentPriority = initialPriority;
+        let currentNote = initialNote;
+        const MIN_SCHEDULE_OFFSET = 5;
+        function minWhenTs() { return Math.floor(Date.now() / 1000) + MIN_SCHEDULE_OFFSET; }
+        function formatWhen(ts) {
+            const d = new Date(ts * 1000);
+            const pad = (n) => String(n).padStart(2, "0");
+            return d.getFullYear() + "-" + pad(d.getMonth() + 1) + "-" + pad(d.getDate())
+                + " " + pad(d.getHours()) + ":" + pad(d.getMinutes()) + ":" + pad(d.getSeconds());
+        }
+        function parseWhen(text) {
+            if (typeof text !== "string") return NaN;
+            const trimmed = text.trim();
+            if (!trimmed) return NaN;
+            const m = trimmed.match(/^(\d{4})[-/](\d{1,2})[-/](\d{1,2})[ T](\d{1,2}):(\d{1,2})(?::(\d{1,2}))?$/);
+            if (!m) return NaN;
+            const [, y, mo, d, h, mi, s] = m;
+            const Y = parseInt(y, 10), Mo = parseInt(mo, 10), D = parseInt(d, 10);
+            const H = parseInt(h, 10), Mi = parseInt(mi, 10), S = s == null ? 0 : parseInt(s, 10);
+            if (Mo < 1 || Mo > 12 || D < 1 || D > 31) return NaN;
+            if (H > 23 || Mi > 59 || S > 59) return NaN;
+            const dt = new Date(Y, Mo - 1, D, H, Mi, S, 0);
+            if (isNaN(dt.getTime())) return NaN;
+            return Math.floor(dt.getTime() / 1000);
+        }
+
+        const dlg = document.createElement("div");
+        dlg.dataset.sqDialog = "1";
+        dlg.dataset.sqEditDialog = "1";
+        dlg.style.cssText = `
+            position: fixed; inset: 0; z-index: 99999;
+            background: rgba(0,0,0,0.6);
+            display: flex; align-items: center; justify-content: center;
+            font-family: system-ui, sans-serif;
+        `;
+        const status = job.status || "";
+        const statusBadge = ({
+            scheduled: "等待中",
+            dispatched: "已投递",
+            paused: "暂停中",
+        })[status] || status || "未知";
+        const titleText = (job.workflow_title || job.note || "未命名任务").trim() || "未命名任务";
+        const editable = editableStatuses.has(status);
+        const disabledAttr = editable ? "" : "disabled style=\"opacity:.5;cursor:not-allowed;\"";
+        dlg.innerHTML = `
+            <div style="background:#1e1e1e;color:#ccc;padding:18px;border-radius:8px;width:440px;box-shadow:0 8px 32px rgba(0,0,0,0.5);">
+                <h3 style="margin:0 0 4px 0;color:#fff;font-size:14px;">Edit job</h3>
+                <div style="font-size:11px;color:#888;margin-bottom:10px;">
+                    <span>${escapeHtml(titleText)}</span>
+                    <span style="margin-left:6px;padding:1px 5px;background:#555;color:#000;border-radius:2px;">${escapeHtml(statusBadge)}</span>
+                    <span style="margin-left:6px;opacity:.6;">${escapeHtml((id || "").slice(0, 8))}</span>
+                </div>
+                ${editable ? "" : `<div style="font-size:11px;color:#fa3;margin-bottom:10px;">当前状态 (${escapeHtml(status)}) 不支持编辑时间/优先级 — 仍可保存优先级修改。</div>`}
+
+                <div style="margin-bottom:10px;">
+                    <label style="display:block;font-size:11px;color:#aaa;margin-bottom:4px;">When (local time)</label>
+                    <input data-role="edit-when-display" placeholder="2026-08-22 22:30:00"
+                        style="width:100%;padding:6px;background:#252525;color:#fff;border:1px solid #444;border-radius:3px;font-family:monospace;text-align:center;"
+                        value="${escapeHtml(formatWhen(currentWhenTs))}" ${disabledAttr} />
+                    <div data-role="edit-when-buttons" style="display:flex;flex-wrap:wrap;gap:2px;margin-top:6px;justify-content:flex-end;">
+                        <button type="button" data-edit-delta="-3600" ${disabledAttr} style="padding:4px 6px;background:#333;color:#fff;border:none;border-radius:3px;cursor:pointer;font-size:11px;">-1h</button>
+                        <button type="button" data-edit-delta="-600" ${disabledAttr} style="padding:4px 6px;background:#333;color:#fff;border:none;border-radius:3px;cursor:pointer;font-size:11px;">-10m</button>
+                        <button type="button" data-edit-delta="-60" ${disabledAttr} style="padding:4px 6px;background:#333;color:#fff;border:none;border-radius:3px;cursor:pointer;font-size:11px;">-1m</button>
+                        <button type="button" data-edit-delta="-10" ${disabledAttr} style="padding:4px 6px;background:#333;color:#fff;border:none;border-radius:3px;cursor:pointer;font-size:11px;">-10s</button>
+                        <button type="button" data-edit-delta="-5" ${disabledAttr} style="padding:4px 6px;background:#333;color:#fff;border:none;border-radius:3px;cursor:pointer;font-size:11px;">-5s</button>
+                        <button type="button" data-edit-delta="5" ${disabledAttr} style="padding:4px 6px;background:#333;color:#fff;border:none;border-radius:3px;cursor:pointer;font-size:11px;">+5s</button>
+                        <button type="button" data-edit-delta="10" ${disabledAttr} style="padding:4px 6px;background:#333;color:#fff;border:none;border-radius:3px;cursor:pointer;font-size:11px;">+10s</button>
+                        <button type="button" data-edit-delta="60" ${disabledAttr} style="padding:4px 6px;background:#333;color:#fff;border:none;border-radius:3px;cursor:pointer;font-size:11px;">+1m</button>
+                        <button type="button" data-edit-delta="600" ${disabledAttr} style="padding:4px 6px;background:#333;color:#fff;border:none;border-radius:3px;cursor:pointer;font-size:11px;">+10m</button>
+                        <button type="button" data-edit-delta="3600" ${disabledAttr} style="padding:4px 6px;background:#333;color:#fff;border:none;border-radius:3px;cursor:pointer;font-size:11px;">+1h</button>
+                    </div>
+                    <input data-role="edit-when" type="hidden" value="${currentWhenTs}" />
+                </div>
+
+                <div style="margin-bottom:10px;">
+                    <label style="display:block;font-size:11px;color:#aaa;margin-bottom:4px;">Priority (0-1000, higher runs first)</label>
+                    <input data-role="edit-priority" type="number" min="0" max="1000" value="${currentPriority}"
+                        style="width:100%;padding:6px;background:#252525;color:#fff;border:1px solid #444;border-radius:3px;font-family:monospace;" />
+                </div>
+
+                <div style="margin-bottom:14px;">
+                    <label style="display:block;font-size:11px;color:#aaa;margin-bottom:4px;">Note</label>
+                    <input data-role="edit-note" type="text" value="${escapeHtml(currentNote)}" maxlength="200"
+                        style="width:100%;padding:6px;background:#252525;color:#fff;border:1px solid #444;border-radius:3px;" />
+                </div>
+
+                <div data-role="edit-error" style="font-size:11px;color:#f44;min-height:14px;margin-bottom:6px;"></div>
+
+                <div style="display:flex;justify-content:flex-end;gap:8px;">
+                    <button data-act="edit-cancel" style="padding:6px 14px;background:#444;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:12px;">Cancel</button>
+                    <button data-act="edit-save" style="padding:6px 14px;background:#0078d4;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:12px;">Save</button>
+                </div>
+            </div>
+        `;
+
+        function closeDialog() {
+            dlg.remove();
+            document.removeEventListener("keydown", onKey);
+        }
+        function onKey(e) { if (e.key === "Escape") closeDialog(); }
+        document.addEventListener("keydown", onKey);
+        dlg.addEventListener("click", (e) => { if (e.target === dlg) closeDialog(); });
+        dlg.querySelector('[data-act="edit-cancel"]').addEventListener("click", () => closeDialog());
+
+        const displayEl = dlg.querySelector('[data-role="edit-when-display"]');
+        const hiddenEl = dlg.querySelector('[data-role="edit-when"]');
+        const priorityEl = dlg.querySelector('[data-role="edit-priority"]');
+        const noteEl = dlg.querySelector('[data-role="edit-note"]');
+        const errorEl = dlg.querySelector('[data-role="edit-error"]');
+        const saveBtn = dlg.querySelector('[data-act="edit-save"]');
+
+        function refreshEditDisplay() {
+            displayEl.value = formatWhen(currentWhenTs);
+            hiddenEl.value = String(currentWhenTs);
+        }
+
+        // +/- buttons wired the same way as openScheduleDialog; we keep
+        // them disabled when the row's status forbids edits so users on a
+        // running/interrupted job see a greyed-out row instead of an
+        // honest-looking but silently-no-op dialog.
+        dlg.querySelectorAll('[data-edit-delta]').forEach((btn) => {
+            btn.addEventListener("click", () => {
+                if (btn.disabled) return;
+                const delta = parseInt(btn.dataset.editDelta, 10);
+                if (!Number.isFinite(delta)) return;
+                currentWhenTs = Math.max(currentWhenTs + delta, minWhenTs());
+                displayEl.style.borderColor = "";
+                refreshEditDisplay();
+            });
+        });
+        displayEl.addEventListener("input", () => {
+            if (displayEl.disabled) return;
+            const parsed = parseWhen(displayEl.value);
+            if (Number.isFinite(parsed)) {
+                if (parsed < minWhenTs()) {
+                    displayEl.style.borderColor = "#c44";
+                    return;
+                }
+                displayEl.style.borderColor = "";
+                currentWhenTs = parsed;
+                hiddenEl.value = String(parsed);
+            } else {
+                displayEl.style.borderColor = "#c44";
+            }
+        });
+        priorityEl.addEventListener("input", () => {
+            const v = parseInt(priorityEl.value, 10);
+            currentPriority = Number.isFinite(v) ? Math.max(0, Math.min(1000, v)) : currentPriority;
+        });
+        noteEl.addEventListener("input", () => { currentNote = noteEl.value; });
+
+        saveBtn.addEventListener("click", async () => {
+            errorEl.textContent = "";
+            // Re-parse the display at submit time so the user's last
+            // manual edit wins even if they never clicked a +/- button.
+            // Same defensive parse + clamp as the schedule dialog.
+            const parsed = parseWhen(displayEl.value);
+            if (!Number.isFinite(parsed) || parsed < minWhenTs()) {
+                displayEl.style.borderColor = "#c44";
+                errorEl.textContent = "Invalid / past time";
+                return;
+            }
+            currentWhenTs = parsed;
+            hiddenEl.value = String(currentWhenTs);
+
+            const pri = Math.max(0, Math.min(1000, parseInt(priorityEl.value || "100", 10)));
+            const fields = { priority: pri, note: (noteEl.value || "").trim() };
+            // Only send scheduled_at when the row is editable; the backend
+            // whitelists it for the editable statuses anyway but skipping
+            // it for a frozen row keeps the request semantically honest.
+            if (editable) fields.scheduled_at = currentWhenTs;
+
+            saveBtn.disabled = true;
+            try {
+                await callApi(`/update/${encodeURIComponent(id)}`, {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify(fields),
+                });
+                closeDialog();
+                if (typeof onSaved === "function") {
+                    // The /update endpoint round-trips through the DB
+                    // synchronously; refresh() picks up the new values
+                    // before the next paint.
+                    await onSaved({ silent: true });
+                }
+            } catch (err) {
+                errorEl.textContent = `Save failed: ${err.message}`;
+            } finally {
+                saveBtn.disabled = false;
+            }
+        });
+
+        document.body.appendChild(dlg);
+        return dlg;
+    }
 
     // First render and a slow background refresh to catch out-of-band changes.
     // The framework calls render(container) every time the panel becomes active
