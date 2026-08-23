@@ -184,6 +184,7 @@ function buildPanel() {
         <div data-role="status-tabs" style="display:flex;gap:2px;margin-bottom:6px;flex-wrap:wrap;align-items:center;">
             <button data-filter="all" style="padding:4px 6px;background:#0078d4;color:#fff;border:none;border-radius:3px;cursor:pointer;font-size:10px;">${escapeHtml(t("filter.all"))}</button>
             <button data-filter="scheduled" style="padding:4px 6px;background:#333;color:#fff;border:none;border-radius:3px;cursor:pointer;font-size:10px;">${escapeHtml(t("filter.scheduled"))}</button>
+            <button data-filter="dispatched" style="padding:4px 6px;background:#333;color:#fff;border:none;border-radius:3px;cursor:pointer;font-size:10px;">${escapeHtml(t("filter.dispatched", "已投递"))}</button>
             <button data-filter="running" style="padding:4px 6px;background:#333;color:#fff;border:none;border-radius:3px;cursor:pointer;font-size:10px;">${escapeHtml(t("filter.running"))}</button>
             <button data-filter="done" style="padding:4px 6px;background:#333;color:#fff;border:none;border-radius:3px;cursor:pointer;font-size:10px;">${escapeHtml(t("filter.done"))}</button>
             <button data-filter="failed" style="padding:4px 6px;background:#333;color:#fff;border:none;border-radius:3px;cursor:pointer;font-size:10px;">${escapeHtml(t("filter.failed"))}</button>
@@ -481,6 +482,7 @@ function buildPanel() {
     function renderStatus(status) {
         const counters = [
             [t("status_bar.label.sched"), status.counts.scheduled],
+            [t("status_bar.label.dispatched", t("filter.dispatched", "已投递")), status.counts.dispatched || 0],
             [t("status_bar.label.run"), status.counts.running],
             [t("status_bar.label.int"), status.counts.interrupted],
             [t("status_bar.label.done"), status.counts.done],
@@ -663,33 +665,29 @@ function buildPanel() {
                 // (e.g. "5m 30s") so it pairs with the localized template.
                 if (delta > 0) {
                     const dur = formatDuration(delta);
-                    timeLineText = LANG === "en"
-                        // English uses "in 5m 30s" prefix.
-                        ? `in ${dur}`
-                        // Chinese uses "5m 30s 后投递" suffix order.
-                        : `${dur} ${t("time.left", "后投递")}`;
+                    timeLineText = tfmt("time.left", LANG === "en" ? "dispatch in {0}" : "{0} 后投递", [dur]);
                 } else {
                     timeLineText = t("job.time.now");
                 }
                 timeLineHint = `${formatTimeUntil(j.scheduled_at)} (${t("status_bar.label.sched")} ${formatAbsTime(j.scheduled_at)})`;
             } else if (j.status === "dispatched") {
-                timeLineText = t("job.queued_in_comfyui");
+                timeLineText = t("job.waiting_to_run", "等待运行");
                 timeLineHint = j.dispatched_at
-                    ? `${t("status.scheduled")} ${formatAbsTime(j.dispatched_at)}`
-                    : t("job.queued_in_comfyui");
+                    ? `${t("filter.dispatched", "已投递")} ${formatAbsTime(j.dispatched_at)}`
+                    : t("job.waiting_to_run", "等待运行");
             } else if (j.status === "running") {
-                const elapsed = j.dispatched_at ? (now - j.dispatched_at) : null;
+                const elapsed = j.started_at ? (now - j.started_at) : null;
                 if (elapsed != null && elapsed >= 0) {
                     const dur = formatDuration(elapsed);
                     timeLineText = LANG === "en"
-                        ? `running ${dur}`
-                        : `${t("job.running_label")} ${dur}`;
+                        ? `executing ${dur}`
+                        : `${t("job.executing", "执行中")} ${dur}`;
                 } else {
-                    timeLineText = t("job.executing");
+                    timeLineText = t("job.executing", "执行中");
                 }
-                timeLineHint = j.dispatched_at
-                    ? `${t("job.scheduled_label")} ${formatAbsTime(j.dispatched_at)}`
-                    : t("job.executing");
+                timeLineHint = j.started_at
+                    ? `${t("job.started_label", "开始")} ${formatAbsTime(j.started_at)}`
+                    : t("job.executing", "执行中");
             } else if (j.status === "paused") {
                 timeLineText = t("job.paused");
                 timeLineHint = j.scheduled_at
@@ -703,9 +701,8 @@ function buildPanel() {
                     ? `${t("job.scheduled_label")} ${formatAbsTime(j.scheduled_at)}`
                     : "";
             }
-            // Duration row: shows the absolute finished time (HH:MM:SS local) plus
-            // the elapsed time between dispatched_at and finished_at. The label
-            // is status-aware and localized.
+            // Done / failed rows show their absolute finish time and real
+            // execution duration when the scheduler recorded started_at.
             const finishedLabel = j.status === "failed" ? t("job.failed_at")
                 : j.status === "done" ? t("job.completed_at")
                 : j.status === "cancelled" ? t("job.cancelled_at")
@@ -714,12 +711,15 @@ function buildPanel() {
                 : j.status === "paused" ? t("job.paused")
                 : t("job.scheduled_label");
             let durationText;
-            if (j.finished_at && j.dispatched_at) {
-                durationText = `${formatAbsTime(j.finished_at)} · ${formatDuration(j.finished_at - j.dispatched_at)}`;
-            } else if (j.finished_at) {
+            if ((j.status === "done" || j.status === "failed") && j.finished_at) {
                 durationText = formatAbsTime(j.finished_at);
+                if (j.started_at) {
+                    durationText += ` · ${formatDuration(j.finished_at - j.started_at)}`;
+                }
             } else if (j.status === "running") {
-                durationText = t("job.running_label");
+                durationText = j.started_at
+                    ? formatDuration(now - j.started_at)
+                    : t("job.executing", "执行中");
             } else {
                 durationText = "—";
             }

@@ -192,6 +192,34 @@ class TestReconcile(unittest.TestCase):
         for jid in (jid_a, jid_b):
             self.assertEqual(self.db.get_job(jid)["status"], "scheduled")
 
+    def test_running_and_history_expose_real_started_at_and_duration(self):
+        jid = self.db.add_job(payload={}, scheduled_at=1.0)
+        self.db.mark_dispatched(jid, "p-timed")
+        self.db.mark_running(jid, "p-timed")
+        running = self.db.get_job(jid)
+        self.assertEqual(running["status"], "running")
+        self.assertIsNotNone(running["started_at"])
+        self.assertIsNotNone(running["duration"])
+        self.assertGreaterEqual(running["duration"], 0)
+        self.db.mark_done(jid, "p-timed", outputs={})
+        history = self.db.list_history()[0]
+        self.assertIsNotNone(history["started_at"])
+        self.assertIsNotNone(history["duration"])
+        self.assertGreaterEqual(history["duration"], 0)
+
+    def test_pause_reclaims_dispatched_but_not_running(self):
+        dispatched = self.db.add_job(payload={}, scheduled_at=1.0)
+        running = self.db.add_job(payload={}, scheduled_at=1.0)
+        self.db.mark_dispatched(dispatched, "p-dispatched")
+        self.db.mark_dispatched(running, "p-running")
+        self.db.mark_running(running, "p-running")
+        self.assertEqual(self.db.reclaim_dispatched(), 1)
+        reclaimed = self.db.get_job(dispatched)
+        self.assertEqual(reclaimed["status"], "scheduled")
+        self.assertIsNone(reclaimed["prompt_id"])
+        self.assertIsNone(reclaimed["dispatched_at"])
+        self.assertEqual(self.db.get_job(running)["status"], "running")
+
 
 class TestUpdateGuards(unittest.TestCase):
     def setUp(self):

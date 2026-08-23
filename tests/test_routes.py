@@ -128,6 +128,26 @@ class TestRoutes(unittest.TestCase):
         body = json.loads(resp.body)
         self.assertFalse(body["paused"], "status must reflect DB after resume")
 
+    def test_pause_reclaims_dispatched_and_resume_redelivers(self):
+        dispatched = self._add()
+        self.db.mark_dispatched(dispatched, "p-dispatched")
+        resp = _run(self._routes.pause_all_handler(_StubRequest(app=self.app)))
+        self.assertEqual(json.loads(resp.body)["reclaimed_count"], 1)
+        row = self.db.get_job(dispatched)
+        self.assertEqual(row["status"], "scheduled")
+        self.assertIsNone(row["prompt_id"])
+        self.assertIsNone(row["dispatched_at"])
+        _run(self._routes.resume_all_handler(_StubRequest(app=self.app)))
+        claimed = self.db.claim_next_due_job()
+        self.assertEqual(claimed["id"], dispatched)
+
+    def test_pause_does_not_reclaim_running(self):
+        jid = self._add()
+        self.db.mark_dispatched(jid, "p-running")
+        self.db.mark_running(jid, "p-running")
+        _run(self._routes.pause_all_handler(_StubRequest(app=self.app)))
+        self.assertEqual(self.db.get_job(jid)["status"], "running")
+
     def test_status_db_state_change_is_observable(self):
         """Regression test for the bug where status always returned paused=True."""
         # DB starts paused = 1

@@ -535,11 +535,12 @@ async def pause_all_handler(request) -> "web.Response":  # type: ignore[name-def
 
     try:
         db.set_state("paused", "1")
+        reclaimed_count = db.reclaim_dispatched()
     except Exception:
         _log.exception("pause_all: set_state failed")
         return _server_error("database error")
 
-    return _json_response({"paused": True})
+    return _json_response({"paused": True, "reclaimed_count": int(reclaimed_count)})
 
 
 async def resume_all_handler(request) -> "web.Response":  # type: ignore[name-defined]

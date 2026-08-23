@@ -28,6 +28,15 @@ def _default_db_path() -> str:
 
 def _dict(row): return None if row is None else {k: row[k] for k in row.keys()}
 
+def _with_duration(row):
+    if row is None:
+        return None
+    data = _dict(row)
+    started = data.get("started_at")
+    end = data.get("finished_at")
+    data["duration"] = (None if started is None else max(0.0, float(((end if end is not None else time.time()) - started))))
+    return data
+
 def _safe_json(value):
     """Decode a JSON column into a Python object, returning None on
     empty / malformed values rather than raising. Used by the Stage 3
@@ -54,7 +63,7 @@ class ScheduledQueueDB:
               id TEXT PRIMARY KEY, prompt_id TEXT, payload TEXT NOT NULL,
               client_id TEXT, note TEXT, priority INTEGER NOT NULL DEFAULT 100,
               scheduled_at REAL NOT NULL, created_at REAL NOT NULL,
-              dispatched_at REAL, finished_at REAL, status TEXT NOT NULL DEFAULT 'scheduled',
+              dispatched_at REAL, started_at REAL, finished_at REAL, status TEXT NOT NULL DEFAULT 'scheduled',
               error TEXT, retry_count INTEGER NOT NULL DEFAULT 0,
               auto_retry INTEGER NOT NULL DEFAULT 0, queue_order INTEGER,
               workflow_title TEXT
@@ -62,7 +71,7 @@ class ScheduledQueueDB:
             CREATE TABLE IF NOT EXISTS job_history (
               id TEXT PRIMARY KEY, prompt_id TEXT, finished_at REAL NOT NULL,
               status TEXT NOT NULL, outputs TEXT, error TEXT, payload TEXT,
-              workflow_title TEXT, dispatched_at REAL
+              workflow_title TEXT, dispatched_at REAL, started_at REAL
             );
             CREATE TABLE IF NOT EXISTS scheduler_state (key TEXT PRIMARY KEY, value TEXT NOT NULL);
             CREATE INDEX IF NOT EXISTS idx_sq_due ON scheduled_jobs(status, scheduled_at);
@@ -76,6 +85,8 @@ class ScheduledQueueDB:
             # Older DBs need an ALTER. Stays NULL / empty for legacy rows.
             if "workflow_title" not in cols:
                 self._conn.execute("ALTER TABLE scheduled_jobs ADD COLUMN workflow_title TEXT")
+            if "started_at" not in cols:
+                self._conn.execute("ALTER TABLE scheduled_jobs ADD COLUMN started_at REAL")
             # job_history gained a `payload` column in v0.3.8 so finished jobs
             # can be re-submitted via repeat_job. Older DBs need a migration.
             hcols = {r[1] for r in self._conn.execute("PRAGMA table_info(job_history)")}
@@ -91,6 +102,8 @@ class ScheduledQueueDB:
             # failed before they ever dispatched).
             if "dispatched_at" not in hcols:
                 self._conn.execute("ALTER TABLE job_history ADD COLUMN dispatched_at REAL")
+            if "started_at" not in hcols:
+                self._conn.execute("ALTER TABLE job_history ADD COLUMN started_at REAL")
             if self.get_state("paused") is None: self.set_state("paused", "1")
 
     def add_job(self, payload, scheduled_at, priority=100, note=None, client_id=None, auto_retry=0, workflow_title=None):
@@ -107,17 +120,17 @@ class ScheduledQueueDB:
               VALUES (?,?,?,?,?,?,?,'scheduled',?,?,?)""", (jid,json.dumps(payload,ensure_ascii=False,separators=(",",":")),client_id,note,int(priority),float(scheduled_at),now,int(auto_retry),order,wtitle))
         return jid
 
-    def get_job(self, job_id): return _dict(self._conn.execute("SELECT * FROM scheduled_jobs WHERE id=?",(job_id,)).fetchone())
+    def get_job(self, job_id): return _with_duration(self._conn.execute("SELECT * FROM scheduled_jobs WHERE id=?",(job_id,)).fetchone())
 
     def list_jobs(self, status_filter=None, limit=200):
         limit=max(1,min(int(limit),10000)); params=[]; where=""
         if status_filter:
             where="WHERE status IN (%s)"%(",".join("?"*len(status_filter))); params.extend(status_filter)
         rows=self._conn.execute(f"SELECT * FROM scheduled_jobs {where} ORDER BY CASE WHEN status IN ('scheduled','interrupted') THEN 0 WHEN status IN ('dispatched','running') THEN 1 ELSE 2 END, queue_order ASC, priority DESC, scheduled_at ASC, created_at ASC, id ASC LIMIT ?",(*params,limit)).fetchall()
-        return [_dict(r) for r in rows]
+        return [_with_duration(r) for r in rows]
 
     def list_history(self, limit=200):
-        return [_dict(r) for r in self._conn.execute("SELECT * FROM job_history ORDER BY finished_at DESC LIMIT ?",(max(1,min(int(limit),10000)),)).fetchall()]
+        return [_with_duration(r) for r in self._conn.execute("SELECT * FROM job_history ORDER BY finished_at DESC LIMIT ?",(max(1,min(int(limit),10000)),)).fetchall()]
 
     # --- pagination/listing/clear for the v0.3.8+ list endpoint -----------------
     # status values come from both tables:
@@ -185,7 +198,7 @@ class ScheduledQueueDB:
                 f"LIMIT ? OFFSET ?",
                 (*sched, limit, offset),
             ).fetchall()
-            out.extend(_dict(r) for r in rows)
+            out.extend(_with_duration(r) for r in rows)
         if hist:
             placeholders = ",".join("?" * len(hist))
             rows = self._conn.execute(
@@ -193,7 +206,7 @@ class ScheduledQueueDB:
                 f"ORDER BY finished_at DESC LIMIT ? OFFSET ?",
                 (*hist, limit, offset),
             ).fetchall()
-            out.extend(_dict(r) for r in rows)
+            out.extend(_with_duration(r) for r in rows)
         if not sched and not hist:
             # No status filter (or every provided status was unknown): return
             # rows from BOTH stores. scheduled_jobs keeps its live-first
@@ -206,13 +219,13 @@ class ScheduledQueueDB:
                 "LIMIT ? OFFSET ?",
                 (limit, offset),
             ).fetchall()
-            out.extend(_dict(r) for r in rows)
+            out.extend(_with_duration(r) for r in rows)
             rows = self._conn.execute(
                 "SELECT * FROM job_history "
                 "ORDER BY finished_at DESC LIMIT ? OFFSET ?",
                 (limit, offset),
             ).fetchall()
-            out.extend(_dict(r) for r in rows)
+            out.extend(_with_duration(r) for r in rows)
 
         # job_history stores `outputs` as a JSON string and `payload` as a
         # JSON string; decode them here so callers (and the HTTP layer that
@@ -266,7 +279,7 @@ class ScheduledQueueDB:
         ).fetchone()
         if h is None:
             return None
-        d = _dict(h)
+        d = _with_duration(h)
         if d is None:
             return None
         # job_history rows don't store note/priority — fill None so the
@@ -398,7 +411,13 @@ class ScheduledQueueDB:
             d=_dict(r); d.update(status='dispatched',dispatched_at=now); return d
 
     def mark_running(self, job_id, prompt_id):
-        return self.update_job(job_id,status='running',prompt_id=prompt_id)
+        now = time.time()
+        with self._conn:
+            cur = self._conn.execute(
+                "UPDATE scheduled_jobs SET status='running', prompt_id=?, started_at=? WHERE id=? AND status='dispatched'",
+                (prompt_id, now, job_id),
+            )
+        return cur.rowcount > 0
 
     def mark_dispatched(self, job_id, prompt_id):
         """Flip status='dispatched' and stamp ``dispatched_at``.
@@ -434,9 +453,9 @@ class ScheduledQueueDB:
             # "when this job actually started running" (NULL for jobs that
             # finished without ever being dispatched — e.g. auto-retry
             # cancellations handled before claim_next_due_job).
-            r=self._conn.execute("SELECT prompt_id,payload,workflow_title,dispatched_at FROM scheduled_jobs WHERE id=?",(job_id,)).fetchone()
+            r=self._conn.execute("SELECT prompt_id,payload,workflow_title,dispatched_at,started_at FROM scheduled_jobs WHERE id=?",(job_id,)).fetchone()
             if not r:return False
-            self._conn.execute("INSERT OR REPLACE INTO job_history(id,prompt_id,finished_at,status,outputs,error,payload,workflow_title,dispatched_at) VALUES(?,?,?,?,?,?,?,?,?)",(job_id,prompt_id or r[0],now,status,json.dumps(outputs,ensure_ascii=False,separators=(",",":")) if outputs is not None else None,error,r['payload'],r['workflow_title'],r['dispatched_at']))
+            self._conn.execute("INSERT OR REPLACE INTO job_history(id,prompt_id,finished_at,status,outputs,error,payload,workflow_title,dispatched_at,started_at) VALUES(?,?,?,?,?,?,?,?,?,?)",(job_id,prompt_id or r[0],now,status,json.dumps(outputs,ensure_ascii=False,separators=(",",":")) if outputs is not None else None,error,r['payload'],r['workflow_title'],r['dispatched_at'],r['started_at']))
             self._conn.execute("DELETE FROM scheduled_jobs WHERE id=?",(job_id,))
         return True
     def mark_done(self,job_id,prompt_id=None,outputs=None): return self._finish(job_id,'done',prompt_id,outputs)
@@ -450,6 +469,15 @@ class ScheduledQueueDB:
         with self._conn:
             cur=self._conn.execute("UPDATE scheduled_jobs SET status='scheduled',scheduled_at=?,error=NULL WHERE status='interrupted'",(time.time(),))
         return cur.rowcount
+    def reclaim_dispatched(self):
+        """Return POSTed-but-not-started jobs to the scheduler queue."""
+        with self._conn:
+            cur = self._conn.execute(
+                "UPDATE scheduled_jobs SET status='scheduled', prompt_id=NULL, dispatched_at=NULL, started_at=NULL, scheduled_at=? WHERE status='dispatched'",
+                (time.time(),),
+            )
+        return cur.rowcount
+
     def increment_retry(self,job_id):
         with self._conn:self._conn.execute("UPDATE scheduled_jobs SET retry_count=retry_count+1 WHERE id=?",(job_id,))
         r=self._conn.execute("SELECT retry_count FROM scheduled_jobs WHERE id=?",(job_id,)).fetchone(); return int(r[0]) if r else 0
