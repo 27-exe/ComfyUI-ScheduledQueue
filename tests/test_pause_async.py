@@ -26,9 +26,27 @@ class _App:
 class _Request:
     def __init__(self, db):
         self.app = _App(db)
+        self.match_info = {}
 
 
 class TestPauseAsync(unittest.TestCase):
+    def test_cancel_running_uses_blocking_worker(self):
+        db = object()
+        request = _Request(db)
+        request.match_info = {"job_id": "job-1"}
+        response = routes._json_response({"id": "job-1", "status": "failed"})
+        to_thread = AsyncMock(return_value=response)
+        with patch.object(routes.asyncio, "to_thread", to_thread), patch.object(
+            routes, "_cancel_running_blocking", return_value=response
+        ) as blocking:
+            actual = asyncio.run(routes.cancel_running_handler(request))
+
+        blocking.assert_not_called()
+        to_thread.assert_awaited_once()
+        self.assertEqual(to_thread.await_args_list[0].args[1:],
+                         (db, "job-1", "http://comfyui.test"))
+        self.assertIs(actual, response)
+
     def test_pause_all_uses_blocking_worker_and_preserves_schema(self):
         db = object()
         worker_result = {

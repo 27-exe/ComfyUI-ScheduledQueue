@@ -690,21 +690,8 @@ async def requeue_handler(request) -> "web.Response":  # type: ignore[name-defin
     return await requeue_dispatched_handler(request)
 
 
-async def cancel_running_handler(request) -> "web.Response":  # type: ignore[name-defined]
-    """POST /api/schedule/cancel-running/{id}.
-
-    Interrupt exactly one live prompt, then move its local row to the failed
-    history.  ComfyUI's /interrupt acknowledgement is the commit point:
-    failures leave the row in ``running`` so the operator can retry safely.
-    """
-    db = request.app.get("sq_db")
-    if db is None:
-        return _server_error("db not initialized")
-
-    job_id = request.match_info.get("job_id", "").strip()
-    if not job_id:
-        return _bad_request("job_id is required")
-
+def _cancel_running_blocking(db, job_id, comfyui_url) -> "web.Response":  # type: ignore[name-defined]
+    """Interrupt one live prompt and archive its local row."""
     try:
         row = db.get_job(job_id)
     except Exception:
@@ -727,7 +714,7 @@ async def cancel_running_handler(request) -> "web.Response":  # type: ignore[nam
 
     try:
         ok, info = _comfyui_post_json(
-            _comfyui_url(request) + "/interrupt", {"prompt_id": prompt_id}
+            comfyui_url + "/interrupt", {"prompt_id": prompt_id}
         )
     except Exception:
         _log.exception("cancel_running: ComfyUI interrupt failed")
@@ -745,6 +732,21 @@ async def cancel_running_handler(request) -> "web.Response":  # type: ignore[nam
         return _server_error("database error")
 
     return _json_response({"id": job_id, "status": "failed"})
+
+
+async def cancel_running_handler(request) -> "web.Response":  # type: ignore[name-defined]
+    """POST /api/schedule/cancel-running/{id}."""
+    db = request.app.get("sq_db")
+    if db is None:
+        return _server_error("db not initialized")
+
+    job_id = request.match_info.get("job_id", "").strip()
+    if not job_id:
+        return _bad_request("job_id is required")
+
+    return await asyncio.to_thread(
+        _cancel_running_blocking, db, job_id, _comfyui_url(request)
+    )
 
 
 async def update_handler(request) -> "web.Response":  # type: ignore[name-defined]
