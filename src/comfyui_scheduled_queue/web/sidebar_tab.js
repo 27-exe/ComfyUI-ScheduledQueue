@@ -122,6 +122,16 @@ function t(key, fallback) {
     return fallback != null ? fallback : key;
 }
 
+function escapeHtml(value) {
+    return String(value ?? "").replace(/[&<>"']/g, (ch) => ({
+        "&": "&amp;",
+        "<": "&lt;",
+        ">": "&gt;",
+        "\"": "&quot;",
+        "'": "&#39;",
+    }[ch]));
+}
+
 // Format a template string like "Page {0} ({1}-{2} of {3})" by
 // replacing {N} placeholders with positional args. Missing indices
 // are left in place so a translator sees the gap during QA.
