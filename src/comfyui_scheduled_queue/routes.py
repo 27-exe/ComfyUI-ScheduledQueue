@@ -252,7 +252,7 @@ def _default_comfyui_fetcher(url, body, timeout):
         return 0, "", "unreachable"
 
 
-def _comfyui_post_json(url, body, *, fetcher=None):
+def _comfyui_post_json(url, body, *, fetcher=None, timeout=None):
     """POST *body* as JSON to *url*. Returns ``(ok, payload_or_err)``.
 
     ``ok`` is True on any 2xx response. 4xx / 5xx and "we never
@@ -265,11 +265,19 @@ def _comfyui_post_json(url, body, *, fetcher=None):
     Tests inject ``fetcher`` to avoid hitting a real ComfyUI. The fetcher
     signature is ``fetcher(url, body, timeout) -> (status, text, kind)``;
     the default uses ``urllib.request``.
+
+    ``timeout`` overrides the module-level ``_COMFYUI_HTTP_TIMEOUT``
+    for this single call. Defaults to ``None`` (use the module global).
+    Callers that hit a fast in-memory endpoint (e.g. ``/queue {delete:
+    [...]}`` which returns in <100ms) MUST pass a short timeout
+    (≤5s) so a stuck / unresponsive ComfyUI cannot block the aiohttp
+    worker for 30s.
     """
     payload = json.dumps(body).encode()
     do_fetch = fetcher if fetcher is not None else _default_comfyui_fetcher
+    to = _COMFYUI_HTTP_TIMEOUT if timeout is None else float(timeout)
     try:
-        status, text, kind = do_fetch(url, payload, _COMFYUI_HTTP_TIMEOUT)
+        status, text, kind = do_fetch(url, payload, to)
     except Exception as exc:  # noqa: BLE001 — defensive, never raise from HTTP helper
         return False, f"fetcher raised: {exc!r}"
     if 200 <= status < 300:
@@ -281,7 +289,82 @@ def _comfyui_post_json(url, body, *, fetcher=None):
     return False, f"HTTP {status}"
 
 
-def _cancel_comfyui_queue(in_flight, comfyui_url, *, fetcher=None):
+# Cap for the /queue {delete: [...]} HTTP call. /queue is a fast
+# in-memory mutation (ComfyUI normally acks in <100ms) so we don't
+# need the global 30s ceiling that the /interrupt call requires.
+# A stuck / unresponsive ComfyUI must not block the aiohttp worker
+# for the full 30s — that previously froze the sidebar for half a
+# minute when the user hit Pause.
+_QUEUE_DELETE_TIMEOUT = 5.0
+
+
+def _clear_prompt_id_dispatched_snapshot(db, snapshot_ids):
+    """NULL out ``prompt_id``/``dispatched_at`` for snapshot rows
+    that are STILL ``dispatched`` at the moment of the call.
+
+    Mirrors ``_reclaim_dispatched_snapshot``'s race-recovery
+    semantics: a row that transitioned ``dispatched`` → ``running``
+    between the handler's snapshot and this call is left alone
+    (ComfyUI is now responsible for it; we don't want to lose the
+    prompt_id that's actively being polled by ``/history``).
+
+    Lives in routes.py (rather than database.py) because it is a
+    race-recovery helper specific to the pause-all flow.
+    """
+    if not snapshot_ids:
+        return 0
+    placeholders = ",".join("?" for _ in snapshot_ids)
+    with db._conn:
+        cur = db._conn.execute(
+            f"UPDATE scheduled_jobs "
+            f"SET prompt_id=NULL, dispatched_at=NULL "
+            f"WHERE id IN ({placeholders}) AND status='dispatched'",
+            tuple(snapshot_ids),
+        )
+    return cur.rowcount
+
+
+def _reclaim_dispatched_snapshot(db, snapshot_ids):
+    """Reclaim only the rows that were 'dispatched' at the snapshot.
+
+    ``db`` is the ``ScheduledQueueDB`` instance. ``snapshot_ids`` is
+    the list of job_ids observed as ``dispatched`` by the previous
+    ``db.list_in_flight_with_prompt_id()`` call.
+
+    The single UPDATE is scoped to ``id IN (snapshot_ids) AND
+    status='dispatched'`` so a row that transitioned
+    ``dispatched`` → ``running`` between the snapshot and this call
+    is left untouched (ComfyUI is already running it; flipping it
+    back to ``scheduled`` would create a duplicate prompt on
+    resume). The whole operation runs inside ``with db._conn:`` so
+    the read-and-update pair is atomic from the scheduler's
+    perspective.
+
+    Returns the number of rows actually flipped to ``scheduled``.
+
+    Lives in routes.py (rather than database.py) because it is a
+    race-recovery helper specific to the pause-all flow — the
+    generic ``db.reclaim_dispatched()`` keeps its original
+    "every dispatched row" semantics for any future caller that
+    doesn't have a snapshot whitelist handy.
+    """
+    if not snapshot_ids:
+        return 0
+    placeholders = ",".join("?" for _ in snapshot_ids)
+    with db._conn:
+        cur = db._conn.execute(
+            f"UPDATE scheduled_jobs "
+            f"SET status='scheduled', prompt_id=NULL, dispatched_at=NULL, "
+            f"    started_at=NULL, scheduled_at=? "
+            f"WHERE id IN ({placeholders}) AND status='dispatched'",
+            (time.time(), *snapshot_ids),
+        )
+    return cur.rowcount
+
+
+def _cancel_comfyui_queue(
+    in_flight, comfyui_url, *, fetcher=None, queue_delete_timeout=_QUEUE_DELETE_TIMEOUT,
+):
     """Cancel every (job_id, prompt_id) in *in_flight* against ComfyUI.
 
     *in_flight* is a list of dicts from
@@ -292,9 +375,17 @@ def _cancel_comfyui_queue(in_flight, comfyui_url, *, fetcher=None):
     Behaviour:
       * ``dispatched`` rows are bundled into a single
         ``POST /queue {delete: [...]}`` call (ComfyUI accepts a list).
+        This endpoint is a fast in-memory mutation that normally
+        returns in <100ms, so ``queue_delete_timeout`` defaults to 5s.
+        A stuck ComfyUI MUST NOT block the aiohttp worker for the full
+        30s default — pause-all must return promptly so the sidebar
+        doesn't appear frozen.
       * ``running`` rows are interrupted one at a time via
         ``POST /interrupt {prompt_id: pid}`` (ComfyUI's interrupt
-        endpoint only takes one id at a time).
+        endpoint only takes one id at a time). ``/interrupt`` waits
+        for the currently-running sampling step to finish before
+        returning, so it stays on the module-global 30s default; this
+        is the case the long timeout was originally designed for.
 
     Returns ``(cancelled_count, error_count, error_messages)``:
       * ``cancelled_count`` — rows whose prompt_id ComfyUI acknowledged
@@ -329,8 +420,14 @@ def _cancel_comfyui_queue(in_flight, comfyui_url, *, fetcher=None):
     base = comfyui_url.rstrip("/")
 
     if pending_ids:
+        # /queue {delete: [...]} is a fast in-memory mutation — the
+        # caller (e.g. /pause-all) MUST NOT block the aiohttp worker
+        # for the global 30s default. Override per-call.
         ok, info = _comfyui_post_json(
-            base + "/queue", {"delete": pending_ids}, fetcher=fetcher,
+            base + "/queue",
+            {"delete": pending_ids},
+            fetcher=fetcher,
+            timeout=queue_delete_timeout,
         )
         if ok:
             # ComfyUI returns 200 with an empty body and no per-id
@@ -342,6 +439,8 @@ def _cancel_comfyui_queue(in_flight, comfyui_url, *, fetcher=None):
             errors.append(f"queue delete: {info}")
 
     for pid in running_ids:
+        # /interrupt waits for the current sampling step — keep the
+        # module global 30s ceiling here.
         ok, info = _comfyui_post_json(
             base + "/interrupt", {"prompt_id": pid}, fetcher=fetcher,
         )
@@ -856,15 +955,30 @@ async def pause_all_handler(request) -> "web.Response":  # type: ignore[name-def
 
          * ``POST /queue {delete: [...]}`` with every dispatched
            prompt_id bundled into a single batch (ComfyUI accepts a
-           list).
+           list). This endpoint is a fast in-memory mutation that
+           returns in <100ms, so it gets a 5s timeout (via
+           ``_cancel_comfyui_queue``'s ``queue_delete_timeout``).
+           A stuck / unresponsive ComfyUI MUST NOT block the aiohttp
+           worker for the full 30s default — that previously froze
+           the sidebar for half a minute.
 
-      4. ``db.reclaim_dispatched()`` — flip the now-cancelled
-         'dispatched' rows back to 'scheduled' so the scheduler can
-         pick them up again on resume. **Skipped when any cancel call
-         failed** — if ComfyUI didn't ack the cancel, leaving the row
-         at 'dispatched' preserves the prompt_id so a subsequent
-         ``/pause-all`` retry can target it again. The handler also
-         calls ``db.clear_prompt_id()`` for the successfully cancelled
+      4. Reclaim ONLY the rows that were ``dispatched`` at the moment
+         of the snapshot AND are still ``dispatched`` at the moment
+         of the reclaim. This is a deliberate race-condition fix:
+         between step 2 and step 4 a row may have transitioned
+         ``dispatched`` → ``running`` (ComfyUI picked it up off the
+         pending queue while we were waiting on its HTTP ack).
+         ``reclaim_dispatched()`` would naively flip such a row back
+         to ``scheduled`` even though ComfyUI is already running it,
+         creating a duplicate prompt on resume. We avoid that by
+         scoping the reclaim SQL to ``id IN (<snapshot ids>) AND
+         status='dispatched'``, wrapped in a single transaction.
+
+         **Skipped when any cancel call failed** — if ComfyUI didn't
+         ack the cancel, leaving the row at 'dispatched' preserves
+         the prompt_id so a subsequent ``/pause-all`` retry can
+         target it again. The handler also calls
+         ``db.clear_prompt_id()`` for the successfully cancelled
          ids so reconcile() doesn't fetch a /history record for a
          prompt that no longer exists.
 
@@ -881,9 +995,13 @@ async def pause_all_handler(request) -> "web.Response":  # type: ignore[name-def
         try again with a fresh HTTP request. ``paused=True`` is still
         returned because the scheduler is correctly paused — the
         operator just has to retry the cancel piece.
-      * If ``reclaim_dispatched()`` raises, we still return 200 with
-        whatever the HTTP layer accomplished so a partial outage
-        doesn't leave the scheduler running. The exception is logged.
+      * If the reclaim SQL raises, we still return 200 with whatever
+        the HTTP layer accomplished so a partial outage doesn't leave
+        the scheduler running. The exception is logged.
+
+    Latency budget: ≤5s for the ComfyUI cancel + ≤100ms for the
+    reclaim SQL. The total request must finish well under the 30s
+    default that previously froze the aiohttp worker.
     """
     db = request.app.get("sq_db")
     if db is None:
@@ -907,6 +1025,14 @@ async def pause_all_handler(request) -> "web.Response":  # type: ignore[name-def
     dispatched_in_flight = [
         r for r in (all_in_flight or []) if r.get("status") == "dispatched"
     ]
+    # Snapshot the IDs we observed as dispatched. The reclaim step
+    # MUST scope its UPDATE to this exact set (intersected with rows
+    # still in status='dispatched') so a row that flipped to
+    # 'running' between this snapshot and the reclaim is NOT
+    # touched. See the race-condition note in the docstring.
+    dispatched_snapshot_ids = [
+        r["id"] for r in dispatched_in_flight if r.get("id")
+    ]
 
     cancelled_count = 0
     error_count = 0
@@ -926,15 +1052,16 @@ async def pause_all_handler(request) -> "web.Response":  # type: ignore[name-def
                 pass
         # For every row we *think* ComfyUI accepted, clear the prompt_id
         # so reconcile() doesn't fetch a /history record for a prompt
-        # that no longer exists.
+        # that no longer exists. Scope to rows STILL in
+        # status='dispatched' so a row that flipped to 'running'
+        # while we were waiting on /queue keeps its prompt_id
+        # (ComfyUI is now running it; we don't want to lose the
+        # /history pointer).
         if cancelled_count:
             try:
-                cancelled_pids = {r["prompt_id"] for r in dispatched_in_flight}
-                job_ids_to_clear = [
-                    r["id"] for r in dispatched_in_flight
-                    if r.get("prompt_id") and r["prompt_id"] in cancelled_pids
-                ][:cancelled_count]
-                db.clear_prompt_id(job_ids_to_clear)
+                _clear_prompt_id_dispatched_snapshot(
+                    db, dispatched_snapshot_ids,
+                )
             except Exception:
                 _log.exception("pause_all: clear_prompt_id failed (continuing)")
 
@@ -943,8 +1070,26 @@ async def pause_all_handler(request) -> "web.Response":  # type: ignore[name-def
     # cancel failed, leaving the row at 'dispatched' preserves the
     # prompt_id so a subsequent ``/pause-all`` retry can target it
     # again; reclaiming would NULL the prompt_id and break reconcile.
+    #
+    # Atomicity: scope the UPDATE to the snapshot ids AND the still-
+    # dispatched status in a single SQL statement. If B was
+    # 'dispatched' when we read list_in_flight_with_prompt_id() but
+    # ComfyUI promoted B to 'running' while we were POSTing the
+    # /queue {delete: [...]} batch, the WHERE clause skips B — we
+    # don't NULL out B's prompt_id and don't requeue B. The user
+    # sees B continue running normally; the /pause-running-all
+    # button handles it separately.
     reclaimed_count = 0
-    if error_count == 0:
+    if error_count == 0 and dispatched_snapshot_ids:
+        try:
+            reclaimed_count = _reclaim_dispatched_snapshot(
+                db, dispatched_snapshot_ids,
+            )
+        except Exception:
+            _log.exception("pause_all: reclaim_dispatched failed (continuing)")
+    elif error_count == 0 and not dispatched_snapshot_ids:
+        # No in-flight rows — the helper isn't worth calling; mirror
+        # the legacy semantics so the response shape stays stable.
         try:
             reclaimed_count = db.reclaim_dispatched()
         except Exception:

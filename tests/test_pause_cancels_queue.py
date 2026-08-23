@@ -713,5 +713,307 @@ class TestPauseAllCancelsQueue(unittest.TestCase):
             self.assertIn(k, body)
 
 
+# ---------------------------------------------------------------------
+# Regression coverage for the pause-all race + 30s blocking bugs.
+#
+# Bug 1: pause-all used a global 30s HTTP timeout for the fast
+# ``/queue {delete: [...]}`` call, which could freeze the aiohttp
+# worker for 30s and make the sidebar appear unresponsive.
+#
+# Bug 2: the reclaim step (``db.reclaim_dispatched()``) used a
+# blanket ``WHERE status='dispatched'`` UPDATE, so a row that
+# flipped from ``dispatched`` → ``running`` while pause-all was
+# waiting for ComfyUI's /queue ack would be naively flipped back
+# to ``scheduled``. On resume the scheduler would re-dispatch that
+# row, creating a duplicate prompt in ComfyUI (the running copy
+# would still finish normally, but the user would see two of
+# everything).
+# ---------------------------------------------------------------------
+
+
+class _RacingFetcher:
+    """A fetcher that flips a row's DB status from 'dispatched' to
+    'running' AFTER the handler captured its snapshot but BEFORE the
+    reclaim step runs. This emulates the production race where
+    ComfyUI promotes a pending prompt to running while pause-all
+    is waiting on /queue.
+
+    The flip is triggered the first time the fetcher is invoked —
+    i.e. the instant the handler calls ``_cancel_comfyui_queue``,
+    which is exactly the window in which the production race
+    happens. The same fetcher still records every call so the test
+    can assert the right HTTP traffic happened.
+    """
+
+    def __init__(self, db, flip_id, target_status="running"):
+        self._db = db
+        self._flip_id = flip_id
+        self._flipped = False
+        self.target_status = target_status
+        self.calls: List[Dict[str, Any]] = []
+
+    def __call__(self, url: str, body: bytes, timeout: float):
+        try:
+            decoded = body.decode("utf-8")
+            json_body = json.loads(decoded) if decoded else None
+        except Exception:
+            json_body = None
+        self.calls.append(
+            {"url": url, "body": json_body, "raw_body": body, "timeout": timeout}
+        )
+        if not self._flipped:
+            self._flipped = True
+            # Atomic-ish: the handler's snapshot has already been
+            # taken (it ran ``list_in_flight_with_prompt_id()``
+            # before calling _cancel_comfyui_queue), so flipping
+            # now means the reclaim step sees status='running' for
+            # this row.
+            try:
+                # NOTE: started_at is intentionally omitted because
+                # db.update_job whitelists which columns can change;
+                # status alone is enough for the WHERE clause in
+                # _reclaim_dispatched_snapshot to skip this row.
+                self._db.update_job(
+                    self._flip_id,
+                    status=self.target_status,
+                )
+            except Exception:
+                pass
+        # Pretend ComfyUI acked the cancel. The race fix is on our
+        # side, not ComfyUI's.
+        return 200, "", "success"
+
+
+class _SlowFetcher:
+    """A fetcher that simulates a slow ComfyUI by sleeping for
+    ``min(delay, timeout)`` seconds, then returns ``kind='timeout'``
+    if ``delay > timeout`` (ComfyUI didn't ack in time) or
+    success if ``delay <= timeout``.
+
+    The test wants to verify two things:
+      1. The /queue call gets a short per-call timeout (≤5s), so a
+         6s slow ComfyUI triggers the timeout path.
+      2. The handler doesn't block longer than that timeout.
+
+    We honour the ``timeout`` argument explicitly so the assertion
+    ``slow.calls[0]["timeout"] <= 5.0`` proves the per-call timeout
+    is wired correctly. If the timeout value ever grows back to
+    the global 30s default, the sleep below grows too — the test
+    would then either pass-through (≤30s) and fail on the
+    ``wall_elapsed`` check, OR block for 30s and waste CI time.
+    Either failure mode catches the regression.
+    """
+
+    def __init__(self, delay: float):
+        self._delay = float(delay)
+        self.calls: List[Dict[str, Any]] = []
+
+    def __call__(self, url: str, body: bytes, timeout: float):
+        try:
+            decoded = body.decode("utf-8")
+            json_body = json.loads(decoded) if decoded else None
+        except Exception:
+            json_body = None
+        self.calls.append(
+            {"url": url, "body": json_body, "raw_body": body, "timeout": timeout}
+        )
+        # Honour the timeout: sleep up to ``min(delay, timeout)``
+        # seconds. If delay > timeout, return kind='timeout' so the
+        # helper applies timeout-as-success. If delay <= timeout,
+        # return success.
+        import time as _time
+        slept = min(self._delay, float(timeout))
+        if slept > 0:
+            _time.sleep(slept)
+        if self._delay > float(timeout):
+            return 0, "", "timeout"
+        return 200, "", "success"
+
+
+class TestPauseAllRaceCondition(unittest.TestCase):
+    """Regression tests for the pause-all 'B flips to running' race."""
+
+    def setUp(self):
+        self.db, self.path = _fresh_db()
+        self.app = _FakeApp(self.db)
+        # Capture the real _cancel_comfyui_queue BEFORE any test
+        # patches it, so the regression tests can drive it with a
+        # custom fetcher without recursing into themselves.
+        self._real_cancel = routes._cancel_comfyui_queue
+
+    def tearDown(self):
+        # Make sure the module is back to its original state even
+        # if the test failed mid-way (addCleanup is the primary
+        # restoration mechanism; this is the safety net).
+        routes._cancel_comfyui_queue = self._real_cancel
+        self.db.close()
+        try:
+            os.unlink(self.path)
+        except OSError:
+            pass
+
+    def _install_fetcher(self, fetcher):
+        """Replace ``routes._cancel_comfyui_queue`` with a thin
+        shim that delegates to the real implementation but
+        injects *fetcher* into the call. Cleanup is wired
+        automatically.
+        """
+        real = self._real_cancel
+        chosen_fetcher = fetcher
+
+        def shim(in_flight, comfyui_url, *, fetcher=None, **kw):
+            # ``chosen_fetcher`` is bound via closure so the test's
+            # custom fetcher is used regardless of what the handler
+            # passes in (it currently passes nothing).
+            return real(in_flight, comfyui_url, fetcher=chosen_fetcher)
+
+        routes._cancel_comfyui_queue = shim
+        self.addCleanup(setattr, routes, "_cancel_comfyui_queue", real)
+
+    def test_pause_does_not_requeue_race_lost_to_running(self):
+        """Regression: while pause-all is waiting for the /queue
+        ack, a row that was 'dispatched' at snapshot time gets
+        promoted to 'running' by ComfyUI. The race fix: the
+        reclaim step scopes its UPDATE to ``id IN (<snapshot>) AND
+        status='dispatched'`` so the row that flipped is NOT
+        requeued. The still-dispatched rows ARE requeued.
+
+        Without the fix, B (which is now running) would be flipped
+        back to 'scheduled', losing its prompt_id and creating a
+        duplicate prompt on resume.
+        """
+        a = _add(self.db)
+        b = _add(self.db)
+        c = _add(self.db)
+        # All three start as dispatched with a prompt_id.
+        self.db.update_job(a, status="dispatched", prompt_id="p-a",
+                            dispatched_at=1.0)
+        self.db.update_job(b, status="dispatched", prompt_id="p-b",
+                            dispatched_at=2.0)
+        self.db.update_job(c, status="dispatched", prompt_id="p-c",
+                            dispatched_at=3.0)
+
+        # Race injector: the first time the fetcher is called
+        # (i.e. inside _cancel_comfyui_queue, AFTER the handler's
+        # snapshot, BEFORE the reclaim), flip B to 'running'.
+        racing = _RacingFetcher(self.db, flip_id=b, target_status="running")
+        self._install_fetcher(racing)
+
+        resp = _run(routes.pause_all_handler(_StubRequest(self.app)))
+        self.assertEqual(resp.status, 200)
+        body = json.loads(resp.body)
+        self.assertEqual(body["paused"], True)
+        # /queue delete was acked for all three (racing fetcher
+        # returns 200), so cancelled_count = 3.
+        self.assertEqual(body["cancelled_count"], 3)
+        self.assertEqual(body["error_count"], 0)
+        # But only A and C are reclaimed. B is left alone because
+        # its status is now 'running' (the race was lost).
+        self.assertEqual(body["reclaimed_count"], 2)
+
+        # A and C are back to 'scheduled' with prompt_id cleared.
+        self.assertEqual(self.db.get_job(a)["status"], "scheduled")
+        self.assertIsNone(self.db.get_job(a)["prompt_id"])
+        self.assertEqual(self.db.get_job(c)["status"], "scheduled")
+        self.assertIsNone(self.db.get_job(c)["prompt_id"])
+
+        # B is the smoking gun: it must remain 'running' with its
+        # original prompt_id intact. We do NOT want a duplicate
+        # prompt on resume.
+        b_row = self.db.get_job(b)
+        self.assertEqual(b_row["status"], "running")
+        self.assertEqual(b_row["prompt_id"], "p-b")
+
+        # Sanity: the /queue delete was indeed sent to ComfyUI.
+        self.assertEqual(len(racing.calls), 1)
+        self.assertEqual(racing.calls[0]["url"], routes._DEFAULT_COMFYUI_URL + "/queue")
+
+
+class TestPauseAllLatency(unittest.TestCase):
+    """Regression tests for the pause-all 30s blocking bug."""
+
+    def setUp(self):
+        self.db, self.path = _fresh_db()
+        self.app = _FakeApp(self.db)
+        self._real_cancel = routes._cancel_comfyui_queue
+
+    def tearDown(self):
+        routes._cancel_comfyui_queue = self._real_cancel
+        self.db.close()
+        try:
+            os.unlink(self.path)
+        except OSError:
+            pass
+
+    def _install_fetcher(self, fetcher):
+        real = self._real_cancel
+        chosen_fetcher = fetcher
+
+        def shim(in_flight, comfyui_url, *, fetcher=None, **kw):
+            return real(in_flight, comfyui_url, fetcher=chosen_fetcher)
+
+        routes._cancel_comfyui_queue = shim
+        self.addCleanup(setattr, routes, "_cancel_comfyui_queue", real)
+
+    def test_pause_returns_quickly_even_with_slow_comfyui(self):
+        """Regression: a slow ComfyUI (e.g. stalled on /queue
+        delete) must NOT block the aiohttp worker for the global
+        30s default. The fix: the per-call ``queue_delete_timeout``
+        is 5s. After the timeout, the handler returns 200 with
+        ``error_count >= 1`` and the user can retry.
+
+        We verify two things:
+          1. The handler returns well within 30s when /queue takes
+             >5s to ack (the timeout-as-success rule treats the
+             slow ack as success, so the row is reclaimed).
+          2. The ``timeout`` value the fetcher receives is the
+             short 5s one, not the global 30s default.
+        """
+        a = _add(self.db)
+        self.db.update_job(a, status="dispatched", prompt_id="p-slow")
+
+        # /queue takes 6s to ack. With a 5s per-call timeout the
+        # underlying urllib raises after 5s and the fetcher
+        # returns ``kind='timeout'`` — which the helper treats as
+        # success.
+        slow = _SlowFetcher(delay=6.0)
+        self._install_fetcher(slow)
+
+        wall_start = __import__("time").monotonic()
+        resp = _run(routes.pause_all_handler(_StubRequest(self.app)))
+        wall_elapsed = __import__("time").monotonic() - wall_start
+
+        self.assertEqual(resp.status, 200)
+        body = json.loads(resp.body)
+        # The slow ack is treated as success (timeout-as-success).
+        self.assertEqual(body["cancelled_count"], 1)
+        self.assertEqual(body["error_count"], 0)
+        # Row reclaimed (timeout-as-success means we proceed with
+        # the reclaim step).
+        self.assertEqual(body["reclaimed_count"], 1)
+        self.assertEqual(self.db.get_job(a)["status"], "scheduled")
+
+        # The smoking gun: we MUST NOT have waited 6s. The 5s
+        # timeout kicked in first. Allow generous slack for slow
+        # CI but assert the call is well under the 6s sleep the
+        # fetcher would have caused.
+        self.assertLess(
+            wall_elapsed, 5.5,
+            f"pause-all took {wall_elapsed:.2f}s; the per-call "
+            f"timeout (5s) failed to fire — the handler is "
+            f"blocking on the global 30s default again.",
+        )
+
+        # And the per-call timeout must be the short 5s one, not
+        # the global 30s default. If the helper regressed, this
+        # assertion catches it.
+        self.assertEqual(len(slow.calls), 1)
+        self.assertLessEqual(
+            slow.calls[0]["timeout"], 5.0,
+            f"/queue delete was given timeout={slow.calls[0]['timeout']}; "
+            f"expected ≤5s for the fast in-memory endpoint.",
+        )
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
