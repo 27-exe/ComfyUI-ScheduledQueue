@@ -4,6 +4,51 @@ All notable changes to **ComfyUI-ScheduledQueue** are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.3.12] - 2026-09-11
+
+Patch release: HTTP-level robustness for `pause-all` / `pause-running-all`
+and honest startup diagnostics. No schema changes, no API shape changes —
+in-place upgrade from any 0.3.x is safe. Verified against ComfyUI **v0.35.0**
+(the route surface and every ComfyUI API this plugin calls were unchanged
+across the 0.3.10 → v0.35.0 gap).
+
+### Fixed
+
+- **`pause-all` / `pause-running-all` reported `HTTP 0` and left
+  `last_error` dirty after a momentary TCP reset.** `POST /queue
+  {delete: [...]}` and `POST /interrupt` now retry only the transient
+  network kinds (`refused` / `unreachable`) with exponential backoff:
+  3 total attempts, sleeping 0.3 s then 0.6 s between them — at most
+  0.9 s of added latency. 4xx/5xx and read timeouts are deliberately
+  *not* retried: a 5xx is ComfyUI explicitly rejecting us, and a timeout
+  is already treated as an assumed success because ComfyUI most likely
+  processed the request before its read timed out. `_comfyui_post_json`
+  gained a keyword-only `retries` argument (default `1`) so every
+  existing caller keeps the old single-attempt, zero-sleep behaviour.
+- **`try_install()` failed silently.** Route-registration errors and
+  scheduler-thread start errors now log a warning with a traceback
+  instead of returning `False` with no trace. When routes cannot be
+  registered, the scheduler thread still starts — dispatch is independent
+  of the HTTP surface, and skipping it would strand every scheduled job —
+  and the startup line now reads `scheduler running WITHOUT HTTP routes`
+  so the state is visible in the ComfyUI log rather than showing up later
+  as a bare 404.
+- **`routes.setup_routes()` returned `None` on every path, failure
+  included.** It now returns `True` when every route registered and
+  `False` when `PromptServer` is not built yet or `aiohttp` is missing,
+  which is what lets `try_install()` tell "ComfyUI is still booting"
+  apart from "the plugin is live". The HTTP surface itself is unchanged:
+  the same 18 `/api/schedule/*` routes.
+
+### Tests
+
+- 8 new cases in `tests/test_pause_cancels_queue.py::TestComfyuiPostJson`
+  covering transient-retry success, non-retry of 5xx/timeout, early stop
+  when a transient failure is followed by a permanent one, retry-budget
+  exhaustion, backwards-compatible `retries=1`, and the
+  `retries ∈ {0, -1, -7}` clamp (a non-positive value must still make one
+  attempt — clamping to zero attempts would silently no-op every cancel).
+
 ## [0.3.11] - 2026-08-23
 
 Patch release on top of 0.3.10: bug fixes reported within hours of the

@@ -450,6 +450,128 @@ class TestComfyuiPostJson(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("fetcher raised", body)
 
+    def test_retries_transient_refused_then_succeeds(self):
+        # First two attempts get ECONNREFUSED; third succeeds. With
+        # retries=3 we should observe 3 fetcher calls and ultimately
+        # return ok=True. Stubs the time.sleep so the test stays
+        # sub-second.
+        import unittest.mock as _mock
+        fetcher = (
+            _RecordingFetcher()
+            .expect((0, "", "refused"))
+            .expect((0, "", "refused"))
+            .expect((200, "ok", "success"))
+        )
+        with _mock.patch.object(routes.time, "sleep") as _sleep:
+            ok, body = routes._comfyui_post_json(
+                "http://x/y", {"x": 1}, fetcher=fetcher, retries=3,
+            )
+            # 2 backoffs between 3 attempts
+            self.assertEqual(_sleep.call_count, 2)
+        self.assertTrue(ok)
+        self.assertEqual(body, "ok")
+        self.assertEqual(len(fetcher.calls), 3)
+
+    def test_retries_unreachable_then_succeeds(self):
+        import unittest.mock as _mock
+        fetcher = (
+            _RecordingFetcher()
+            .expect((0, "", "unreachable"))
+            .expect((200, "ok", "success"))
+        )
+        with _mock.patch.object(routes.time, "sleep") as _sleep:
+            ok, body = routes._comfyui_post_json(
+                "http://x/y", {"x": 1}, fetcher=fetcher, retries=2,
+            )
+            self.assertEqual(_sleep.call_count, 1)
+        self.assertTrue(ok)
+        self.assertEqual(len(fetcher.calls), 2)
+
+    def test_does_not_retry_5xx(self):
+        # 503 is 'http_error', not transient — must NOT retry, even
+        # when retries > 1.
+        fetcher = _RecordingFetcher().expect((503, "", "http_error"))
+        ok, body = routes._comfyui_post_json(
+            "http://x/y", {"x": 1}, fetcher=fetcher, retries=5,
+        )
+        self.assertFalse(ok)
+        self.assertIn("HTTP 503", body)
+        self.assertEqual(len(fetcher.calls), 1)
+
+    def test_does_not_retry_timeout(self):
+        # Timeout is already treated as assumed success; retrying
+        # would mask the success case.
+        fetcher = _RecordingFetcher().expect((0, "", "timeout"))
+        ok, body = routes._comfyui_post_json(
+            "http://x/y", {"x": 1}, fetcher=fetcher, retries=5,
+        )
+        self.assertTrue(ok)
+        self.assertEqual(len(fetcher.calls), 1)
+
+    def test_gives_up_after_max_attempts(self):
+        import unittest.mock as _mock
+        fetcher = _RecordingFetcher()
+        for _ in range(3):
+            fetcher.expect((0, "", "refused"))
+        with _mock.patch.object(routes.time, "sleep") as _sleep:
+            ok, body = routes._comfyui_post_json(
+                "http://x/y", {"x": 1}, fetcher=fetcher, retries=3,
+            )
+            self.assertEqual(_sleep.call_count, 2)
+        self.assertFalse(ok)
+        self.assertEqual(len(fetcher.calls), 3)
+        self.assertIn("HTTP 0", body)
+
+    def test_default_retries_one_is_single_attempt(self):
+        # Backwards-compat: callers that don't pass retries must
+        # still get exactly one attempt and zero backoff sleeps.
+        import unittest.mock as _mock
+        fetcher = _RecordingFetcher().expect((0, "", "refused"))
+        with _mock.patch.object(routes.time, "sleep") as _sleep:
+            ok, _body = routes._comfyui_post_json(
+                "http://x/y", {"x": 1}, fetcher=fetcher,
+            )
+            self.assertEqual(_sleep.call_count, 0)
+        self.assertFalse(ok)
+        self.assertEqual(len(fetcher.calls), 1)
+
+    def test_retries_clamped_to_at_least_one(self):
+        # retries is the TOTAL attempt count, so 0 and negatives must
+        # clamp to a single attempt rather than skipping the call
+        # entirely (which would silently no-op every cancel).
+        import unittest.mock as _mock
+        for bad in (0, -1, -7):
+            with self.subTest(retries=bad):
+                fetcher = _RecordingFetcher().expect((0, "", "refused"))
+                with _mock.patch.object(routes.time, "sleep") as _sleep:
+                    ok, body = routes._comfyui_post_json(
+                        "http://x/y", {"x": 1}, fetcher=fetcher, retries=bad,
+                    )
+                    self.assertEqual(_sleep.call_count, 0)
+                self.assertFalse(ok)
+                self.assertIn("HTTP 0", body)
+                self.assertEqual(len(fetcher.calls), 1)
+
+    def test_mixed_transient_then_permanent_stops_early(self):
+        # A transient failure followed by a real 5xx must stop right
+        # there — no point burning the remaining retry budget on a
+        # server that is explicitly rejecting us.
+        import unittest.mock as _mock
+        fetcher = (
+            _RecordingFetcher()
+            .expect((0, "", "refused"))
+            .expect((500, "", "http_error"))
+            .expect((200, "ok", "success"))  # must never be reached
+        )
+        with _mock.patch.object(routes.time, "sleep") as _sleep:
+            ok, body = routes._comfyui_post_json(
+                "http://x/y", {"x": 1}, fetcher=fetcher, retries=3,
+            )
+            self.assertEqual(_sleep.call_count, 1)
+        self.assertFalse(ok)
+        self.assertIn("HTTP 500", body)
+        self.assertEqual(len(fetcher.calls), 2)
+
 
 # ---------------------------------------------------------------------
 # routes.pause_all_handler — the user-facing endpoint.
@@ -481,9 +603,17 @@ class TestPauseAllCancelsQueue(unittest.TestCase):
         original = routes._cancel_comfyui_queue
         captured = {}
 
-        def fake_cancel(in_flight, comfyui_url, *, fetcher=None):
+        def fake_cancel(
+            in_flight, comfyui_url, *, fetcher=None,
+            delete_retries=1, interrupt_retries=1,
+        ):
+            # Forward the retry kwargs so the wrapped call matches the
+            # production signature (the handler passes retries=3 since
+            # v0.3.11).
             cancelled, errors, msgs = original(
                 in_flight, comfyui_url, fetcher=self.fetcher,
+                delete_retries=delete_retries,
+                interrupt_retries=interrupt_retries,
             )
             captured["url"] = comfyui_url
             captured["in_flight"] = in_flight

@@ -68,6 +68,13 @@ def try_install() -> bool:
     Returns True on success (or already-installed), False on soft failure
     (e.g. PromptServer not ready yet, aiohttp missing). Never raises on
     expected startup-time failures -- ComfyUI is still booting.
+
+    Each soft-failure branch logs a warning so operators can tell
+    "ComfyUI hasn't finished booting yet" (normal) apart from "the
+    plugin is broken" (real problem). Without these, an early-time
+    fail used to silently no-op and only surface when /api/schedule/*
+    returned 404 — confusing because routes that exist in source
+    should always be live once ComfyUI finishes bootstrap.
     """
     global _installed, _scheduler_thread
     if _installed:
@@ -119,17 +126,49 @@ def try_install() -> bool:
         db.set_state("paused", "1")
 
     # 4) Wire HTTP routes. Lazy import inside setup_routes handles missing
-    #    aiohttp / server.PromptServer gracefully.
+    #    aiohttp / server.PromptServer gracefully. It returns False instead
+    #    of raising when PromptServer isn't built yet, so handle the bool —
+    #    otherwise a not-ready server looks identical to a live one.
     interceptor = prompt_interceptor.PromptInterceptor(db)
-    routes.setup_routes(db, interceptor)
+    try:
+        routes_ok = routes.setup_routes(db, interceptor)
+    except Exception:
+        routes_ok = False
+        log.warning(
+            "[ScheduledQueue] route registration raised:\n%s",
+            traceback.format_exc(),
+        )
+    if not routes_ok:
+        log.warning(
+            "[ScheduledQueue] HTTP routes were NOT registered "
+            "(PromptServer not built yet, or aiohttp missing); "
+            "/api/schedule/* will 404. The scheduler thread still starts "
+            "so already-scheduled jobs keep dispatching."
+        )
 
     # 5) Background scheduler thread (daemon, dies with ComfyUI).
+    #    Started regardless of `routes_ok`: dispatch is independent of the
+    #    HTTP surface, and skipping the thread on a not-yet-ready
+    #    PromptServer would silently strand every scheduled job.
     _scheduler_thread = scheduler.SchedulerThread(db)
-    _scheduler_thread.start()
+    try:
+        _scheduler_thread.start()
+    except Exception:
+        log.warning(
+            "[ScheduledQueue] scheduler thread start failed:\n%s",
+            traceback.format_exc(),
+        )
+        return False
 
     atexit.register(_scheduler_thread.stop)
 
-    print(f"[ScheduledQueue] Stage 3 initialised. db={db.db_path}")
+    if routes_ok:
+        print(f"[ScheduledQueue] Stage 3 initialised. db={db.db_path}")
+    else:
+        print(
+            f"[ScheduledQueue] scheduler running WITHOUT HTTP routes; "
+            f"reload ComfyUI to retry registration. db={db.db_path}"
+        )
     _installed = True
     return True
 
@@ -138,9 +177,12 @@ def try_install() -> bool:
 # ComfyUI import-time hook.
 #
 # When custom_nodes are imported, ComfyUI has not yet built PromptServer.
-# We try once; on failure we silently exit. The plugin self-registers via
-# the loader's known sentinel ``try_install`` function so tests and
-# external bootstrap can call it later. We do NOT print noisy warnings on
-# the first import -- that's the expected path.
+# We try once; if PromptServer isn't ready, setup_routes() returns False,
+# we log one warning and leave the scheduler thread running (see step 4/5
+# above). The plugin self-registers via the loader's known sentinel
+# ``try_install`` function so tests and external bootstrap can call it
+# later. We deliberately do NOT print a stack trace or take the process
+# down on this path -- a not-yet-built PromptServer is an expected
+# startup state, not an error.
 # ------------------------------------------------------------------
 try_install()

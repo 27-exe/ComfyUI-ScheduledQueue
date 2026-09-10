@@ -253,7 +253,16 @@ def _default_comfyui_fetcher(url, body, timeout):
         return 0, "", "unreachable"
 
 
-def _comfyui_post_json(url, body, *, fetcher=None, timeout=None):
+# Transient network kinds that warrant a retry (TCP RST, ECONNREFUSED,
+# DNS hiccup). 'timeout' is intentionally NOT here — it's already
+# treated as an assumed success downstream because ComfyUI most
+# likely processed the request before its read timed out. 'http_error'
+# is also NOT retried: a 4xx/5xx is ComfyUI explicitly rejecting us,
+# and blasting it 3× would just spam its log.
+_RETRYABLE_KINDS = frozenset({"refused", "unreachable"})
+
+
+def _comfyui_post_json(url, body, *, fetcher=None, timeout=None, retries=1):
     """POST *body* as JSON to *url*. Returns ``(ok, payload_or_err)``.
 
     ``ok`` is True on any 2xx response. 4xx / 5xx and "we never
@@ -273,21 +282,45 @@ def _comfyui_post_json(url, body, *, fetcher=None, timeout=None):
     [...]}`` which returns in <100ms) MUST pass a short timeout
     (≤5s) so a stuck / unresponsive ComfyUI cannot block the aiohttp
     worker for 30s.
+
+    ``retries`` (default 1) is the TOTAL number of attempts, not the
+    number of *extra* attempts. The default of 1 reproduces the
+    pre-fix behaviour exactly — one call, no sleep — so callers that
+    don't opt in pay nothing. Retries happen only on transient network
+    errors (``refused`` / ``unreachable``); a 4xx/5xx or a timeout
+    returns immediately without looping. Backoff is exponential
+    starting at 0.3s and sleeps only *between* attempts, so
+    ``retries=N`` sleeps ``N-1`` times (0.3 → 0.6 → 1.2 …). As a
+    result ``retries=3`` costs at most 0.9s of added latency.
     """
     payload = json.dumps(body).encode()
     do_fetch = fetcher if fetcher is not None else _default_comfyui_fetcher
     to = _COMFYUI_HTTP_TIMEOUT if timeout is None else float(timeout)
-    try:
-        status, text, kind = do_fetch(url, payload, to)
-    except Exception as exc:  # noqa: BLE001 — defensive, never raise from HTTP helper
-        return False, f"fetcher raised: {exc!r}"
-    if 200 <= status < 300:
-        return True, text
-    if kind == "timeout":
-        # Treat as success; the row is reclaimed by reconcile() if it
-        # wasn't actually accepted by ComfyUI.
-        return True, text or "timeout (assumed success)"
-    return False, f"HTTP {status}"
+    attempts = max(1, int(retries))
+    last_err = ""
+    for i in range(attempts):
+        try:
+            status, text, kind = do_fetch(url, payload, to)
+        except Exception as exc:  # noqa: BLE001 — defensive, never raise from HTTP helper
+            last_err = f"fetcher raised: {exc!r}"
+        else:
+            if 200 <= status < 300:
+                return True, text
+            if kind == "timeout":
+                # Treat as success; the row is reclaimed by reconcile()
+                # if it wasn't actually accepted by ComfyUI.
+                return True, text or "timeout (assumed success)"
+            last_err = f"HTTP {status}"
+            if kind not in _RETRYABLE_KINDS:
+                # 4xx/5xx or other non-retryable failure — don't waste
+                # time looping.
+                return False, last_err
+        # Retry path: only reachable on transient errors. Sleep only
+        # if another attempt will actually run.
+        if i + 1 < attempts:
+            backoff = 0.3 * (2 ** i)
+            time.sleep(backoff)
+    return False, last_err
 
 
 # Cap for the /queue {delete: [...]} HTTP call. /queue is a fast
@@ -367,6 +400,7 @@ def _reclaim_dispatched_snapshot(db, snapshot_ids):
 
 def _cancel_comfyui_queue(
     in_flight, comfyui_url, *, fetcher=None, queue_delete_timeout=_QUEUE_DELETE_TIMEOUT,
+    delete_retries=1, interrupt_retries=1,
 ):
     """Cancel every (job_id, prompt_id) in *in_flight* against ComfyUI.
 
@@ -382,13 +416,18 @@ def _cancel_comfyui_queue(
         returns in <100ms, so ``queue_delete_timeout`` defaults to 5s.
         A stuck ComfyUI MUST NOT block the aiohttp worker for the full
         30s default — pause-all must return promptly so the sidebar
-        doesn't appear frozen.
+        doesn't appear frozen. ``delete_retries`` (default 1; pause-all
+        passes 3) lets callers ask for exponential backoff on transient
+        network errors so a momentary TCP reset during a sampler step
+        doesn't get reported as ``HTTP 0`` to the sidebar.
       * ``running`` rows are interrupted one at a time via
         ``POST /interrupt {prompt_id: pid}`` (ComfyUI's interrupt
         endpoint only takes one id at a time). ``/interrupt`` waits
         for the currently-running sampling step to finish before
         returning, so it stays on the module-global 30s default; this
         is the case the long timeout was originally designed for.
+        ``interrupt_retries`` mirrors ``delete_retries`` for the same
+        reason.
 
     Returns ``(cancelled_count, error_count, error_messages)``:
       * ``cancelled_count`` — rows whose prompt_id ComfyUI acknowledged
@@ -431,6 +470,7 @@ def _cancel_comfyui_queue(
             {"delete": pending_ids},
             fetcher=fetcher,
             timeout=queue_delete_timeout,
+            retries=delete_retries,
         )
         if ok:
             # ComfyUI returns 200 with an empty body and no per-id
@@ -446,6 +486,7 @@ def _cancel_comfyui_queue(
         # module global 30s ceiling here.
         ok, info = _comfyui_post_json(
             base + "/interrupt", {"prompt_id": pid}, fetcher=fetcher,
+            retries=interrupt_retries,
         )
         if ok:
             cancelled += 1
@@ -1055,6 +1096,12 @@ def _pause_all_blocking(db, comfyui_url) -> "web.Response":  # type: ignore[name
     if dispatched_in_flight:
         cancelled_count, error_count, errors = _cancel_comfyui_queue(
             dispatched_in_flight, comfyui_url,
+            # Retry transient network errors (TCP reset during a
+            # sampler step) before reporting HTTP 0 to the sidebar.
+            # delete_retries=3 means 3 TOTAL attempts with at most 2
+            # backoff sleeps (0.3 + 0.6 = 0.9s); interrupt_retries=3
+            # is the same posture for the per-prompt /interrupt calls.
+            delete_retries=3, interrupt_retries=3,
         )
         if error_count:
             _log.warning(
@@ -1146,6 +1193,11 @@ def _pause_running_all_blocking(db, comfyui_url) -> "web.Response":  # type: ign
     if running_in_flight:
         cancelled_count, error_count, errors = _cancel_comfyui_queue(
             running_in_flight, comfyui_url,
+            # Same retry posture as pause_all: 3 attempts on transient
+            # network errors. /interrupt may take up to a full sampling
+            # step (~30s ceiling) so the extra retry cost only matters
+            # on the failure path.
+            delete_retries=3, interrupt_retries=3,
         )
         if error_count:
             _log.warning(
@@ -1608,7 +1660,7 @@ _STATUS_IN_HISTORY = ("done", "failed")
 # Route registration
 # ---------------------------------------------------------------------------
 
-def setup_routes(db, interceptor=None) -> None:
+def setup_routes(db, interceptor=None) -> bool:
     """Register all /api/schedule/* endpoints on the running ComfyUI server.
 
     Spec section 5.1: PromptServer.instance must be touched INSIDE this
@@ -1618,6 +1670,14 @@ def setup_routes(db, interceptor=None) -> None:
     each handler can fetch it via request.app["sq_db"]. interceptor is
     accepted for forward-compatibility with Stage 2 (when prompt
     interception will be wired up); it's not used in Stage 1 handlers.
+
+    Returns ``True`` when every route was registered, ``False`` when we
+    could not register (aiohttp missing, or PromptServer not built yet).
+    Returning a bool — instead of the historical silent ``return`` — is
+    what lets ``try_install()`` tell "ComfyUI is still booting" apart
+    from "the plugin is actually live", instead of both looking like
+    success. This function stays silent on the not-ready path: that is
+    an expected startup state, and the caller owns the wording.
     """
     # Lazy imports — custom_nodes are imported BEFORE PromptServer is ready.
     # Reference the module-level `PromptServer` (not a fresh `from server import`)
@@ -1629,7 +1689,7 @@ def setup_routes(db, interceptor=None) -> None:
         _log.getLogger(__name__).warning(
             "[ScheduledQueue] aiohttp unavailable; routes not registered: %s", exc
         )
-        return
+        return False
     global PromptServer
     try:
         from server import PromptServer as _ServerPromptServer
@@ -1639,11 +1699,10 @@ def setup_routes(db, interceptor=None) -> None:
     server = PromptServer.instance
     if server is None:
         # PromptServer hasn't been built yet (custom_node loads before
-        # ComfyUI bootstrap). Stay silent -- the ComfyUI loader will
-        # retry by re-importing our package only if it calls back into
-        # us. We expose try_install() for that purpose; tests/CI can also
-        # call it.
-        return
+        # ComfyUI bootstrap). Stay silent here -- the caller decides how
+        # to report it. We expose try_install() for the retry path;
+        # tests/CI can also call it.
+        return False
     # Spec §5.1: route via server.routes.app.router. In modern ComfyUI
     # `server.routes` is a RouteTableDef, so we accept both spellings —
     # `routes.app` if present (older custom_node convention), else fall
@@ -1678,6 +1737,8 @@ def setup_routes(db, interceptor=None) -> None:
     app.router.add_delete("/api/schedule/clear", clear_handler)
     app.router.add_post("/api/schedule/repeat/{job_id}", repeat_handler)
     app.router.add_get("/api/schedule/export/{job_id}", export_handler)
+
+    return True
 
 
 __all__ = [
