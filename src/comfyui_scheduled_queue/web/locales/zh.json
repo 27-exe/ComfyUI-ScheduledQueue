@@ -135,7 +135,7 @@
     "dialog.preset.5min": "5 分钟后",
     "dialog.preset.30min": "30 分钟后",
     "dialog.preset.2hours": "2 小时后",
-    "dialog.preset.tomorrow": "明天上午 9 点",
+    "dialog.preset.next7": "下一个 7 点",
 
     "dialog.delta.dec_1h": "-1 小时",
     "dialog.delta.dec_10m": "-10 分",

@@ -135,7 +135,7 @@
     "dialog.preset.5min": "in 5 min",
     "dialog.preset.30min": "in 30 min",
     "dialog.preset.2hours": "in 2 hours",
-    "dialog.preset.tomorrow": "tomorrow 9am",
+    "dialog.preset.next7": "next 7am",
 
     "dialog.delta.dec_1h": "-1h",
     "dialog.delta.dec_10m": "-10m",

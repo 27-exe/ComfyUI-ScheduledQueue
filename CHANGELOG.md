@@ -4,6 +4,50 @@ All notable changes to **ComfyUI-ScheduledQueue** are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.3.13] - 2026-09-11
+
+Schedule dialog polish: the morning preset now defaults to **07:00** instead of
+09:00, and the dialog **remembers the last submitted time slot and batch
+count**. Frontend-only change — no Python, no schema, no API change; a browser
+hard-refresh (Ctrl+Shift+R) is enough to pick it up.
+
+### Changed
+
+- **`next 7am` chip semantics: the next 07:00, not "tomorrow".** 00:00–06:59
+  → today 07:00; 07:00–23:59 → tomorrow 07:00. The chip is now powered by the
+  same `nextClockTime()` helper that the hand-typed-time restore path uses, so
+  a clicked chip and a hand-typed time can never disagree on what "next 7am"
+  means. DST-safe: the date is rolled forward and the clock re-applied rather
+  than adding a fixed 86400 s. Locale strings (`next 7am` / `下一个 7 点`)
+  and the i18n key (`dialog.preset.next7`, formerly `dialog.preset.tomorrow`)
+  were updated to match.
+- **The dialog remembers the last submitted slot and count.** Re-opening it
+  pre-selects the same preset and pre-fills `Count`, so repeat work ("every
+  evening: next 7am, 4 images") no longer needs re-entering. Stored in the
+  browser's `localStorage` under `sq.dialog-prefs`.
+  - Remembering a preset stores its **identity**, not a timestamp: absolute
+    presets are recomputed against the current clock, so "next 7am" can
+    never resolve to an already-past time.
+  - If the previous time was **typed by hand**, the saved wall-clock `HH:MM` is
+    re-applied to its next future occurrence — today when that time is still
+    ahead, otherwise tomorrow. DST-safe: the date is rolled forward and the
+    clock re-applied, rather than adding a fixed 86400 s.
+  - Hand-editing the time input clears the preset memory, since the intent
+    there is that specific clock time rather than the chip.
+  - Written **only after a confirmed 2xx**, so a failed submit cannot poison
+    the remembered values.
+
+### Tests
+
+- New `tests/test_dialog_prefs.js` (28 assertions). Unlike the existing
+  source-shape checks in `test_sidebar_actions.js`, this one *executes* the
+  shipped code: `nextClockTime`, `loadDialogPrefs` and `saveDialogPrefs` are
+  extracted from `sidebar_tab.js` by brace matching and run against a stubbed
+  `localStorage`. Covers the 07:00:00-exactly boundary (must roll to tomorrow,
+  never schedule the past), the 23:30 overnight-queue case, minute precision,
+  corrupt / array / primitive stored values, and a `localStorage` that throws
+  (Safari private mode / quota).
+
 ## [0.3.12] - 2026-09-11
 
 Patch release: HTTP-level robustness for `pause-all` / `pause-running-all`

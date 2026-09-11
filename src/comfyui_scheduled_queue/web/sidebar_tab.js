@@ -36,6 +36,54 @@ const TAB_ID = "scheduled-queue";
 
 const LS_LANG_KEY = "sq.lang";
 
+// Remembers the Schedule dialog's last-used time slot and batch count, so
+// repeat work ("every evening: next 7am, 4 images") opens pre-filled
+// instead of resetting to the 30 s default every time.
+//
+// We store the *preset identity* rather than an absolute timestamp. Absolute
+// presets are recomputed against the current clock at dialog-open time, so
+// "next 7am" always resolves to the next 07:00 instead of a stale date
+// that has already passed. When the user typed a time by hand there is no
+// chip to restore, so we fall back to the wall-clock HH:MM and re-apply it
+// to the next future occurrence of that time.
+//
+// Shape: { preset: <int>|null, hh: <0-23>, mm: <0-59>, count: <int> }
+const LS_DIALOG_PREFS_KEY = "sq.dialog-prefs";
+
+function loadDialogPrefs() {
+    try {
+        const raw = window.localStorage?.getItem(LS_DIALOG_PREFS_KEY);
+        if (!raw) return null;
+        const obj = JSON.parse(raw);
+        // Guard against a hand-edited / partially-written value: callers
+        // validate each field, so an array or primitive here is just noise.
+        if (!obj || typeof obj !== "object" || Array.isArray(obj)) return null;
+        return obj;
+    } catch (_e) {
+        return null;  // localStorage blocked (private mode) or corrupt JSON
+    }
+}
+
+function saveDialogPrefs(prefs) {
+    try {
+        window.localStorage?.setItem(LS_DIALOG_PREFS_KEY, JSON.stringify(prefs));
+    } catch (_e) { /* quota / private mode -- remembering is best-effort */ }
+}
+
+// Next future local timestamp whose wall clock reads hh:mm -- today when
+// that time is still ahead, otherwise tomorrow. We roll the *date* forward
+// and re-apply the clock instead of adding a fixed 86400 s so the result
+// stays correct across DST transitions.
+function nextClockTime(hh, mm, nowSec) {
+    const d = new Date(nowSec * 1000);
+    d.setHours(hh, mm, 0, 0);
+    if (Math.floor(d.getTime() / 1000) <= nowSec) {
+        d.setDate(d.getDate() + 1);
+        d.setHours(hh, mm, 0, 0);
+    }
+    return Math.floor(d.getTime() / 1000);
+}
+
 function detectInitialLang() {
     try {
         const stored = window.localStorage?.getItem(LS_LANG_KEY);
@@ -1523,12 +1571,17 @@ function openScheduleDialog() {
         { label: t("dialog.preset.30min", "in 30 min"), offset: 1800 },
         { label: t("dialog.preset.2hours", "in 2 hours"), offset: 7200 },
     ];
-    const tomorrow9 = (() => {
-        const d = new Date(Date.now() + 86400_000);
-        d.setHours(9, 0, 0, 0);
-        return Math.floor(d.getTime() / 1000);
-    })();
-    presets.push({ label: t("dialog.preset.tomorrow", "tomorrow 9am"), absolute: tomorrow9 });
+    // Absolute morning preset: the next local 07:00. Computed at dialog-open
+    // time so the chip always resolves to the *next* 07:00 rather than a
+    // stale date:
+    //   * 00:00–06:59 → today 07:00
+    //   * 07:00–23:59 → tomorrow 07:00
+    // We deliberately use the same "next future occurrence" rule as
+    // nextClockTime() so a restored hand-typed time and a restored preset
+    // share identical semantics: 07:00:00 exactly rolls to tomorrow, never
+    // the past. DST-safe because we re-apply HH:MM after rolling the date.
+    const next7 = nextClockTime(7, 0, now);
+    presets.push({ label: t("dialog.preset.next7", "next 7am"), absolute: next7 });
 
     const dlg = document.createElement("div");
     dlg.dataset.sqDialog = "1";
@@ -1538,10 +1591,33 @@ function openScheduleDialog() {
         display: flex; align-items: center; justify-content: center;
         font-family: system-ui, sans-serif;
     `;
+    // Restore the last-used slot / count (see LS_DIALOG_PREFS_KEY above).
+    // A restored preset is applied further down by clicking its chip, which
+    // also recomputes any absolute timestamp against the current clock. A
+    // restored hand-typed clock time has no chip, so it is re-applied at the
+    // same place -- after minWhenTs() is in scope.
+    const prefs = loadDialogPrefs();
+    const restoredPresetIdx = (prefs && Number.isInteger(prefs.preset)
+        && prefs.preset >= 0 && prefs.preset < presets.length)
+        ? prefs.preset
+        : null;
+    const restoredClock = (restoredPresetIdx === null && prefs
+        && Number.isInteger(prefs.hh) && prefs.hh >= 0 && prefs.hh <= 23
+        && Number.isInteger(prefs.mm) && prefs.mm >= 0 && prefs.mm <= 59)
+        ? { hh: prefs.hh, mm: prefs.mm }
+        : null;
+    const restoredCount = (prefs && Number.isInteger(prefs.count))
+        ? Math.max(1, Math.min(50, prefs.count))
+        : 1;
+    // Tracks which chip (if any) produced the submitted time. Hand-typing a
+    // time clears it so the next dialog falls back to the HH:MM path.
+    let lastPresetIdx = restoredPresetIdx;
+
     // Default timestamp used by both the three-section time picker and the
     // hidden Unix-seconds input. The latter exists only so submit() can post
     // an integer unix-seconds value to /api/schedule/add -- the user never
-    // touches it.
+    // touches it. A restored preset overrides this by clicking its chip
+    // below; until then this keeps the "30 s from now" behaviour.
     let currentWhenTs = now + 30;
 
     // Format an integer unix-seconds timestamp as local "YYYY-MM-DD HH:MM:SS".
@@ -1629,7 +1705,7 @@ function openScheduleDialog() {
 
             <div data-role="count-row" style="margin-top:6px;margin-bottom:14px;display:flex;gap:6px;align-items:center;">
                 <label style="opacity:.7;font-size:11px;">${escapeHtml(t("dialog.count_label", "Count:"))}</label>
-                <input data-role="count" type="number" min="1" max="50" value="1" style="width:60px;background:#222;color:#fff;border:1px solid #555;padding:4px;border-radius:3px;" />
+                <input data-role="count" type="number" min="1" max="50" value="${restoredCount}" style="width:60px;background:#222;color:#fff;border:1px solid #555;padding:4px;border-radius:3px;" />
                 <span style="opacity:.5;font-size:11px;">${escapeHtml(t("dialog.count_hint", "(1-50, repeat same workflow)"))}</span>
             </div>
 
@@ -1756,6 +1832,17 @@ function openScheduleDialog() {
                     return;
                 }
                 console.log("[ScheduledQueue] Added job(s):", data);
+                // Persist the slot + batch size so the next dialog opens
+                // pre-filled ("same time, same count"). Deliberately only
+                // after a confirmed 2xx, so a failed submit never poisons the
+                // remembered values.
+                const _whenDate = new Date(scheduledAt * 1000);
+                saveDialogPrefs({
+                    preset: lastPresetIdx,
+                    hh: _whenDate.getHours(),
+                    mm: _whenDate.getMinutes(),
+                    count: count,
+                });
                 closeDialog();
                 // Ask any open sidebar panel to refresh so the new job shows up
                 // immediately, without waiting for the next 5 s poll.
@@ -1853,6 +1940,10 @@ function openScheduleDialog() {
     // because silently rewriting what the user typed is more confusing
     // than refusing the bad value.
     whenDisplay.addEventListener("input", () => {
+        // Hand-editing the time means the user is no longer on a preset chip
+        // (note: programmatic refreshWhenDisplay() sets .value directly and
+        // does NOT fire this event, so it won't clobber the tracking).
+        lastPresetIdx = null;
         const text = whenDisplay.value;
         const parsed = parseWhen(text);
         if (Number.isFinite(parsed)) {
@@ -1881,11 +1972,14 @@ function openScheduleDialog() {
         btn.addEventListener("click", () => {
             const idx = parseInt(btn.dataset.preset, 10);
             const p = presets[idx];
+            // Remember which chip produced this time so the next dialog can
+            // re-open on the same slot (see LS_DIALOG_PREFS_KEY).
+            lastPresetIdx = idx;
             currentWhenTs = p.absolute !== undefined ? p.absolute : (now + p.offset);
             // Clamp: presets are computed at dialog-open time using `now`,
             // so they are guaranteed to be future-relative -- but if the
             // user leaves the dialog open for minutes before clicking a
-            // preset (e.g. "tomorrow 9am" after 9:01am), clamp keeps us
+            // preset (e.g. "next 7am" after 7:01am), clamp keeps us
             // safe.
             currentWhenTs = Math.max(currentWhenTs, minWhenTs());
             refreshWhenDisplay();
@@ -1898,9 +1992,28 @@ function openScheduleDialog() {
         });
     });
 
-    // Auto-select first preset (also drives initial display value)
-    const first = dlg.querySelector('[data-preset="0"]');
-    if (first) first.click();
+    // Auto-select: restore the remembered slot when we have one, else fall
+    // back to the first chip (30 s). This must run AFTER the handlers above
+    // are wired, because clicking a chip is what drives both the visible
+    // time input and the hidden unix-seconds input.
+    const firstPresetBtn = dlg.querySelector('[data-preset="0"]');
+    if (restoredPresetIdx !== null) {
+        const restoredBtn = dlg.querySelector(`[data-preset="${restoredPresetIdx}"]`);
+        // Fall back to the 30 s chip if the remembered index has no chip
+        // (e.g. the preset list shrank between releases).
+        if (restoredBtn) restoredBtn.click();
+        else if (firstPresetBtn) firstPresetBtn.click();
+    } else if (restoredClock) {
+        // Hand-typed slot: there is no chip to click, so re-apply the
+        // remembered HH:MM to its next future occurrence and render it.
+        currentWhenTs = Math.max(
+            nextClockTime(restoredClock.hh, restoredClock.mm, now),
+            minWhenTs(),
+        );
+        refreshWhenDisplay();
+    } else if (firstPresetBtn) {
+        firstPresetBtn.click();
+    }
 
     document.body.appendChild(dlg);
     return dlg;
