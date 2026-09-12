@@ -107,19 +107,56 @@ def _read_payload(arg):
     return {"prompt": obj}
 
 
+# Minimum seconds in the future a --in value must resolve to. Matches the
+# backend's `_MIN_SCHEDULE_OFFSET_SECONDS` (routes.py) and the frontend
+# `MIN_SCHEDULE_OFFSET` (sidebar_tab.js) so the three reject the same set
+# of past / sub-threshold inputs. Change this in all three places.
+MIN_SCHEDULE_OFFSET_SECONDS = 5
+
+
 def _parse_in(arg):
-    """Parse a duration string like '10m' / '2h' / '1d' / '30s' or absolute ISO timestamp."""
+    """Parse a duration string like '10m' / '2h' / '1d' / '30s' or absolute ISO timestamp.
+
+    The result must be at least MIN_SCHEDULE_OFFSET_SECONDS in the future;
+    past or sub-threshold inputs exit with rc=2 before reaching the HTTP
+    layer, saving a round-trip and giving the user an immediate, specific
+    error.
+    """
     s = arg.strip()
     if s and s[-1] in ("s", "m", "h", "d") and s[:-1].replace(".", "").isdigit():
         n = float(s[:-1])
         mult = {"s": 1, "m": 60, "h": 3600, "d": 86400}[s[-1]]
-        return time.time() + n * mult
-    try:
-        from datetime import datetime
-        return datetime.fromisoformat(s).timestamp()
-    except ValueError:
-        print(f"comfy-schedule: invalid --in value: {arg}", file=sys.stderr)
+        ts = time.time() + n * mult
+    else:
+        try:
+            from datetime import datetime
+            ts = datetime.fromisoformat(s).timestamp()
+        except ValueError:
+            print(f"comfy-schedule: invalid --in value: {arg}", file=sys.stderr)
+            sys.exit(2)
+    # Future-only guard. We do this *after* parsing so the error message
+    # can echo back the original argument and the resolved local time.
+    now = time.time()
+    if ts <= now:
+        from datetime import datetime as _dt
+        local = _dt.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
+        print(
+            f"comfy-schedule: --in value {arg!r} is in the past "
+            f"(resolved to local {local}, now is "
+            f"{_dt.fromtimestamp(now).strftime('%Y-%m-%d %H:%M:%S')}). "
+            f"Use a future time.",
+            file=sys.stderr,
+        )
         sys.exit(2)
+    if ts < now + MIN_SCHEDULE_OFFSET_SECONDS:
+        print(
+            f"comfy-schedule: --in value {arg!r} is too close to now "
+            f"({ts - now:+.1f}s, minimum is "
+            f"{MIN_SCHEDULE_OFFSET_SECONDS}s). Add a little buffer.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    return ts
 
 
 def cmd_add(args):
@@ -244,7 +281,10 @@ def main():
 
     p_add = sub.add_parser("add", help="add a new scheduled job")
     p_add.add_argument("workflow", help="path to workflow JSON file, or '-' for stdin")
-    p_add.add_argument("--in", dest="in_", required=True, help="when to run: '10m', '2h', '1d', or ISO timestamp")
+    p_add.add_argument("--in", dest="in_", required=True,
+                       help="when to run: '10m', '2h', '1d', '30s', or an ISO "
+                            "timestamp ('2026-09-12T07:00:00'). Must resolve to "
+                            f"the future (>= {MIN_SCHEDULE_OFFSET_SECONDS}s from now)")
     p_add.add_argument("--note", help="free-form note")
     p_add.add_argument("--priority", type=int, help="priority (higher = sooner)")
     p_add.add_argument("--client-id", dest="client_id", help="ComfyUI client_id")
@@ -256,7 +296,9 @@ def main():
 
     p_update = sub.add_parser("update", help="patch a job")
     p_update.add_argument("job_id")
-    p_update.add_argument("--in", dest="in_", help="reschedule to a new time")
+    p_update.add_argument("--in", dest="in_",
+                          help="reschedule to a new time (same formats as 'add'; "
+                               f"must be >= {MIN_SCHEDULE_OFFSET_SECONDS}s in the future)")
     p_update.add_argument("--priority", type=int, help="new priority")
     p_update.add_argument("--note", help="new note")
     p_update.add_argument("--auto-retry", dest="auto_retry", type=int, help="0 or 1")

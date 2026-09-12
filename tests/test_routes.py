@@ -7,6 +7,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -44,7 +45,23 @@ class _StubRequest:
 
 
 def _run(coro):
-    return asyncio.get_event_loop().run_until_complete(coro)
+    # asyncio.run() (vs the deprecated asyncio.get_event_loop() +
+    # run_until_complete() that used to be here) creates and tears down a
+    # private loop per call, which keeps the test runner -- and other test
+    # modules in the suite -- from getting poisoned by leftover events.
+    # On Python 3.12+ get_event_loop() raises "There is no current event
+    # loop" in the main thread, which used to cause ~33 cross-file
+    # failures here.
+    return asyncio.run(coro)
+
+
+# Fixture helper: every HTTP-layer test should use a *future* scheduled_at
+# so the production `_check_future_scheduled_at` guard accepts it. We use
+# `time.time()` per call rather than a module constant so a slow test that
+# spans a minute boundary still passes the >= now+5 check.
+def _future_scheduled_at(offset_seconds=3600):
+    """Return a unix-seconds timestamp safely in the future for HTTP tests."""
+    return time.time() + offset_seconds
 
 
 class TestRoutes(unittest.TestCase):
@@ -200,10 +217,13 @@ class TestRoutes(unittest.TestCase):
     # ------------------------------------------------------------------
 
     def test_add_batch_with_multiple_items(self):
+        # Freeze the timestamps once so the request body and the assertion
+        # see byte-identical values (`time.time()` advances between calls).
+        ts0, ts1, ts2 = _future_scheduled_at(100), _future_scheduled_at(200), _future_scheduled_at(300)
         items = [
-            {"payload": {"i": 0}, "scheduled_at": 100.0, "priority": 5},
-            {"payload": {"i": 1}, "scheduled_at": 200.0, "priority": 7},
-            {"payload": {"i": 2}, "scheduled_at": 300.0, "priority": 9},
+            {"payload": {"i": 0}, "scheduled_at": ts0, "priority": 5},
+            {"payload": {"i": 1}, "scheduled_at": ts1, "priority": 7},
+            {"payload": {"i": 2}, "scheduled_at": ts2, "priority": 9},
         ]
         resp = _run(self._routes.add_batch_handler(_StubRequest(
             app=self.app, json_body={"items": items},
@@ -213,14 +233,14 @@ class TestRoutes(unittest.TestCase):
         self.assertEqual(body["count"], 3)
         self.assertEqual(len(body["added"]), 3)
         self.assertEqual({row["scheduled_at"] for row in body["added"]},
-                         {100.0, 200.0, 300.0})
+                         {ts0, ts1, ts2})
         # rows are real — fetch by id
         for row in body["added"]:
             self.assertIsNotNone(self.db.get_job(row["id"]))
 
     def test_add_batch_rejects_over_50_items(self):
         items = [
-            {"payload": {"i": i}, "scheduled_at": 100.0 + i}
+            {"payload": {"i": i}, "scheduled_at": _future_scheduled_at(100 + i)}
             for i in range(51)
         ]
         resp = _run(self._routes.add_batch_handler(_StubRequest(
@@ -429,6 +449,82 @@ class TestRoutes(unittest.TestCase):
             claimed.append(json.loads(row["payload"])["name"])
         self.assertEqual(claimed, ["high", "mid", "low"])
 
+    # ------------------------------------------------------------------
+    # v0.3.14: future-only guard on scheduled_at across /add, /add-batch
+    # and /update. See _MIN_SCHEDULE_OFFSET_SECONDS in routes.py.
+    # ------------------------------------------------------------------
+
+    def _add_body(self, scheduled_at, **extra):
+        body = {"payload": {"x": 1}, "scheduled_at": scheduled_at}
+        body.update(extra)
+        return body
+
+    def test_add_rejects_past_scheduled_at(self):
+        # Clearly in the past -- the year 2000 is well below `time.time()`
+        # by 25+ years so there is no flakiness from clock skew.
+        resp = _run(self._routes.add_handler(_StubRequest(
+            app=self.app, json_body=self._add_body(946684800.0),  # 2000-01-01
+        )))
+        self.assertEqual(resp.status, 400)
+        self.assertIn("future", resp.body.decode("utf-8", "replace"))
+
+    def test_add_rejects_subthreshold_scheduled_at(self):
+        # now + 2s -- below the 5s minimum that the UI already enforces.
+        resp = _run(self._routes.add_handler(_StubRequest(
+            app=self.app, json_body=self._add_body(time.time() + 2),
+        )))
+        self.assertEqual(resp.status, 400)
+        self.assertIn("5 seconds", resp.body.decode("utf-8", "replace"))
+
+    def test_add_accepts_just_above_threshold(self):
+        # now + 6s -- one second above the 5s floor. A slow CI tick could
+        # push this below the threshold mid-test, so pad to now+10.
+        resp = _run(self._routes.add_handler(_StubRequest(
+            app=self.app, json_body=self._add_body(time.time() + 10),
+        )))
+        self.assertEqual(resp.status, 201)
+
+    def test_add_batch_skips_past_items(self):
+        # Per-item validation: a past-time item is silently dropped, the
+        # future-time siblings still land.
+        items = [
+            {"payload": {"i": 0}, "scheduled_at": _future_scheduled_at(60)},
+            {"payload": {"i": 1}, "scheduled_at": 946684800.0},  # year 2000
+            {"payload": {"i": 2}, "scheduled_at": _future_scheduled_at(120)},
+        ]
+        resp = _run(self._routes.add_batch_handler(_StubRequest(
+            app=self.app, json_body={"items": items},
+        )))
+        self.assertEqual(resp.status, 201)
+        body = json.loads(resp.body)
+        self.assertEqual(body["count"], 2)
+        self.assertEqual(len(body["added"]), 2)
+
+    def test_update_rejects_past_scheduled_at(self):
+        # Set up a real scheduled job first (using the helper), then try
+        # to reschedule it to the past.
+        ts = _future_scheduled_at(3600)
+        resp = _run(self._routes.add_handler(_StubRequest(
+            app=self.app, json_body=self._add_body(ts, note="resched-me"),
+        )))
+        self.assertEqual(resp.status, 201)
+        job_id = json.loads(resp.body)["id"]
+
+        # Reschedule to a past timestamp -- must be rejected.
+        resp = _run(self._routes.update_handler(_StubRequest(
+            app=self.app,
+            match_info={"job_id": job_id},
+            json_body={"scheduled_at": 946684800.0},
+        )))
+        self.assertEqual(resp.status, 400)
+        self.assertIn("future", resp.body.decode("utf-8", "replace"))
+
+        # And the job's scheduled_at must NOT have been changed by the
+        # rejected request (defence-in-depth against partial writes).
+        current = self.db.get_job(job_id)
+        assert current is not None  # we just created it
+        self.assertEqual(current["scheduled_at"], ts)
+
 
 # ---------------------------------------------------------------------------
 # v0.3.10: workflow_title exposed through the HTTP layer.
@@ -467,7 +563,7 @@ class TestWorkflowTitleRoutes(unittest.TestCase):
             app=self.app,
             json_body={
                 "payload": {"x": 1},
-                "scheduled_at": 100.0,
+                "scheduled_at": _future_scheduled_at(100),
                 "workflow_title": "My Workflow",
             },
         )))
@@ -480,7 +576,7 @@ class TestWorkflowTitleRoutes(unittest.TestCase):
         # No workflow_title in body -> stored as blank, not crashing.
         resp = _run(self._routes.add_handler(_StubRequest(
             app=self.app,
-            json_body={"payload": {"x": 1}, "scheduled_at": 100.0},
+            json_body={"payload": {"x": 1}, "scheduled_at": _future_scheduled_at(100)},
         )))
         self.assertEqual(resp.status, 201)
         jid = json.loads(resp.body)["id"]
@@ -491,7 +587,7 @@ class TestWorkflowTitleRoutes(unittest.TestCase):
             app=self.app,
             json_body={
                 "payload": {"x": 1},
-                "scheduled_at": 100.0,
+                "scheduled_at": _future_scheduled_at(100),
                 "workflow_title": 12345,  # int, not str
             },
         )))
@@ -504,7 +600,7 @@ class TestWorkflowTitleRoutes(unittest.TestCase):
             app=self.app,
             json_body={
                 "payload": {"x": 1},
-                "scheduled_at": 100.0,
+                "scheduled_at": _future_scheduled_at(100),
                 "workflow_title": None,
             },
         )))
@@ -516,10 +612,10 @@ class TestWorkflowTitleRoutes(unittest.TestCase):
 
     def test_list_exposes_workflow_title_without_payload(self):
         # Add three jobs with different titles.
-        a_body = {"payload": {"x": 1}, "scheduled_at": 100.0,
+        a_body = {"payload": {"x": 1}, "scheduled_at": _future_scheduled_at(100),
                   "workflow_title": "Alpha"}
-        b_body = {"payload": {"x": 2}, "scheduled_at": 200.0}
-        c_body = {"payload": {"x": 3}, "scheduled_at": 300.0,
+        b_body = {"payload": {"x": 2}, "scheduled_at": _future_scheduled_at(200)}
+        c_body = {"payload": {"x": 3}, "scheduled_at": _future_scheduled_at(300),
                   "workflow_title": ""}
         for body in (a_body, b_body, c_body):
             r = _run(self._routes.add_handler(_StubRequest(
@@ -556,7 +652,7 @@ class TestWorkflowTitleRoutes(unittest.TestCase):
             app=self.app,
             json_body={
                 "payload": {"k": "v"},
-                "scheduled_at": 100.0,
+                "scheduled_at": _future_scheduled_at(100),
                 "workflow_title": "Detail Title",
             },
         )))
@@ -576,7 +672,7 @@ class TestWorkflowTitleRoutes(unittest.TestCase):
             app=self.app,
             json_body={
                 "payload": {"k": "v"},
-                "scheduled_at": 100.0,
+                "scheduled_at": _future_scheduled_at(100),
                 "workflow_title": "History Title",
             },
         )))
@@ -598,7 +694,7 @@ class TestWorkflowTitleRoutes(unittest.TestCase):
             app=self.app,
             json_body={
                 "payload": {"x": 1},
-                "scheduled_at": 100.0,
+                "scheduled_at": _future_scheduled_at(100),
                 "workflow_title": "Original",
             },
         )))
@@ -619,7 +715,7 @@ class TestWorkflowTitleRoutes(unittest.TestCase):
             app=self.app,
             json_body={
                 "payload": {"x": 1},
-                "scheduled_at": 100.0,
+                "scheduled_at": _future_scheduled_at(100),
                 "workflow_title": "Will be cleared",
             },
         )))
@@ -636,7 +732,7 @@ class TestWorkflowTitleRoutes(unittest.TestCase):
     def test_update_rejects_non_string_workflow_title(self):
         r = _run(self._routes.add_handler(_StubRequest(
             app=self.app,
-            json_body={"payload": {"x": 1}, "scheduled_at": 100.0},
+            json_body={"payload": {"x": 1}, "scheduled_at": _future_scheduled_at(100)},
         )))
         jid = json.loads(r.body)["id"]
 
@@ -653,7 +749,7 @@ class TestWorkflowTitleRoutes(unittest.TestCase):
         # unknown-field guard together with note.
         r = _run(self._routes.add_handler(_StubRequest(
             app=self.app,
-            json_body={"payload": {"x": 1}, "scheduled_at": 100.0},
+            json_body={"payload": {"x": 1}, "scheduled_at": _future_scheduled_at(100)},
         )))
         jid = json.loads(r.body)["id"]
 
@@ -671,9 +767,9 @@ class TestWorkflowTitleRoutes(unittest.TestCase):
 
     def test_add_batch_per_item_workflow_title(self):
         items = [
-            {"payload": {"i": 0}, "scheduled_at": 100.0, "workflow_title": "Zero"},
-            {"payload": {"i": 1}, "scheduled_at": 200.0, "workflow_title": "One"},
-            {"payload": {"i": 2}, "scheduled_at": 300.0},  # no title
+            {"payload": {"i": 0}, "scheduled_at": _future_scheduled_at(100), "workflow_title": "Zero"},
+            {"payload": {"i": 1}, "scheduled_at": _future_scheduled_at(200), "workflow_title": "One"},
+            {"payload": {"i": 2}, "scheduled_at": _future_scheduled_at(300)},  # no title
         ]
         resp = _run(self._routes.add_batch_handler(_StubRequest(
             app=self.app, json_body={"items": items},
@@ -690,8 +786,8 @@ class TestWorkflowTitleRoutes(unittest.TestCase):
         # Per-item validation: a bad workflow_title in one item must not
         # poison the rest of the batch.
         items = [
-            {"payload": {"i": 0}, "scheduled_at": 100.0, "workflow_title": 99},
-            {"payload": {"i": 1}, "scheduled_at": 200.0, "workflow_title": "OK"},
+            {"payload": {"i": 0}, "scheduled_at": _future_scheduled_at(100), "workflow_title": 99},
+            {"payload": {"i": 1}, "scheduled_at": _future_scheduled_at(200), "workflow_title": "OK"},
         ]
         resp = _run(self._routes.add_batch_handler(_StubRequest(
             app=self.app, json_body={"items": items},
@@ -714,7 +810,7 @@ class TestWorkflowTitleRoutes(unittest.TestCase):
             app=self.app,
             json_body={
                 "payload": {"x": 1},
-                "scheduled_at": 100.0,
+                "scheduled_at": _future_scheduled_at(100),
                 "workflow_title": "Repeat Me",
             },
         )))

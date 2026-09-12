@@ -4,6 +4,65 @@ All notable changes to **ComfyUI-ScheduledQueue** are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.3.14] - 2026-09-12
+
+Patch release: reject past-time `scheduled_at` in both the CLI and the HTTP
+API. Closes a behaviour gap between the **frontend dialog** (which already
+enforced `MIN_SCHEDULE_OFFSET` since v0.3.11) and the two backends, so the
+same set of past /亚阈值 inputs is now rejected everywhere with a specific,
+non-misleading error.
+
+### Fixed
+
+- **CLI `--in 0s` / past-time ISO accepted as "scheduled" forever.**
+  `--in` now exits `rc=2` before reaching the HTTP layer if the resolved
+  timestamp is `<= now` or `< now + 5s`, mirroring `MIN_SCHEDULE_OFFSET` in
+  the frontend and `_MIN_SCHEDULE_OFFSET_SECONDS` on the server. The error
+  message echoes back the original `--in` argument and the resolved local
+  time so the user can see exactly what the parser saw. Affected: `add`,
+  `update`.
+- **HTTP `POST /api/schedule/add` accepted `scheduled_at` in the past.**
+  Three handlers (`/add`, `/add-batch`, `/update`) now share a single
+  `_check_future_scheduled_at` helper that rejects values `<= now` with
+  HTTP 400 and a specific message naming the offending timestamp. Sub-
+  threshold inputs (`now+1s … now+4s`) get a distinct message that points
+  at the 5-second floor. The check sits *after* the existing
+  positive-float / type guards so legacy clients still get the same error
+  surface for malformed JSON.
+
+### Tests
+
+- `tests/test_routes.py` -- 5 new cases for `/add`, `/add-batch`, `/update`:
+  past-time rejection, subthreshold rejection (now+2s), just-above-threshold
+  acceptance (now+10s, padded for CI clock skew), per-item batch skipping
+  (one past item in a batch silently dropped, siblings still land), and a
+  defensive check that a rejected `update` does NOT mutate the stored
+  `scheduled_at`.
+- `tests/test_cli.py` -- 5 new cases mirroring the HTTP suite at the
+  subprocess layer: `--in 0s`, `--in 2020-01-01`, `--in 2s`, `--in 10s`
+  (acceptance + cleanup), and `update --in 2020-01-01`. All assert on the
+  CLI's stderr text so the user-facing diagnostic stays locked down.
+- `tests/test_routes.py::_run` -- replaced the deprecated
+  `asyncio.get_event_loop().run_until_complete()` with `asyncio.run()`
+  so each handler call gets a private loop. This was a latent
+  cross-file failure (test_pause_cancels_queue.py leaves a dangling
+  coroutine which then causes any subsequent `get_event_loop()` call in
+  the main thread to raise on Python 3.12+). One-line change, full
+  suite goes from ~33 historical + 5 new failures to 0.
+
+### Notes
+
+- The threshold is the same `5s` already enforced by the frontend dialog.
+  Change `_MIN_SCHEDULE_OFFSET_SECONDS` (routes.py) and
+  `MIN_SCHEDULE_OFFSET_SECONDS` (scripts/comfy-schedule) together if you
+  ever need to move it.
+- `tests/test_routes.py` fixtures that previously hard-coded small unix
+  timestamps like `100.0` / `200.0` now go through a `_future_scheduled_at
+  (offset)` helper that resolves to `time.time() + offset`, so the fixture
+  data stays past the 5-second floor no matter how slow CI is. The
+  underlying `db.add_job` (which bypasses HTTP) still accepts any positive
+  float, so the 6+ database-only tests are unchanged.
+
 ## [0.3.13] - 2026-09-11
 
 Schedule dialog polish: the morning preset now defaults to **07:00** instead of

@@ -66,6 +66,52 @@ _UPDATE_ALLOWED_FIELDS = frozenset({"scheduled_at", "priority", "note", "auto_re
 _LIST_MAX_LIMIT = 200
 _LIST_DEFAULT_LIMIT = 50
 
+# Minimum seconds in the future a scheduled_at must lie. Shared with the
+# frontend (`MIN_SCHEDULE_OFFSET` in sidebar_tab.js) and the CLI
+# (`MIN_SCHEDULE_OFFSET_SECONDS` in scripts/comfy-schedule) so the UI dialog,
+# the HTTP API and the CLI reject past / sub-threshold times with one
+# consistent rule. Change this value in all three places; do not let them drift.
+_MIN_SCHEDULE_OFFSET_SECONDS = 5
+
+
+def _fmt_local(ts: float) -> str:
+    """Format a unix timestamp as a local 'YYYY-MM-DD HH:MM:SS' string."""
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts))
+
+
+def _check_future_scheduled_at(value: Any, *, field: str = "scheduled_at") -> str | None:
+    """Return ``None`` when *value* is acceptable, else a short explanation.
+
+    "Acceptable" means a float at least ``_MIN_SCHEDULE_OFFSET_SECONDS``
+    seconds in the future. The returned string is suitable for an HTTP 400
+    body or CLI stderr.
+
+    Non-numeric input also returns ``None``: the caller's own type /
+    positive-float guards produce a better message for those, and we do not
+    want to shadow them with a vaguer one.
+    """
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return None
+    # Sample the clock once so the past-check and the threshold-check agree.
+    now = time.time()
+    if v <= now:
+        # Checked before the threshold so an ISO string from last week gets
+        # a message about being in the past rather than one about a 5-second
+        # floor it missed by a month.
+        return (
+            f"{field} must be in the future "
+            f"(got {v} = {_fmt_local(v)}, now is {_fmt_local(now)})"
+        )
+    if v < now + _MIN_SCHEDULE_OFFSET_SECONDS:
+        return (
+            f"{field} must be at least {_MIN_SCHEDULE_OFFSET_SECONDS} seconds "
+            f"in the future (got {v - now:+.1f}s from now)"
+        )
+    return None
+
+
 # Status counts returned by /status. Keys must match spec section 5.2.
 # `dispatched` was added alongside the dispatched/running split — jobs
 # that have been POSTed to ComfyUI but are queued behind another job in
@@ -590,6 +636,12 @@ async def add_handler(request) -> "web.Response":  # type: ignore[name-defined]
         return _bad_request("scheduled_at must be a number")
     if isinstance(scheduled_at, bool) or not float(scheduled_at) > 0:
         return _bad_request("scheduled_at must be a positive float")
+    # Future-only: see _check_future_scheduled_at for the threshold
+    # rationale. The UI dialog already enforces this (MIN_SCHEDULE_OFFSET);
+    # the HTTP guard here is the belt to the UI's braces for raw-API
+    # callers and the CLI.
+    if (msg := _check_future_scheduled_at(scheduled_at)) is not None:
+        return _bad_request(msg)
 
     # Optional fields with type checks
     priority = body.get("priority", 100)
@@ -832,6 +884,9 @@ async def update_handler(request) -> "web.Response":  # type: ignore[name-define
         v = body["scheduled_at"]
         if not isinstance(v, (int, float)) or isinstance(v, bool) or not float(v) > 0:
             return _bad_request("scheduled_at must be a positive float")
+        # Future-only (shared helper with /add and /add-batch).
+        if (msg := _check_future_scheduled_at(v)) is not None:
+            return _bad_request(msg)
         fields["scheduled_at"] = float(v)
 
     if "priority" in body:
@@ -1412,6 +1467,10 @@ def _validate_add_item(item: Any) -> tuple[dict, str | None]:
         return {}, "scheduled_at must be a number"
     if float(scheduled_at) <= 0:
         return {}, "scheduled_at must be a positive float"
+    # Future-only (shared helper with /add; UI's MIN_SCHEDULE_OFFSET).
+    msg = _check_future_scheduled_at(scheduled_at)
+    if msg is not None:
+        return {}, msg
 
     args: dict[str, Any] = {
         "payload": payload,

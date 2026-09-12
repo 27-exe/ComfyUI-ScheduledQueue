@@ -174,6 +174,71 @@ class TestCli(unittest.TestCase):
         self.assertEqual(len(ids), 3)
         self.assertTrue(ids[0].startswith("j-"))
 
+    # ------------------------------------------------------------------
+    # v0.3.14: --in must resolve to the future (CLI-side guard so the
+    # user gets a specific error before the HTTP round-trip).
+    # ------------------------------------------------------------------
+
+    _WF = '{"3": {"class_type": "KSampler"}}'
+
+    def test_add_rejects_zero_seconds(self):
+        # --in 0s used to silently land a row in the DB that the scheduler
+        # would never dispatch. Now rejected at the CLI before the HTTP
+        # layer is touched.
+        rc, out, err = _run_cli(
+            "add", "-", "--in", "0s", stdin_data=self._WF,
+        )
+        self.assertEqual(rc, 2)
+        # Specific error message must include the offending value and a
+        # hint that points at past-time semantics.
+        self.assertIn("past", err)
+        self.assertIn("0s", err)
+
+    def test_add_rejects_past_iso_date(self):
+        # 2020-01-01 is 6 years in the past -- the CLI must reject it.
+        rc, _, err = _run_cli(
+            "add", "-", "--in", "2020-01-01", stdin_data=self._WF,
+        )
+        self.assertEqual(rc, 2)
+        self.assertIn("past", err)
+
+    def test_add_rejects_subthreshold_seconds(self):
+        # --in 2s is below the 5s floor that /add enforces (matched to
+        # the UI's MIN_SCHEDULE_OFFSET). Rejected.
+        rc, _, err = _run_cli(
+            "add", "-", "--in", "2s", stdin_data=self._WF,
+        )
+        self.assertEqual(rc, 2)
+        self.assertIn("minimum is", err)
+        self.assertIn("5s", err)
+
+    def test_add_accepts_just_above_threshold(self):
+        # --in 10s is well past the 5s floor.
+        rc, out, _ = _run_cli(
+            "add", "-", "--in", "10s", "--note", "threshold+",
+            stdin_data=self._WF,
+        )
+        self.assertEqual(rc, 0, out)
+        body = json.loads(out)
+        # Cleanup so the rest of the suite's "total counts" stays stable.
+        # `cancel` returns the job_id; we ignore the result.
+        _run_cli("cancel", body["id"])
+
+    def test_update_rejects_past_scheduled_at(self):
+        # Same guard via update: even if the row already exists, you
+        # cannot reschedule it to the past.
+        rc, out, _ = _run_cli(
+            "add", "-", "--in", "60s", stdin_data=self._WF,
+        )
+        self.assertEqual(rc, 0, out)
+        job_id = json.loads(out)["id"]
+        try:
+            rc, _, err = _run_cli("update", job_id, "--in", "2020-01-01")
+            self.assertEqual(rc, 2)
+            self.assertIn("past", err)
+        finally:
+            _run_cli("cancel", job_id)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
