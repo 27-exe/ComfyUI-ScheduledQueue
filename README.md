@@ -98,7 +98,7 @@ The topbar **Schedule** button (clock icon, left of Run) opens a modal for addin
 
 | Pain point | Solution | Where |
 |---|---|---|
-| I want the prompt to run when the GPU is idle but I don't want to leave my computer on at night | **Time-window scheduling** — any ISO or relative time (`--in 10m`, `--in 2h`, `tomorrow 9 am`) | `scheduler.tick()` → `claim_next_due_job()` |
+| I want the prompt to run when the GPU is idle but I don't want to leave my computer on at night | **Time-window scheduling** — any relative duration (`--in 10m`, `--in 2h`) or absolute ISO timestamp (`--in 2026-09-12T07:00:00`); always in the future | `scheduler.tick()` → `claim_next_due_job()` |
 | ComfyUI crashes / restarts lose the in-memory queue | **Persistence** — every job lands in `<ComfyUI>/user/scheduled_queue.sqlite3` (WAL mode) | `database.py` `ScheduledQueueDB` |
 | I want a batch of 50 but I don't want to click Run 50 times | **Repeat (Clear / Repeat / Batch add)** — `Count: N` submits 1–50 copies at once; the Repeat (↻) button clones a finished job in one click | `/api/schedule/add-batch`, Repeat button L542 |
 | 30 items in the queue, all I see is `KSampler-42`, I can't tell which one is from which batch | **Workflow naming (`workflow_title` from Pinia store)** — read at submit time from `app.extensionManager.workflow.activeWorkflow.filename`, persisted to the DB, shown in priority in the sidebar | `add` route L249, sidebar L561–L567 |
@@ -129,7 +129,7 @@ comfy-schedule resume     # default is paused on first boot
 echo '{"3": {"class_type": "KSampler", "inputs": {"seed": 42}}}' \
   | comfy-schedule add - --in 10m --note "morning batch"
 
-# add 5 copies of the same workflow (count 5 → /add-batch)
+# add from a file, with an explicit priority
 cat workflow.json | comfy-schedule add - --in 1h --priority 200
 
 # watch the queue
@@ -139,6 +139,12 @@ comfy-schedule watch --interval 2
 comfy-schedule cancel <job_id>
 comfy-schedule run-now <job_id>
 ```
+
+`--in` accepts a relative duration (`10m` / `2h` / `1d` / `30s`, decimals OK) or an
+absolute ISO timestamp, and **must resolve to the future** — anything `<= now + 5s`
+exits with `rc=2` before the HTTP call, so you never silently queue a job the
+scheduler will never dispatch. Subcommands: `status`, `list`, `add`, `cancel`,
+`update`, `pause`, `resume`, `orphans`, `run-now`, `watch`.
 
 In the UI: click the **clock icon** in the topbar → choose a preset → **Schedule**.
 

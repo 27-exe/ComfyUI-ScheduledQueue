@@ -354,39 +354,89 @@ CLI 完全等价于 HTTP API。装好后默认在 `~/.local/bin/comfy-schedule`:
 echo '{"3":{"class_type":"KSampler","inputs":{"seed":42}}}' \
   | comfy-schedule add - --in 10m --note "morning batch"
 
-# 加 5 份
-cat workflow.json | comfy-schedule add - --in 1h --count 5
+# 从文件加
+cat workflow.json | comfy-schedule add - --in 1h --priority 200
 
 # 列表
 comfy-schedule list
 comfy-schedule list --status scheduled
+comfy-schedule list --ids-only          # 只打印 job id, 方便管道
 
 # 状态
 comfy-schedule status
-# { "paused": false, "counts": {...}, "version": "0.3.10" }
+# { "paused": false, "last_dispatch_at": ..., "last_error": null, "counts": {...} }
 
-# 暂停 / 恢复
-comfy-schedule pause-all
-comfy-schedule resume-all
+# 暂停 / 恢复 (注意子命令是 pause / resume)
+comfy-schedule pause
+comfy-schedule resume
 
-# 立即跑 / 取消 / 复制
+# 上次 ComfyUI 崩溃遗留在途的任务
+comfy-schedule orphans
+
+# 立即跑 / 取消
 comfy-schedule run-now <job_id>
 comfy-schedule cancel <job_id>
-comfy-schedule repeat <job_id>
 
-# 编辑 (whitelist)
+# 编辑 (白名单: --in / --priority / --note / --auto-retry)
 comfy-schedule update <job_id> --priority 500
 comfy-schedule update <job_id> --in 30m --note "delay"
 
 # 持续观察
-comfy-schedule watch --interval 2
+comfy-schedule watch --interval 2 --seconds 60
 ```
 
-`comfy-schedule` 默认连 `http://127.0.0.1:8188`, 通过环境变量覆盖:
+子命令全集: `status` / `list` / `add` / `cancel` / `update` / `pause` /
+`resume` / `orphans` / `run-now` / `watch`。`comfy-schedule --help` 随时可查。
+
+> **批量添加**走 UI 的 `Count` 字段(走 `/api/schedule/add-batch`)。CLI 没有
+> `--count`;脚本化批量请直接 POST `/api/schedule/add-batch`,或循环调 `add`。
+
+### 8.1 `--in` 必须是未来的时间
+
+`--in` 接受两种写法:
+
+| 形式 | 例子 | 说明 |
+|---|---|---|
+| **相对时长** | `10m` / `2h` / `1d` / `30s` / `1.5h` | 后缀 `s`/`m`/`h`/`d`, 支持小数 |
+| **绝对时刻** | `2026-09-12T07:00:00` | `datetime.fromisoformat()` 支持的格式, 按**本地时间**解释 |
+
+**不接受自然语言** —— `tomorrow 9am` 会直接报错。想要「明早 7 点」这种语义,
+用 UI 的预设按钮,或自己算好 ISO 字符串。
+
+解析结果必须**至少比现在晚 5 秒**,否则 CLI 以 `rc=2` 退出, **不会发出 HTTP 请求**:
 
 ```bash
-export COMFYUI_HOST=http://127.0.0.1:8188
+$ comfy-schedule add workflow.json --in 0s
+comfy-schedule: --in value '0s' is in the past (resolved to local
+2026-09-12 16:58:03, now is 2026-09-12 16:58:03). Use a future time.
+
+$ comfy-schedule add workflow.json --in 2s
+comfy-schedule: --in value '2s' is too close to now (+2.0s, minimum is 5s).
+Add a little buffer.
+```
+
+这道 **5 秒门槛在三个地方同时生效**,值保持一致:UI 对话框 / HTTP API / CLI。
+过去时间的任务永远不会被调度器取走, 所以这里选择**直接拒绝**, 而不是静默
+接受一个「看起来成功、实际永不执行」的任务。
+
+**退出码**
+
+| 码 | 含义 |
+|---|---|
+| `0` | 成功 |
+| `1` | HTTP 错误 (服务端返回 4xx/5xx) |
+| `2` | 参数错误 (含上面两种时间错误、无法解析的 `--in`) |
+| `3` | 连不上 ComfyUI |
+
+`comfy-schedule` 默认连 `http://127.0.0.1:8188`, 用环境变量 `COMFYUI_URL`
+或 `--url` 覆盖:
+
+```bash
+export COMFYUI_URL=http://127.0.0.1:9999
 comfy-schedule status
+
+# 或每次都指定
+comfy-schedule --url http://127.0.0.1:9999 status
 ```
 
 ---

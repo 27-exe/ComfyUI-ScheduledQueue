@@ -98,7 +98,7 @@
 
 | 痛点 | 解决 | 代码位置 |
 |---|---|---|
-| 想让 prompt 在 GPU 空闲时才跑，又不想半夜开电脑 | **任务调度（时间窗）** —— 任意 ISO 或相对时间（`--in 10m`、`--in 2h`、`tomorrow 9 am`） | `scheduler.tick()` → `claim_next_due_job()` |
+| 想让 prompt 在 GPU 空闲时才跑，又不想半夜开电脑 | **任务调度（时间窗）** —— 任意相对时长（`--in 10m`、`--in 2h`）或绝对 ISO 时刻（`--in 2026-09-12T07:00:00`），且必须在未来 | `scheduler.tick()` → `claim_next_due_job()` |
 | ComfyUI 崩溃/重启会丢失内存中的队列 | **持久化** —— 每个任务都进 `<ComfyUI>/user/scheduled_queue.sqlite3`（WAL 模式） | `database.py` `ScheduledQueueDB` |
 | 想做 50 张批量，但不想点 50 次 Run | **重复任务（Clear / Repeat / Batch add）** —— `Count: N` 一次提交 1–50 份；Repeat（↻）一键克隆已完成任务 | `/api/schedule/add-batch`，Repeat 按钮 L542 |
 | 队列里 30 条任务，看到的是 `KSampler-42`，找不到第几条是哪批 | **工作流命名（`workflow_title` 来自 Pinia store）** —— 提交时从 `app.extensionManager.workflow.activeWorkflow.filename` 读取并落到数据库，侧栏优先显示它 | `add` route L249，sidebar L561–L567 |
@@ -129,7 +129,7 @@ comfy-schedule resume     # default is paused on first boot
 echo '{"3": {"class_type": "KSampler", "inputs": {"seed": 42}}}' \
   | comfy-schedule add - --in 10m --note "morning batch"
 
-# 加 5 份同一个 workflow（count 5 → /add-batch）
+# 从文件加，并指定优先级
 cat workflow.json | comfy-schedule add - --in 1h --priority 200
 
 # 持续观察队列
@@ -139,6 +139,11 @@ comfy-schedule watch --interval 2
 comfy-schedule cancel <job_id>
 comfy-schedule run-now <job_id>
 ```
+
+`--in` 接受相对时长（`10m` / `2h` / `1d` / `30s`，支持小数）或绝对 ISO 时刻，且
+**必须落在未来** —— 任何 `<= now + 5s` 的输入会以 `rc=2` 退出、不发 HTTP 请求，
+避免静默排入一个永远不会被调度的任务。子命令：`status`、`list`、`add`、`cancel`、
+`update`、`pause`、`resume`、`orphans`、`run-now`、`watch`。
 
 在 UI 里：点顶栏的 **时钟图标** → 选择预设 → **Schedule**。
 
