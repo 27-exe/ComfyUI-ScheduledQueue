@@ -38,10 +38,38 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import threading
 import time
 import urllib.error
 import urllib.request
 from typing import Any
+
+# ---------------------------------------------------------------------------
+# ComfyUI loads custom_nodes with the folder name as the dotted parent
+# (``ComfyUI-ScheduledQueue.routes``) and does NOT register sibling modules
+# under that parent, so a relative ``from .preflight import ...`` raises
+# ModuleNotFoundError. Wrapping that import in try/except silently disables
+# the pre-dispatch validator — the 2026-09-21 incident: the validator never
+# ran in production, and the unit tests only exercised the degraded path.
+# Self-load preflight under the loader's dotted name, mirroring
+# scheduler.py's workflow_format pattern.
+# ---------------------------------------------------------------------------
+import importlib.util as _il_util
+import os as _os
+import sys as _sys
+
+_pf_spec = _il_util.spec_from_file_location(
+    "ComfyUI-ScheduledQueue.preflight",
+    _os.path.join(_os.path.dirname(__file__), "preflight.py"),
+)
+if _pf_spec is None or _pf_spec.loader is None:
+    raise ImportError("[ScheduledQueue] cannot self-load preflight.py")
+_pf_mod = _il_util.module_from_spec(_pf_spec)
+_sys.modules.setdefault("ComfyUI-ScheduledQueue.preflight", _pf_mod)
+_pf_spec.loader.exec_module(_pf_mod)
+_preflight = _pf_mod.preflight
+_fetch_local_indexes = _pf_mod.fetch_local_indexes
+del _il_util, _os, _sys, _pf_spec, _pf_mod
 
 # NOTE: keep module imports minimal. aiohttp.web + server.PromptServer are
 # imported lazily inside setup_routes() and the handlers.
@@ -162,6 +190,153 @@ def _json_response(data: Any, status: int = 200):
         return web.json_response(data, status=status)
     except Exception:
         return _StubResponse(data, status)
+
+
+# ---------------------------------------------------------------------------
+# ComfyUI schema cache for preflight
+# ---------------------------------------------------------------------------
+#
+# The validator (see preflight.py) needs /object_info (node schemas) and the
+# on-disk model file index. Both are expensive to fetch on every /add call,
+# so we cache them in process memory with a short TTL. A failed fetch returns
+# None so the caller degrades gracefully (schema-free checks still run).
+#
+# NOTE: this cache lives in process memory and is therefore scoped to the
+# ComfyUI process. If the user restarts ComfyUI the cache rebuilds.
+_PREFLIGHT_INDEX_TTL_SECONDS = 60.0
+_preflight_index_cache: dict[str, Any] = {
+    "object_info": None,
+    "object_info_at": 0.0,
+    "model_index": None,
+    "model_index_at": 0.0,
+    "model_index_folders": None,
+}
+_preflight_index_lock = threading.Lock()
+
+
+def _comfyui_base_url() -> str:
+    """Where the plugin thinks ComfyUI lives. Falls back to localhost.
+
+    Note: the per-request URL is exposed via ``request.app['sq_comfyui_url']``
+    in aiohttp handlers. Without a request scope we have to fall back to the
+    default; callers that have a request should prefer
+    ``request.app.get("sq_comfyui_url")`` (already used elsewhere in this
+    file, see lines 354 / 1224 / 1327 / 1392).
+    """
+    return "http://127.0.0.1:8188"
+
+
+def _http_get_json(url: str, *, timeout: float = 5.0) -> Any:
+    """Tiny GET wrapper that never raises (returns None on any failure)."""
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as r:
+            return json.loads(r.read().decode("utf-8", errors="replace"))
+    except Exception:
+        return None
+
+
+def _get_object_info() -> dict | None:
+    """Cached GET /object_info. None on failure (cache stays None)."""
+    now = time.time()
+    with _preflight_index_lock:
+        cached = _preflight_index_cache["object_info"]
+        cached_at = _preflight_index_cache["object_info_at"]
+        if cached is not None and (now - cached_at) < _PREFLIGHT_INDEX_TTL_SECONDS:
+            return cached
+        data = _http_get_json(_comfyui_base_url() + "/object_info")
+        if isinstance(data, dict):
+            _preflight_index_cache["object_info"] = data
+            _preflight_index_cache["object_info_at"] = now
+            return data
+        return None
+
+
+def _get_model_index() -> dict | None:
+    """Cached model file index. Maps folder -> list of file basenames.
+
+    The folders come from /api/experiment/models/{folder}; each call lists
+    what ComfyUI can actually see on disk. Returns None on any failure.
+    """
+    now = time.time()
+    with _preflight_index_lock:
+        cached = _preflight_index_cache["model_index"]
+        cached_at = _preflight_index_cache["model_index_at"]
+        cached_folders = _preflight_index_cache["model_index_folders"]
+        if cached is not None and (now - cached_at) < _PREFLIGHT_INDEX_TTL_SECONDS:
+            return cached
+        # ComfyUI exposes the canonical list at /api/experiment/models.
+        # If that endpoint is missing in this ComfyUI version, we fall
+        # back to the well-known folder names. Note: `unet` and `clip`
+        # 404 on current builds (renamed to diffusion_models / text_encoders)
+        # but are kept for older versions; 404s are skipped silently.
+        candidates = (
+            "checkpoints", "diffusion_models", "unet", "loras", "vae",
+            "clip", "text_encoders", "clip_vision", "controlnet",
+            "upscale_models",
+        )
+        index: dict[str, list[str]] = {}
+        for folder in candidates:
+            listing = _http_get_json(
+                _comfyui_base_url() + f"/api/experiment/models/{folder}"
+            )
+            if isinstance(listing, list):
+                names: list[str] = []
+                for f in listing:
+                    if isinstance(f, dict):
+                        n = f.get("name")
+                        if isinstance(n, str):
+                            names.append(n)
+                    elif isinstance(f, str):
+                        names.append(f)
+                index[folder] = names
+        if not index:
+            return None
+        _preflight_index_cache["model_index"] = index
+        _preflight_index_cache["model_index_at"] = now
+        _preflight_index_cache["model_index_folders"] = set(index.keys())
+        return index
+
+
+def _fetch_comfyui_indexes(payload: dict | None = None) -> tuple[dict | None, dict | None]:
+    """Return (object_info, model_index).
+
+    Prefers in-process introspection: the plugin runs INSIDE the ComfyUI
+    process, and a synchronous HTTP request from a handler back to our own
+    server would block the event loop that is supposed to serve it
+    (self-deadlock → 5s timeout → degraded validation). The HTTP endpoints
+    remain as a fallback for out-of-process callers (scripts, debugging).
+    """
+    local_oi = None
+    local_mi = None
+    try:
+        local_oi, local_mi = _fetch_local_indexes(payload)
+    except Exception as exc:  # pragma: no cover — defensive
+        _log.debug("local index build failed: %s", exc)
+    if local_oi is not None and local_mi is not None:
+        return local_oi, local_mi
+    http_oi = local_oi if local_oi is not None else _get_object_info()
+    http_mi = local_mi if local_mi is not None else _get_model_index()
+    return http_oi, http_mi
+
+
+def _describe_preflight_failure(errors) -> str:
+    """One-line rejection summary shared by the single- and batch-add paths."""
+    first = errors[0]
+    more = "" if len(errors) == 1 else f" (+{len(errors) - 1} more)"
+    return (
+        f"preflight failed: {first.type} on node {first.node_id} "
+        f"field {first.field}: {first.message}{more}"
+    )
+
+
+def _run_preflight(payload: dict) -> tuple[bool, list]:
+    """Validate *payload* against live ComfyUI truth (schema + disk).
+
+    Single seam for the validator: tests that do not exercise preflight
+    itself stub this to ``(True, [])``.
+    """
+    object_info, model_index = _fetch_comfyui_indexes(payload)
+    return _preflight(payload, object_info, model_index)
 
 
 class _StubResponse:
@@ -666,6 +841,19 @@ async def add_handler(request) -> "web.Response":  # type: ignore[name-defined]
     workflow_title = body.get("workflow_title")
     if workflow_title is not None and not isinstance(workflow_title, str):
         return _bad_request("workflow_title must be a string")
+
+    # Preflight: reject malformed payloads BEFORE they enter the DB, with a
+    # readable reason. Previously such jobs only failed at dispatch time —
+    # and a scheduled_at 7h out meant nobody saw the failure until the timer
+    # fired (2026-09-13 incident: 40 jobs × 3 retries, all HTTP 400
+    # `Required input is missing`).
+    try:
+        ok, preflight_errors = _run_preflight(payload)
+    except Exception as exc:  # pragma: no cover — defensive
+        _log.debug("preflight degraded: %s", exc)
+        ok, preflight_errors = True, []
+    if not ok:
+        return _bad_request(_describe_preflight_failure(preflight_errors))
 
     try:
         job_id = db.add_job(
@@ -1506,6 +1694,17 @@ def _validate_add_item(item: Any) -> tuple[dict, str | None]:
         if wt is not None and not isinstance(wt, str):
             return {}, "workflow_title must be a string"
         args["workflow_title"] = wt
+
+    # Preflight: never enqueue a payload ComfyUI's own validation would
+    # reject with HTTP 400. Failures skip *this item* only — one bad item
+    # must not block the rest of the batch.
+    try:
+        ok, preflight_errors = _run_preflight(payload)
+    except Exception as exc:  # pragma: no cover — defensive
+        _log.debug("preflight degraded: %s", exc)
+        ok, preflight_errors = True, []
+    if not ok:
+        return {}, _describe_preflight_failure(preflight_errors)
 
     return args, None
 

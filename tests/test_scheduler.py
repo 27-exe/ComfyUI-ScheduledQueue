@@ -13,6 +13,7 @@ from unittest.mock import MagicMock, patch
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from comfyui_scheduled_queue import database, scheduler  # noqa: E402
+from comfyui_scheduled_queue.preflight import PreflightError  # noqa: E402
 
 
 def _fresh_db():
@@ -39,6 +40,12 @@ class _FakeResponse:
 class TestScheduler(unittest.TestCase):
     def setUp(self):
         self.db, self.path = _fresh_db()
+        # Dispatch-mechanics tests stub the preflight seam (their payloads
+        # are synthetic one-liners, not workflows). Validator coverage lives
+        # in test_preflight.py and PreflightDispatchTests below.
+        _pf = patch.object(scheduler, "_preflight_prompt", return_value=(True, []))
+        _pf.start()
+        self.addCleanup(_pf.stop)
 
     def tearDown(self):
         self.db.close()
@@ -76,6 +83,29 @@ class TestScheduler(unittest.TestCase):
             row = self.db.get_job(jid)
             self.assertEqual(row["status"], "dispatched")
             self.assertEqual(row["prompt_id"], "p1")
+        w.stop()
+
+    def test_preflight_rejection_fails_fast_without_retry(self):
+        # A payload rejected by preflight must (a) never reach ComfyUI and
+        # (b) go straight to failed — no 3-retry ladder. 2026-09-13 lesson:
+        # 40 jobs × 3 retries all hit the same HTTP 400 and nothing surfaced
+        # until the 7h timer fired.
+        self.db.set_state("paused", "0")
+        jid = self.db.add_job(payload={"x": 1}, scheduled_at=0.0)
+        w = scheduler.SchedulerThread(self.db, comfyui_url="http://fake-comfyui/")
+        err = PreflightError(
+            type="not_api_format", node_id=None, field=None, message="bad payload"
+        )
+        with patch.object(scheduler, "_preflight_prompt", return_value=(False, [err])):
+            with patch.object(scheduler.urllib.request, "urlopen") as u:
+                w.tick()
+        self.assertEqual(u.call_count, 0, "rejected payload must not be POSTed")
+        self.assertIsNone(self.db.get_job(jid), "job must leave scheduled_jobs")
+        hist = self.db.list_history()
+        self.assertEqual(len(hist), 1)
+        self.assertEqual(hist[0]["status"], "failed")
+        self.assertIn("preflight failed", hist[0]["error"])
+        self.assertIn("no retry", hist[0]["error"])
         w.stop()
 
     def test_failed_dispatch_increments_retry(self):
@@ -360,6 +390,11 @@ class TestPreDispatchHooks(unittest.TestCase):
     def setUp(self):
         # Same scratch-DB pattern used by TestScheduler above.
         self.db, self.path = _fresh_db()
+        # Tick-path tests use synthetic payloads; stub the preflight seam so
+        # these stay focused on the control_after_generate contract.
+        _pf = patch.object(scheduler, "_preflight_prompt", return_value=(True, []))
+        _pf.start()
+        self.addCleanup(_pf.stop)
 
     def tearDown(self):
         self.db.close()

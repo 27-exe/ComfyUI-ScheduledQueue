@@ -76,6 +76,14 @@ class TestRoutes(unittest.TestCase):
         self._routes = routes
         self.db = db_mod.ScheduledQueueDB(db_path=self.db_path)
         self.app = {"sq_db": self.db}
+        # These tests cover the HTTP contract, not payload validation; stub
+        # the preflight seam so they stay hermetic (no live ComfyUI). The
+        # validator itself is exercised in test_preflight.py and
+        # PreflightIntegrationTests at the bottom of this file.
+        from unittest.mock import patch as _patch
+        _pf = _patch.object(routes, "_run_preflight", return_value=(True, []))
+        _pf.start()
+        self.addCleanup(_pf.stop)
 
     def tearDown(self):
         self.db.close()
@@ -550,6 +558,14 @@ class TestWorkflowTitleRoutes(unittest.TestCase):
         self._routes = routes
         self.db = db_mod.ScheduledQueueDB(db_path=self.db_path)
         self.app = {"sq_db": self.db}
+        # These tests cover the HTTP contract, not payload validation; stub
+        # the preflight seam so they stay hermetic (no live ComfyUI). The
+        # validator itself is exercised in test_preflight.py and
+        # PreflightIntegrationTests at the bottom of this file.
+        from unittest.mock import patch as _patch
+        _pf = _patch.object(routes, "_run_preflight", return_value=(True, []))
+        _pf.start()
+        self.addCleanup(_pf.stop)
 
     def tearDown(self):
         self.db.close()
@@ -825,6 +841,95 @@ class TestWorkflowTitleRoutes(unittest.TestCase):
         body = json.loads(resp.body)
         new_id = body["id"]
         self.assertEqual(self.db.get_job(new_id)["workflow_title"], "Repeat Me")
+
+
+class PreflightIntegrationTests(unittest.TestCase):
+    """End-to-end: the add paths run the REAL validator on a REAL payload
+    shape, with only the ComfyUI index fetch stubbed (hermetic — no live
+    ComfyUI dependency, no HTTP)."""
+
+    _OBJECT_INFO = {
+        "EmptyImage": {
+            "input": {"required": {
+                "width": ["INT", {"default": 512, "min": 16, "max": 8192}],
+                "height": ["INT", {"default": 512, "min": 16, "max": 8192}],
+                "batch_size": ["INT", {"default": 1, "min": 1, "max": 4096}],
+                "color": ["INT", {"default": 0, "min": 0, "max": 16777215}],
+            }, "optional": {}},
+            "output": ["IMAGE"],
+        },
+        "SaveImage": {
+            "input": {"required": {"images": ["IMAGE"]},
+                      "optional": {"filename_prefix": ["STRING", {"default": "ComfyUI"}]}},
+            "output": [],
+            "output_node": True,
+        },
+    }
+    _MODEL_INDEX = {"checkpoints": [], "loras": []}
+
+    def setUp(self):
+        self.db_path = os.path.join(_tmpdir, "test_preflight_integration.sqlite3")
+        if os.path.exists(self.db_path):
+            os.remove(self.db_path)
+        from comfyui_scheduled_queue import database as db_mod
+        from comfyui_scheduled_queue import routes
+        self._routes = routes
+        self.db = db_mod.ScheduledQueueDB(db_path=self.db_path)
+        self.app = {"sq_db": self.db}
+        # Stub ONLY the index fetch so the test stays hermetic; the real
+        # validator + the real `_run_preflight` seam run for real.
+        from unittest.mock import patch as _patch
+        _fetch = _patch.object(
+            routes, "_fetch_comfyui_indexes",
+            return_value=(self._OBJECT_INFO, self._MODEL_INDEX),
+        )
+        _fetch.start()
+        self.addCleanup(_fetch.stop)
+
+    def tearDown(self):
+        self.db.close()
+        if os.path.exists(self.db_path):
+            os.remove(self.db_path)
+
+    def _payload(self, prefix="preflight-it"):
+        return {
+            "1": {"class_type": "EmptyImage", "inputs": {
+                "width": 64, "height": 64, "batch_size": 1, "color": 0}},
+            "2": {"class_type": "SaveImage", "inputs": {
+                "images": ["1", 0], "filename_prefix": prefix}},
+        }
+
+    def test_valid_payload_accepted(self):
+        resp = _run(self._routes.add_handler(_StubRequest(app=self.app, json_body={
+            "payload": self._payload(),
+            "scheduled_at": _future_scheduled_at(600),
+        })))
+        self.assertEqual(resp.status, 201)
+
+    def test_unknown_class_type_rejected_at_add_time(self):
+        payload = self._payload()
+        payload["3"] = {"class_type": "NoSuchNode", "inputs": {}}
+        resp = _run(self._routes.add_handler(_StubRequest(app=self.app, json_body={
+            "payload": payload,
+            "scheduled_at": _future_scheduled_at(600),
+        })))
+        self.assertEqual(resp.status, 400)
+        body = resp.body.decode("utf-8", "replace")
+        self.assertIn("preflight failed", body)
+        self.assertIn("missing_node_type", body)
+        # And nothing entered the DB.
+        self.assertEqual(self.db.list_jobs(), [])
+
+    def test_batch_skips_bad_item_keeps_good(self):
+        good = {"payload": self._payload(), "scheduled_at": _future_scheduled_at(600)}
+        bad = {"payload": {"9": {"class_type": "NoSuchNode", "inputs": {}}},
+               "scheduled_at": _future_scheduled_at(700)}
+        resp = _run(self._routes.add_batch_handler(_StubRequest(
+            app=self.app, json_body={"items": [good, bad]})))
+        self.assertEqual(resp.status, 201)
+        body = json.loads(resp.body)
+        self.assertEqual(body["count"], 1)
+        self.assertEqual(len(body["added"]), 1)
 
 
 if __name__ == "__main__":

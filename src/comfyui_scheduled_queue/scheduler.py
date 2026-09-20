@@ -44,6 +44,38 @@ convert_ui_to_api = _wf_mod.convert_ui_to_api
 is_api_format = _wf_mod.is_api_format
 del _il_util, _os, _sys, _wf_spec, _wf_mod
 
+# Same loader caveat as above applies to preflight.py: a relative import
+# fails under ComfyUI's loader and any surrounding try/except silently
+# skips validation (the 2026-09-21 incident — the validator never ran).
+# Self-load it under the loader's dotted name instead.
+import importlib.util as _il_util
+import os as _os
+import sys as _sys
+
+_pf_spec = _il_util.spec_from_file_location(
+    "ComfyUI-ScheduledQueue.preflight",
+    _os.path.join(_os.path.dirname(__file__), "preflight.py"),
+)
+if _pf_spec is None or _pf_spec.loader is None:
+    raise ImportError("[ScheduledQueue] cannot self-load preflight.py")
+_pf_mod = _il_util.module_from_spec(_pf_spec)
+_sys.modules.setdefault("ComfyUI-ScheduledQueue.preflight", _pf_mod)
+_pf_spec.loader.exec_module(_pf_mod)
+_preflight = _pf_mod.preflight
+_fetch_local_indexes = _pf_mod.fetch_local_indexes
+del _il_util, _os, _sys, _pf_spec, _pf_mod
+
+
+def _preflight_prompt(prompt):
+    """Run the pre-dispatch validator against in-process ComfyUI schemas.
+
+    Module-level seam: tests that only exercise dispatch mechanics stub
+    this to ``(True, [])``. Uses in-process introspection (no HTTP) —
+    a self-request from inside handlers would deadlock; see preflight.py.
+    """
+    object_info, model_index = _fetch_local_indexes(prompt)
+    return _preflight(prompt, object_info, model_index)
+
 log = logging.getLogger(__name__)
 
 
@@ -449,6 +481,27 @@ class SchedulerThread:
             except Exception as exc:
                 log.warning('[SQ-DEBUG] post-hook payload inspection failed: %s', exc)
 
+            # === Preflight: catch what ComfyUI would 400 on, before we POST. ===
+            # This is a defense-in-depth net for legacy rows that landed in
+            # the DB before the add-time preflight was added. /object_info
+            # is best-effort: if ComfyUI is unreachable the schema-aware
+            # checks silently no-op and the schema-free checks still run.
+            try:
+                ok, pf_errors = _preflight_prompt(prompt)
+                if not ok:
+                    first = pf_errors[0]
+                    more = "" if len(pf_errors) == 1 else f" (+{len(pf_errors) - 1} more)"
+                    raise RuntimeError(
+                        f"preflight failed: {first.type} on node {first.node_id} "
+                        f"field {first.field}: {first.message}{more}"
+                    )
+            except RuntimeError:
+                raise
+            except Exception as exc:  # pragma: no cover — defensive
+                # Preflight infrastructure may be uninitialised (tests,
+                # import errors); log and continue rather than crash tick.
+                log.debug('[SQ-DEBUG] preflight degraded: %s', exc)
+
             body = {
                 'prompt': prompt,
                 'client_id': job.get('client_id') or 'scheduled_queue',
@@ -506,6 +559,26 @@ class SchedulerThread:
             return False
 
     def _dispatch_failure(self, job_id, error):
+        # 4xx is the client payload's fault: retrying the same payload three
+        # times against ComfyUI's `validate_prompt` will produce three more
+        # 400s (this was the 2026-09-13 incident: 40 jobs × 3 retries = 120
+        # wasted HTTP calls before the wall of `failed` rows appeared). A
+        # preflight error string starts with "preflight failed: " which is
+        # the same shape — bail out immediately, no retry.
+        # Anything else (5xx, connection error, parse error) follows the
+        # existing exponential-backoff retry ladder.
+        if (
+            isinstance(error, str)
+            and (
+                error.startswith('HTTP 4')
+                or error.startswith('preflight failed: ')
+            )
+        ):
+            self.db.mark_failed(
+                job_id,
+                f'dispatch rejected (no retry): {error}',
+            )
+            return
         n = self.db.increment_retry(job_id)
         if n > self.MAX_RETRIES:
             self.db.mark_failed(
