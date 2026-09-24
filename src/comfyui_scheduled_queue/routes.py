@@ -38,6 +38,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import threading
 import time
 import urllib.error
@@ -102,6 +103,81 @@ _LIST_DEFAULT_LIMIT = 50
 _MIN_SCHEDULE_OFFSET_SECONDS = 5
 
 
+# Hard bounds the three write paths (/add, /add-batch, /update) share.
+# SQLite stores INTEGER as a 64-bit signed value and REAL as an IEEE-754
+# double. A value outside these limits raises at execute() time and
+# surfaces as an opaque 500 "database error" (or, for a batch, kills
+# every sibling row in the request). Rejecting them up front gives the
+# caller a 400 that names the offending field instead.
+#
+# Postgres-style ranges would be overkill; these are just the widest
+# values that round-trip through SQLite unchanged.
+_PRIORITY_MIN, _PRIORITY_MAX = -1000, 1000
+_AUTO_RETRY_MIN, _AUTO_RETRY_MAX = 0, 100
+_NOTE_MAX_LEN = 512
+
+# Widest bound SQLite can hold without loss. Anything at or beyond it is
+# either inf (never due -> permanent zombie row) or an int too large to
+# convert to float (OverflowError -> 500).
+_TS_MAX = 2 ** 53
+
+
+def _check_priority(value: Any) -> str | None:
+    """Validate a priority int. Returns an error string, else None."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        return "priority must be an integer"
+    if not _PRIORITY_MIN <= value <= _PRIORITY_MAX:
+        return (
+            f"priority must be between {_PRIORITY_MIN} and {_PRIORITY_MAX} "
+            f"(got {value})"
+        )
+    return None
+
+
+def _check_auto_retry(value: Any) -> str | None:
+    """Validate an auto_retry int. Returns an error string, else None."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        return "auto_retry must be an integer"
+    if not _AUTO_RETRY_MIN <= value <= _AUTO_RETRY_MAX:
+        return (
+            f"auto_retry must be between {_AUTO_RETRY_MIN} and {_AUTO_RETRY_MAX} "
+            f"(got {value})"
+        )
+    return None
+
+
+def _check_note(value: Any) -> str | None:
+    """Validate a note string. Returns an error string, else None."""
+    if value is not None and not isinstance(value, str):
+        return "note must be a string"
+    if isinstance(value, str) and len(value) > _NOTE_MAX_LEN:
+        return f"note too long (max {_NOTE_MAX_LEN} chars, got {len(value)})"
+    return None
+
+
+def _check_timestamp(value: Any) -> str | None:
+    """Validate a scheduled_at timestamp. Returns an error string, else None.
+
+    Catches what the type guard cannot: non-finite floats and ints too
+    large to convert. Both paths used to escape as a 500 or, worse, a
+    silently accepted `Infinity` that made the row undispatchable.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return "scheduled_at must be a number"
+    # Branch on type: math.isfinite() coerces its argument with __float__,
+    # so an int beyond float range RAISES OverflowError instead of returning
+    # False -- which is how a 400-digit timestamp used to escape as a 500.
+    # Only call it on floats; ints are checked by magnitude alone.
+    if isinstance(value, float) and not math.isfinite(value):
+        return f"scheduled_at must be finite (got {value!r})"
+    if abs(value) > _TS_MAX:
+        return (
+            f"scheduled_at is out of range (max {_TS_MAX}, got "
+            f"{value if not isinstance(value, int) or value.bit_length() < 20 else str(value)[:20] + '...'})"
+        )
+    return None
+
+
 def _fmt_local(ts: float) -> str:
     """Format a unix timestamp as a local 'YYYY-MM-DD HH:MM:SS' string."""
     return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts))
@@ -122,6 +198,10 @@ def _check_future_scheduled_at(value: Any, *, field: str = "scheduled_at") -> st
         v = float(value)
     except (TypeError, ValueError):
         return None
+    except OverflowError:
+        # An int too large for a double. _check_timestamp() reports this with
+        # a proper 400; here we just decline to guess so its message wins.
+        return None
     # Sample the clock once so the past-check and the threshold-check agree.
     now = time.time()
     if v <= now:
@@ -139,6 +219,14 @@ def _check_future_scheduled_at(value: Any, *, field: str = "scheduled_at") -> st
         )
     return None
 
+
+# Idempotency guard for setup_routes(). aiohttp silently allows the same
+# method+path to be registered twice on different Resource objects, so a
+# second call used to double the route table (18 -> 36) with every request
+# then matching the FIRST-registered handler. try_install() can reach this
+# function again when its first attempt failed on something other than
+# route registration.
+_routes_registered = False
 
 # Status counts returned by /status. Keys must match spec section 5.2.
 # `dispatched` was added alongside the dispatched/running split — jobs
@@ -807,9 +895,11 @@ async def add_handler(request) -> "web.Response":  # type: ignore[name-defined]
     scheduled_at = body.get("scheduled_at")
     if scheduled_at is None:
         return _bad_request("scheduled_at is required")
-    if not isinstance(scheduled_at, (int, float)):
+    if isinstance(scheduled_at, bool) or not isinstance(scheduled_at, (int, float)):
         return _bad_request("scheduled_at must be a number")
-    if isinstance(scheduled_at, bool) or not float(scheduled_at) > 0:
+    if (msg := _check_timestamp(scheduled_at)) is not None:
+        return _bad_request(msg)
+    if not float(scheduled_at) > 0:
         return _bad_request("scheduled_at must be a positive float")
     # Future-only: see _check_future_scheduled_at for the threshold
     # rationale. The UI dialog already enforces this (MIN_SCHEDULE_OFFSET);
@@ -818,18 +908,21 @@ async def add_handler(request) -> "web.Response":  # type: ignore[name-defined]
     if (msg := _check_future_scheduled_at(scheduled_at)) is not None:
         return _bad_request(msg)
 
-    # Optional fields with type checks
+    # Optional fields with type + range checks.
+    # The ranges are not cosmetic: SQLite overflows on a huge int (500 with
+    # "database error") and an unbounded note is echoed back on every
+    # /list poll, which the 5s-refreshing sidebar turns into a DoS.
     priority = body.get("priority", 100)
-    if not isinstance(priority, int) or isinstance(priority, bool):
-        return _bad_request("priority must be an integer")
+    if (msg := _check_priority(priority)) is not None:
+        return _bad_request(msg)
 
     note = body.get("note")
-    if note is not None and not isinstance(note, str):
-        return _bad_request("note must be a string")
+    if (msg := _check_note(note)) is not None:
+        return _bad_request(msg)
 
     auto_retry = body.get("auto_retry", 0)
-    if not isinstance(auto_retry, int) or isinstance(auto_retry, bool):
-        return _bad_request("auto_retry must be an integer")
+    if (msg := _check_auto_retry(auto_retry)) is not None:
+        return _bad_request(msg)
 
     client_id = body.get("client_id")
     if client_id is not None and not isinstance(client_id, str):
@@ -892,6 +985,33 @@ async def cancel_handler(request) -> "web.Response":  # type: ignore[name-define
     if not job_id:
         return _bad_request("job_id is required")
 
+    # Distinguish "no such row" (404) from "row exists but this state
+    # cannot be cancelled" (409). cancel_job() only flips
+    # scheduled/interrupted rows, so collapsing both into 404 told callers
+    # their running/dispatched job had vanished -- and the sidebar shows a
+    # Cancel button on exactly those rows, so every click on one was a
+    # guaranteed red error. ARCHITECTURE.md has always promised 409 here.
+    try:
+        row = db.get_job(job_id)
+    except Exception:
+        _log.exception("cancel: get_job failed")
+        return _server_error("database error")
+
+    if row is None:
+        return _not_found("job not found")
+
+    cancellable = row.get("status") in ("scheduled", "interrupted")
+    if not cancellable:
+        return _json_response(
+            {
+                "error": (
+                    f"job is not cancellable "
+                    f"(status={row.get('status')})"
+                )
+            },
+            status=409,
+        )
+
     try:
         ok = db.cancel_job(job_id)
     except Exception:
@@ -899,7 +1019,18 @@ async def cancel_handler(request) -> "web.Response":  # type: ignore[name-define
         return _server_error("database error")
 
     if not ok:
-        return _not_found("job not found")
+        # Lost a race with the scheduler between the read and the write.
+        # Re-read so the caller learns the real terminal state.
+        try:
+            row = db.get_job(job_id)
+        except Exception:
+            row = None
+        if row is None:
+            return _not_found("job not found")
+        return _json_response(
+            {"error": f"job is not cancellable (status={row.get('status')})"},
+            status=409,
+        )
 
     return _json_response({"id": job_id, "status": "cancelled"})
 
@@ -1070,7 +1201,11 @@ async def update_handler(request) -> "web.Response":  # type: ignore[name-define
     fields: dict[str, Any] = {}
     if "scheduled_at" in body:
         v = body["scheduled_at"]
-        if not isinstance(v, (int, float)) or isinstance(v, bool) or not float(v) > 0:
+        if isinstance(v, bool) or not isinstance(v, (int, float)):
+            return _bad_request("scheduled_at must be a number")
+        if (msg := _check_timestamp(v)) is not None:
+            return _bad_request(msg)
+        if not float(v) > 0:
             return _bad_request("scheduled_at must be a positive float")
         # Future-only (shared helper with /add and /add-batch).
         if (msg := _check_future_scheduled_at(v)) is not None:
@@ -1078,22 +1213,19 @@ async def update_handler(request) -> "web.Response":  # type: ignore[name-define
         fields["scheduled_at"] = float(v)
 
     if "priority" in body:
-        v = body["priority"]
-        if not isinstance(v, int) or isinstance(v, bool):
-            return _bad_request("priority must be an integer")
-        fields["priority"] = int(v)
+        if (msg := _check_priority(body["priority"])) is not None:
+            return _bad_request(msg)
+        fields["priority"] = int(body["priority"])
 
     if "note" in body:
-        v = body["note"]
-        if not isinstance(v, str):
-            return _bad_request("note must be a string")
-        fields["note"] = v
+        if (msg := _check_note(body["note"])) is not None:
+            return _bad_request(msg)
+        fields["note"] = body["note"]
 
     if "auto_retry" in body:
-        v = body["auto_retry"]
-        if not isinstance(v, int) or isinstance(v, bool):
-            return _bad_request("auto_retry must be an integer")
-        fields["auto_retry"] = int(v)
+        if (msg := _check_auto_retry(body["auto_retry"])) is not None:
+            return _bad_request(msg)
+        fields["auto_retry"] = int(body["auto_retry"])
 
     if "workflow_title" in body:
         v = body["workflow_title"]
@@ -1193,21 +1325,16 @@ async def status_handler(request) -> "web.Response":  # type: ignore[name-define
             except (TypeError, ValueError):
                 last_dispatch_at = None
 
-        # Counts: query each known status. scheduled_jobs holds active rows;
-        # job_history holds terminal rows (done/failed). Done/failed are NOT
-        # in scheduled_jobs anymore (they move to history once observed).
+        # Counts: COUNT(*) per status, never a LIMITed row fetch.
+        # The old implementation counted the rows it happened to pull back
+        # (limit=_LIST_MAX_LIMIT=200), so a queue of 250 scheduled jobs
+        # permanently reported 200 in the status bar and the operator never
+        # learned about the extra 50. count_jobs() counts uncapped in SQL.
         counts: dict[str, int] = {key: 0 for key in _STATUS_COUNT_KEYS}
         for status in ("scheduled", "dispatched", "running", "interrupted", "cancelled"):
-            rows = db.list_jobs(status_filter=[status], limit=_LIST_MAX_LIMIT)
-            counts[status] = len(rows)
-        try:
-            history_rows = db.list_history(limit=_LIST_MAX_LIMIT)
-        except Exception:
-            history_rows = []
-        for row in history_rows:
-            s = row.get("status")
-            if s in counts:
-                counts[s] += 1
+            counts[status] = int(db.count_jobs(statuses=[status]))
+        for status in ("done", "failed"):
+            counts[status] = int(db.count_jobs(statuses=[status]))
     except Exception:
         _log.exception("status query failed")
         return _server_error("database error")
@@ -1651,13 +1778,16 @@ def _validate_add_item(item: Any) -> tuple[dict, str | None]:
     scheduled_at = item.get("scheduled_at")
     if scheduled_at is None:
         return {}, "scheduled_at is required"
-    if isinstance(scheduled_at, bool) or not isinstance(scheduled_at, (int, float)):
-        return {}, "scheduled_at must be a number"
+    # Range/finite check first: a 400-digit int makes the bare float()
+    # below raise OverflowError, which used to escape this function and
+    # kill the WHOLE batch -- one bad item took its innocent siblings down
+    # with it, defeating the "skip the bad item" contract in this docstring.
+    if (msg := _check_timestamp(scheduled_at)) is not None:
+        return {}, msg
     if float(scheduled_at) <= 0:
         return {}, "scheduled_at must be a positive float"
     # Future-only (shared helper with /add; UI's MIN_SCHEDULE_OFFSET).
-    msg = _check_future_scheduled_at(scheduled_at)
-    if msg is not None:
+    if (msg := _check_future_scheduled_at(scheduled_at)) is not None:
         return {}, msg
 
     args: dict[str, Any] = {
@@ -1666,22 +1796,19 @@ def _validate_add_item(item: Any) -> tuple[dict, str | None]:
     }
 
     if "priority" in item:
-        priority = item["priority"]
-        if isinstance(priority, bool) or not isinstance(priority, int):
-            return {}, "priority must be an integer"
-        args["priority"] = int(priority)
+        if (msg := _check_priority(item["priority"])) is not None:
+            return {}, msg
+        args["priority"] = int(item["priority"])
 
     if "note" in item:
-        note = item["note"]
-        if note is not None and not isinstance(note, str):
-            return {}, "note must be a string"
-        args["note"] = note
+        if (msg := _check_note(item["note"])) is not None:
+            return {}, msg
+        args["note"] = item["note"]
 
     if "auto_retry" in item:
-        ar = item["auto_retry"]
-        if isinstance(ar, bool) or not isinstance(ar, int):
-            return {}, "auto_retry must be an integer"
-        args["auto_retry"] = int(ar)
+        if (msg := _check_auto_retry(item["auto_retry"])) is not None:
+            return {}, msg
+        args["auto_retry"] = int(item["auto_retry"])
 
     if "client_id" in item:
         cid = item["client_id"]
@@ -1968,6 +2095,11 @@ def setup_routes(db, interceptor=None) -> bool:
     routes_obj = server.routes
     app = getattr(routes_obj, "app", None) or server.app
 
+    # Nothing to do if these exact routes are already live on this app.
+    global _routes_registered
+    if _routes_registered and app.get("sq_db") is db:
+        return True
+
     # Stash db on the app so handlers can reach it through request.app.
     app["sq_db"] = db
     if interceptor is not None:
@@ -1996,6 +2128,10 @@ def setup_routes(db, interceptor=None) -> bool:
     app.router.add_post("/api/schedule/repeat/{job_id}", repeat_handler)
     app.router.add_get("/api/schedule/export/{job_id}", export_handler)
 
+    # Only flip the sentinel after every add_* succeeded, so a partial
+    # failure leaves it False and a retry can finish the job. (The `global`
+    # declaration lives with the guard at the top of this function.)
+    _routes_registered = True
     return True
 
 
