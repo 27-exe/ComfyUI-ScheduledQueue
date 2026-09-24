@@ -270,6 +270,8 @@ noted; responses use `_json_response()` which sets
 | `GET /status` | `status_handler` | paused flag + per-status counts + version |
 | `POST /pause-all` | `pause_all_handler` | set scheduler_state.paused = "1" |
 | `POST /resume-all` | `resume_all_handler` | set scheduler_state.paused = "0" |
+| `GET /pause-schedule` | `pause_schedule_handler` | read the armed scheduled-pause pair |
+| `POST /pause-schedule` | `pause_schedule_handler` | arm/clear one or both scheduled times (validated before any write) |
 | `GET /orphan-status` | `orphan_status_handler` | interrupted-job inventory (read-only; the sweep itself is `recover_orphans()`, run at startup) |
 
 Code reference: `src/comfyui_scheduled_queue/routes.py`.

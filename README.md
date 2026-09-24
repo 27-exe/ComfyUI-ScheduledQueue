@@ -1,6 +1,6 @@
 # ComfyUI-ScheduledQueue
 
-**Status:** under development (v0.3.15). CLI and HTTP API are production-ready; the bundled sidebar UI is stable against ComfyUI ≥ 1.49.6.
+**Status:** under development (v0.4.0). CLI and HTTP API are production-ready; the bundled sidebar UI is stable against ComfyUI ≥ 1.49.6.
 
 [简体中文](README.zh.md)
 
@@ -138,13 +138,34 @@ comfy-schedule watch --interval 2
 # cancel / run-now
 comfy-schedule cancel <job_id>
 comfy-schedule run-now <job_id>
+
+# arm a one-shot scheduled pause + resume (minute precision, local time)
+comfy-schedule pause-at --pause "2026-09-24 23:00" --resume "2026-09-25 07:00"
+comfy-schedule pause-at                    # show what is armed
+comfy-schedule pause-at --clear            # drop both
 ```
 
 `--in` accepts a relative duration (`10m` / `2h` / `1d` / `30s`, decimals OK) or an
 absolute ISO timestamp, and **must resolve to the future** — anything `<= now + 5s`
 exits with `rc=2` before the HTTP call, so you never silently queue a job the
 scheduler will never dispatch. Subcommands: `status`, `list`, `add`, `cancel`,
-`update`, `pause`, `resume`, `orphans`, `run-now`, `watch`.
+`update`, `pause`, `resume`, `orphans`, `pause-at`, `run-now`, `watch`.
+
+### Scheduled pause / resume
+
+`pause-at` arms a **one-shot** pair. Each fires once at its wall-clock minute and is
+then cleared, so a restart never replays it. The two actions are **identical to the
+manual buttons** — pause pulls dispatched prompts out of ComfyUI's queue and
+reclaims them, resume clears the flag and flips `interrupted` rows back to
+`scheduled`.
+
+Rules live in the existing `scheduler_state` KV table, so an older database needs no
+migration. `--pause` / `--resume` accept `YYYY-MM-DD HH:MM` (a `T` separator and
+optional seconds are tolerated); an unparseable time, or a `--resume` earlier than
+`--pause`, exits `rc=2` without touching the server. Omitting a flag leaves that
+rule untouched — handy for nudging one half of an armed pair.
+
+The sidebar shows the same pair (Scheduled pause panel above the status bar).
 
 In the UI: click the **clock icon** in the topbar → choose a preset → **Schedule**.
 

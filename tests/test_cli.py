@@ -51,6 +51,11 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         elif self.path == "/api/schedule/orphan-status":
             ids = [j["id"] for j in self.store["jobs"] if j["status"] == "interrupted"]
             self._json(200, {"interrupted_count": len(ids), "interrupted_ids": ids, "auto_retry_count": 0})
+        elif self.path == "/api/schedule/pause-schedule":
+            self._json(200, {
+                "pause_at": self.store.get("pause_at", ""),
+                "resume_at": self.store.get("resume_at", ""),
+            })
         else:
             self._json(404, {"error": "no"})
 
@@ -76,6 +81,17 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         elif self.path == "/api/schedule/pause-all":
             self.store["paused"] = True
             self._json(200, {"paused": True})
+        elif self.path == "/api/schedule/pause-schedule":
+            # Mirror the real handler's contract: an omitted field is left
+            # untouched, null/"" clears it. Time-shape validation belongs to
+            # the CLI's own pre-check, so here we only apply what arrived.
+            for field in ("pause_at", "resume_at"):
+                if field in payload:
+                    self.store[field] = payload[field]
+            self._json(200, {
+                "pause_at": self.store.get("pause_at", ""),
+                "resume_at": self.store.get("resume_at", ""),
+            })
         elif self.path == "/api/schedule/resume-all":
             self.store["paused"] = False
             self._json(200, {"paused": False, "resumed_count": 0})
@@ -134,6 +150,8 @@ class TestCli(unittest.TestCase):
             "paused": True,
             "last_dispatch_at": None,
             "last_error": None,
+            "pause_at": "",
+            "resume_at": "",
         }
 
     def test_status(self):
@@ -238,6 +256,100 @@ class TestCli(unittest.TestCase):
             self.assertIn("past", err)
         finally:
             _run_cli("cancel", job_id)
+
+
+class TestCliPauseAt(unittest.TestCase):
+    """`comfy-schedule pause-at` -- read, write one field, write both, clear."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.server = http.server.HTTPServer(("127.0.0.1", PORT), _Handler)
+        cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls.thread.start()
+        time.sleep(0.1)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+        cls.server.server_close()
+
+    def setUp(self):
+        _Handler.store = {
+            "jobs": [], "paused": True,
+            "last_dispatch_at": None, "last_error": None,
+            "pause_at": "", "resume_at": "",
+        }
+
+    def _future(self, minutes):
+        return time.strftime("%Y-%m-%d %H:%M", time.localtime(time.time() + minutes * 60))
+
+    def test_reads_both_fields(self):
+        rc, out, _ = _run_cli("pause-at")
+        self.assertEqual(rc, 0)
+        body = json.loads(out)
+        self.assertEqual(body["pause_at"], "")
+        self.assertEqual(body["resume_at"], "")
+
+    def test_sets_the_whole_pair(self):
+        p, r = self._future(40), self._future(50)
+        rc, out, _ = _run_cli("pause-at", "--pause", p, "--resume", r)
+        self.assertEqual(rc, 0)
+        body = json.loads(out)
+        self.assertEqual(body["pause_at"], p.replace(" ", "T"))
+        self.assertEqual(body["resume_at"], r.replace(" ", "T"))
+
+    def test_one_field_leaves_the_other_alone(self):
+        r = self._future(50)
+        _run_cli("pause-at", "--pause", self._future(40))
+        rc, out, _ = _run_cli("pause-at", "--resume", r)
+        self.assertEqual(rc, 0)
+        body = json.loads(out)
+        self.assertNotEqual(body["pause_at"], "", "the pause rule must survive")
+        self.assertEqual(body["resume_at"], r.replace(" ", "T"))
+
+    def test_clear_empties_both(self):
+        _run_cli("pause-at", "--pause", self._future(40), "--resume", self._future(50))
+        rc, out, _ = _run_cli("pause-at", "--clear")
+        self.assertEqual(rc, 0)
+        body = json.loads(out)
+        self.assertEqual(body["pause_at"], "")
+        self.assertEqual(body["resume_at"], "")
+
+    def test_bad_time_is_rejected_locally(self):
+        rc, _, err = _run_cli("pause-at", "--pause", "tomorrow")
+        self.assertEqual(rc, 2)
+        self.assertIn("bad --pause value", err)
+
+    def test_impossible_date_is_rejected_locally(self):
+        rc, _, err = _run_cli("pause-at", "--pause", "2030-02-30 10:00")
+        self.assertEqual(rc, 2)
+        self.assertIn("bad --pause value", err)
+
+    def test_inverted_pair_is_rejected_locally(self):
+        rc, _, err = _run_cli(
+            "pause-at",
+            "--pause", "2030-01-01 10:00",
+            "--resume", "2030-01-01 09:00",
+        )
+        self.assertEqual(rc, 2)
+        self.assertIn("must be later than", err)
+
+
+    def test_empty_string_clears_only_its_own_field(self):
+        """An explicit "" clears one field; it must NOT be read as "absent".
+
+        Regression: the first version used `if not args.pause and not
+        args.resume`, so `--resume ""` fell through to the GET branch and
+        silently did nothing.
+        """
+        rc, out, _ = _run_cli("pause-at", "--pause", self._future(40),
+                              "--resume", self._future(50))
+        self.assertEqual(rc, 0)
+        rc, out, _ = _run_cli("pause-at", "--resume", "")
+        self.assertEqual(rc, 0)
+        body = json.loads(out)
+        self.assertNotEqual(body["pause_at"], "", "the pause rule must survive")
+        self.assertEqual(body["resume_at"], "")
 
 
 if __name__ == "__main__":

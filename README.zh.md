@@ -1,6 +1,6 @@
 # ComfyUI-ScheduledQueue
 
-**Status:** under development (v0.3.15). CLI and HTTP API are production-ready; the bundled sidebar UI is stable against ComfyUI ≥ 1.49.6.
+**Status:** under development (v0.4.0). CLI and HTTP API are production-ready; the bundled sidebar UI is stable against ComfyUI ≥ 1.49.6.
 
 [English](README.md) · [简体中文](README.zh.md)
 
@@ -138,12 +138,29 @@ comfy-schedule watch --interval 2
 # 取消 / 立即跑
 comfy-schedule cancel <job_id>
 comfy-schedule run-now <job_id>
+
+# 设定定时暂停 / 定时恢复（一次性，精确到分钟，本地时间）
+comfy-schedule pause-at --pause "2026-09-24 23:00" --resume "2026-09-25 07:00"
+comfy-schedule pause-at                 # 查看当前设定
+comfy-schedule pause-at --clear         # 全部清除
 ```
 
 `--in` 接受相对时长（`10m` / `2h` / `1d` / `30s`，支持小数）或绝对 ISO 时刻，且
 **必须落在未来** —— 任何 `<= now + 5s` 的输入会以 `rc=2` 退出、不发 HTTP 请求，
 避免静默排入一个永远不会被调度的任务。子命令：`status`、`list`、`add`、`cancel`、
-`update`、`pause`、`resume`、`orphans`、`run-now`、`watch`。
+`update`、`pause`、`resume`、`orphans`、`pause-at`、`run-now`、`watch`。
+
+### 定时暂停 / 定时恢复
+
+`pause-at` 设定的是一对**一次性**规则：各自到点触发一次即自动清除，重启不会重放。
+两个动作与手动按钮**完全一致** —— 暂停会把已投递的 prompt 从 ComfyUI 队列取出并回收，
+恢复会解除暂停标志、把 `interrupted` 行翻回 `scheduled`。
+
+规则存在既有的 `scheduler_state` KV 表里，旧数据库无需迁移。`--pause` / `--resume`
+接受 `YYYY-MM-DD HH:MM`（也容忍 `T` 分隔和秒）；无法解析的时间、或 `--resume` 早于
+`--pause`，会以 `rc=2` 退出且不打扰服务端。只给其中一个参数时，另一个规则保持原样。
+
+侧边栏里也有同一对输入框（状态条上方的「定时暂停」面板）。
 
 在 UI 里：点顶栏的 **时钟图标** → 选择预设 → **Schedule**。
 

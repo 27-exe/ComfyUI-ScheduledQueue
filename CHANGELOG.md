@@ -4,6 +4,43 @@ All notable changes to **ComfyUI-ScheduledQueue** are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.4.0] - 2026-09-24
+
+Minor release: **scheduled pause and resume**. Arm a pair of wall-clock times
+(minute precision) and the scheduler performs the same action the manual
+buttons do, at the set time, once.
+
+### Added
+
+- **`GET` / `POST /api/schedule/pause-schedule`** — read or arm the one-shot
+  pair. Both fields accept `YYYY-MM-DDTHH:MM`; a missing field is left
+  untouched (so one half of an armed pair can be nudged alone) while `null` or
+  `""` clears it. The whole body is validated *before* anything is written, so a
+  rejected request can never half-apply. Unparseable or past values get a 400
+  naming the field.
+- **`comfy-schedule pause-at`** — shell access to the same rule
+  (`--pause` / `--resume` / `--clear`; no flags shows what is armed). Time shape,
+  future-ness and `resume < pause` are checked locally, so bad input exits
+  `rc=2` without disturbing the server. An explicit `--resume ""` clears just
+  that field.
+- **Scheduled pause panel in the sidebar** — two minute-precision fields with
+  `-1h / -10m / +10m / +1h / +1d` nudges. The status line distinguishes
+  "armed" from "unsaved edit" so it is always clear what will actually happen.
+- **Scheduler trigger** — `_check_scheduled_pause_resume()` runs on the existing
+  tick loop (no new thread, no new timer). Each rule fires once and is cleared
+  *before* it acts, so a restart can never replay it and a failing action cannot
+  be retried forever.
+
+### Changed
+
+- Scheduled pause reuses `routes._pause_all_blocking` verbatim, and scheduled
+  resume mirrors `resume_all_handler` — one implementation, two callers. The
+  scheduled action is therefore bit-identical to the manual one, including the
+  race guards and the ComfyUI queue delete.
+- Rules live in the existing `scheduler_state` KV table, so an existing database
+  needs no migration.
+
+
 ## [0.3.15] - 2026-09-24
 
 Patch release: two functional blockers and a documentation-correction sweep.

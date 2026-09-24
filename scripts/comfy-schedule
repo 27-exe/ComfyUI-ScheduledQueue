@@ -236,6 +236,88 @@ def cmd_orphans(args):
     return 0 if code == 200 else 1
 
 
+def _normalise_wallclock(text):
+    """Normalise a wall-clock time into the backend's YYYY-MM-DDTHH:MM form.
+
+    Accepts a space or "T" separator and an optional seconds field, so both
+    "2026-09-24 23:00" and "2026-09-24T23:00:15" work. Returns None when the
+    value cannot be a real wall clock, and the CLI reports that itself
+    instead of letting the server answer with a bare 400.
+    """
+    import re as _re
+    m = _re.fullmatch(
+        r"(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})(?::(\d{2}))?",
+        str(text or "").strip(),
+    )
+    if not m:
+        return None
+    y, mo, d, h, mi, s = (int(g) if g else 0 for g in m.groups())
+    if not (1 <= mo <= 12 and 1 <= d <= 31 and h <= 23 and mi <= 59 and s <= 59):
+        return None
+    import datetime as _dt
+    try:
+        obj = _dt.datetime(y, mo, d, h, mi, s)
+    except ValueError:
+        return None
+    return obj.strftime("%Y-%m-%dT%H:%M")
+
+
+def cmd_pause_at(args):
+    """Show or set the one-shot scheduled pause / resume pair."""
+    if args.clear:
+        code, resp = _request("POST", f"{args.url}/api/schedule/pause-schedule",
+                              {"pause_at": "", "resume_at": ""})
+        if code != 200:
+            print(f"HTTP {code}: {resp}", file=sys.stderr)
+            return 1
+        print(json.dumps(resp, indent=2, ensure_ascii=False))
+        return 0
+
+    # `is not None`, not truthiness: an explicit "" is a request to CLEAR that
+    # one field, which is different from not mentioning it at all.
+    if args.pause is None and args.resume is None and not args.clear:
+        code, resp = _request("GET", f"{args.url}/api/schedule/pause-schedule")
+        if code != 200:
+            print(f"HTTP {code}: {resp}", file=sys.stderr)
+            return 1
+        print(json.dumps(resp, indent=2, ensure_ascii=False))
+        return 0
+
+    body = {}
+    if args.pause is not None:
+        if args.pause.strip():
+            norm = _normalise_wallclock(args.pause)
+            if norm is None:
+                print(f"comfy-schedule: bad --pause value: {args.pause!r} "
+                      "(want YYYY-MM-DD HH:MM)", file=sys.stderr)
+                return 2
+            body["pause_at"] = norm
+        else:
+            body["pause_at"] = ""
+    if args.resume is not None:
+        if args.resume.strip():
+            norm = _normalise_wallclock(args.resume)
+            if norm is None:
+                print(f"comfy-schedule: bad --resume value: {args.resume!r} "
+                      "(want YYYY-MM-DD HH:MM)", file=sys.stderr)
+                return 2
+            body["resume_at"] = norm
+        else:
+            body["resume_at"] = ""
+
+    if "pause_at" in body and "resume_at" in body and body["resume_at"] < body["pause_at"]:
+        print("comfy-schedule: --resume must be later than --pause",
+              file=sys.stderr)
+        return 2
+
+    code, resp = _request("POST", f"{args.url}/api/schedule/pause-schedule", body)
+    if code != 200:
+        print(f"HTTP {code}: {resp}", file=sys.stderr)
+        return 1
+    print(json.dumps(resp, indent=2, ensure_ascii=False))
+    return 0
+
+
 def cmd_run_now(args):
     code, resp = _request("POST", f"{args.url}/api/schedule/run-now/{args.job_id}")
     if code != 200:
@@ -315,6 +397,16 @@ def main():
     sub.add_parser("pause", help="pause scheduler (new dispatches)").set_defaults(func=cmd_pause)
     sub.add_parser("resume", help="resume + reset interrupted jobs").set_defaults(func=cmd_resume)
     sub.add_parser("orphans", help="show interrupted jobs from previous ComfyUI run").set_defaults(func=cmd_orphans)
+
+    p_pat = sub.add_parser(
+        "pause-at",
+        help="show/set the one-shot scheduled pause + resume pair",
+    )
+    p_pat.add_argument("--pause", help="pause time, YYYY-MM-DD HH:MM")
+    p_pat.add_argument("--resume", help="resume time, YYYY-MM-DD HH:MM")
+    p_pat.add_argument("--clear", action="store_true",
+                       help="remove both scheduled times")
+    p_pat.set_defaults(func=cmd_pause_at)
 
     p_run = sub.add_parser("run-now", help="dispatch a job immediately")
     p_run.add_argument("job_id")

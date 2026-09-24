@@ -7,7 +7,7 @@
 
 > 目标读者: 已经装好 ComfyUI + ComfyUI-ScheduledQueue, 想搞清楚这个插件到底能干什么、什么时候该用、踩坑了怎么排查的人。
 >
-> 文档版本: v0.3.15
+> 文档版本: v0.4.0
 
 ---
 
@@ -115,6 +115,7 @@ ComfyUI 原生的 Run 按钮**完全没改**。插件只是在你 *Schedule* 一
 | **顶部状态过滤** | 点击切换只显示某类任务; 切换时自动回到 Page 1。 |
 | **Clear 面板** | 勾选要清空的类别, 显示每个状态的当前数量, 点 `Clear selected` 一次性删除。 |
 | **Pause / Resume** | 暂停时按钮变绿显示 `Resume`, 状态条显示 `paused · ...`。 |
+| **定时暂停面板** | 状态过滤栏下方的「定时暂停」区块。两个文本框精确到分钟, 各自带 -1h/-10m/+10m/+1h/+1d 微调按钮; `Save` 之后状态行显示「已设定」, 改动任一输入框则变「未保存」以提示尚未生效。规则到点触发一次即自动清除。 |
 | **分页** | `limit=50` 默认; 显示当前 offset/limit/total, 末页自动 disable `Next ›`。 |
 
 ---
@@ -370,6 +371,12 @@ comfy-schedule status
 comfy-schedule pause
 comfy-schedule resume
 
+# 定时暂停 / 定时恢复 (一次性，精确到分钟，本地时间)
+comfy-schedule pause-at --pause "2026-09-24 23:00" --resume "2026-09-25 07:00"
+comfy-schedule pause-at                 # 查看当前已设定的两个时间
+comfy-schedule pause-at --resume ""     # 只清恢复时间，暂停时间保留
+comfy-schedule pause-at --clear         # 两个都清掉
+
 # 上次 ComfyUI 崩溃遗留在途的任务
 comfy-schedule orphans
 
@@ -386,7 +393,7 @@ comfy-schedule watch --interval 2 --seconds 60
 ```
 
 子命令全集: `status` / `list` / `add` / `cancel` / `update` / `pause` /
-`resume` / `orphans` / `run-now` / `watch`。`comfy-schedule --help` 随时可查。
+`resume` / `orphans` / `pause-at` / `run-now` / `watch`。`comfy-schedule --help` 随时可查。
 
 > **批量添加**走 UI 的 `Count` 字段(走 `/api/schedule/add-batch`)。CLI 没有
 > `--count`;脚本化批量请直接 POST `/api/schedule/add-batch`,或循环调 `add`。

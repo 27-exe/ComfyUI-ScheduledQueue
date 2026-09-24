@@ -2471,6 +2471,6 @@ function installSidebarWatcher(container) {
 // framework calls render(container) directly whenever our sidebar tab is
 // activated.)
 
-const SQ_VERSION = "0.3.15";
+const SQ_VERSION = "0.4.0";
 console.log("[ScheduledQueue] Loaded version " + SQ_VERSION + " (file://" + (import.meta?.url || location.href) + ")");
 console.log("[ScheduledQueue] Registered: topbar button + sidebar tab.");
