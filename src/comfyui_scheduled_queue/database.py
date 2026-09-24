@@ -138,7 +138,16 @@ class ScheduledQueueDB:
             cols = {r[1] for r in self._conn.execute("PRAGMA table_info(scheduled_jobs)")}
             if "queue_order" not in cols:
                 self._conn.execute("ALTER TABLE scheduled_jobs ADD COLUMN queue_order INTEGER")
-            self._conn.execute("UPDATE scheduled_jobs SET queue_order=rowid*1000 WHERE queue_order IS NULL")
+                # Backfill legacy rows ONLY here, inside the "column was just
+                # added" branch. This used to be an unconditional UPDATE run on
+                # every boot outside the guard, which (a) rewrote every NULL on
+                # each restart so a "once" migration looked like a repeating
+                # write pass, and (b) reached rows whose callers (or a future
+                # migration step) deliberately left NULL. The ALTER branch runs
+                # exactly once per DB — right when the column is born and every
+                # legacy row is still NULL — which is the only moment a blanket
+                # rowid*1000 backfill is both necessary and safe.
+                self._conn.execute("UPDATE scheduled_jobs SET queue_order=rowid*1000 WHERE queue_order IS NULL")
             # v0.3.10: track the ComfyUI workflow filename alongside every job so
             # the sidebar can show "which workflow" without re-fetching payload.
             # Older DBs need an ALTER. Stays NULL / empty for legacy rows.
@@ -174,7 +183,18 @@ class ScheduledQueueDB:
         # transaction.
         with self._IO_LOCK:
             jid = str(uuid.uuid4()); now = time.time()
-            row = self._conn.execute("SELECT COALESCE(MAX(queue_order),0)+1000 FROM scheduled_jobs WHERE status IN ('scheduled','interrupted')").fetchone()
+            # MAX() must span EVERY row, not just the pending ones. Root cause of
+            # the old collision: the WHERE only looked at
+            # status IN ('scheduled','interrupted'), so a job that had been
+            # claimed (status -> 'dispatched', queue_order retained) became
+            # invisible. The next add_job then handed out the very same
+            # queue_order, and when that dispatched job was later requeued the
+            # two rows shared one order — after which reorder_job swapped a row
+            # with ITSELF, returned True, and the UI reported a move that never
+            # happened (a silent no-op). Counting all rows keeps the invariant
+            # "new order > every existing non-NULL order", so two pending rows
+            # can never collide no matter which statuses the holders are in.
+            row = self._conn.execute("SELECT COALESCE(MAX(queue_order),0)+1000 FROM scheduled_jobs").fetchone()
             order = int(row[0] or 1000)
             # Normalise: empty string == "no title" == NULL. Storing NULL keeps the
             # column tidy for legacy rows and lets the sidebar fall back to the
@@ -519,10 +539,19 @@ class ScheduledQueueDB:
                 # Priority must dominate scheduled_at: a high-priority job due
                 # later still jumps ahead of a low-priority job already due.
                 # Explicit ASC on scheduled_at mirrors the same intent in code.
+                # NOTE: `queue_order` used to lead this ORDER BY, which silently
+                # inverted the documented contract — the frontend's priority
+                # field ("0-1000, higher runs first") had NO effect because the
+                # monotonically-increasing queue_order always decided first.
+                # The correct precedence is: priority DESC first, then queue_order
+                # as the tie-break INSIDE a priority band (so manual reorder still
+                # works among equal-priority jobs), then scheduled_at ASC (a
+                # not-yet-due high-priority job never jumps the queue — the due
+                # filter above already guarantees that), then created_at, id.
                 r=self._conn.execute(
                     "SELECT * FROM scheduled_jobs "
                     "WHERE status='scheduled' AND scheduled_at<=? "
-                    "ORDER BY queue_order, priority DESC, scheduled_at ASC, created_at, id "
+                    "ORDER BY priority DESC, queue_order, scheduled_at ASC, created_at, id "
                     "LIMIT 1",
                     (now,),
                 ).fetchone()
