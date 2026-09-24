@@ -634,6 +634,7 @@ function buildPanel() {
             _syncSchedPauseInput(pauseAtInput, nextPause);
             _syncSchedPauseInput(resumeAtInput, nextResume);
             _renderSchedPauseState(data);
+            _healSchedPausePlaceholders();
         } catch (e) {
             console.warn("[ScheduledQueue] load pause-schedule failed", e);
         }
@@ -651,6 +652,25 @@ function buildPanel() {
     //      it must not erase a time the user picked but has not saved yet.
     //      The armed-state line always shows the SERVER truth, so the user
     //      can tell saved from unsaved at a glance.
+    // Force our own placeholder onto whatever DOM is live right now.
+    //
+    // WHY this exists: <input type="datetime-local"> renders its placeholder
+    // from the BROWSER locale (navigator.language), so a Chinese browser
+    // shows 年/月/日 even with the sidebar in English -- no locale file can
+    // change that. buildPanel() sets a correct placeholder, but that only
+    // reaches the user if the panel is (re)built. A DOM left over from an
+    // earlier build -- tab never switched, page never reloaded -- keeps the
+    // native text forever. loadSchedPause() runs on every 5s poll, so this
+    // converges without any user action.
+    function _healSchedPausePlaceholders() {
+        const want = t("sched_pause.placeholder", "YYYY-MM-DD HH:MM");
+        for (const el of [pauseAtInput, resumeAtInput]) {
+            if (el && el.getAttribute("placeholder") !== want) {
+                el.setAttribute("placeholder", want);
+            }
+        }
+    }
+
     function _syncSchedPauseInput(el, nextValue) {
         if (!el) return;
         if (el === document.activeElement) return;
