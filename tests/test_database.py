@@ -222,6 +222,154 @@ class TestReconcile(unittest.TestCase):
         self.assertEqual(self.db.get_job(running)["status"], "running")
 
 
+# ---------------------------------------------------------------------------
+# 2026-09-24 fix (P2, dispatch state machine)
+# ---------------------------------------------------------------------------
+
+
+class TestDispatchStateMachineGuards(unittest.TestCase):
+    """Regression guards for the three defects that desynchronised the
+    scheduler's state machine from ComfyUI's real execution state.
+
+    A) mark_dispatched had no status guard, so a slow POST response
+       landing *after* a concurrent pause-all / run-now / requeue had
+       advanced the row would clobber it back to 'dispatched' and wipe
+       started_at.
+    B) claim_next_due_job -> mark_dispatched had no rollback, so any
+       exception in between left an unreapable 'dispatched'
+       prompt_id=NULL row.
+    """
+
+    def setUp(self):
+        self.db, self.path = _fresh_db()
+
+    def tearDown(self):
+        self.db.close()
+        try:
+            os.unlink(self.path)
+        except OSError:
+            pass
+
+    # ---- A: mark_dispatched status guard ------------------------------
+
+    def test_mark_dispatched_refuses_to_downgrade_running_row(self):
+        """2026-09-24 defect A: a POST ack that lands after the row was
+        promoted to 'running' must NOT rewrite it as 'dispatched'. The
+        prompt is already executing in ComfyUI, so the row is strictly
+        further along than this completion event."""
+        jid = self.db.add_job(payload={}, scheduled_at=1.0)
+        self.db.mark_dispatched(jid, "p-run")
+        self.assertTrue(self.db.mark_running(jid, "p-run"))
+
+        # Now a late POST ack arrives (race with a concurrent pause/run-now
+        # that had already advanced the row).
+        self.assertFalse(
+            self.db.mark_dispatched(jid, "p-late"),
+            "mark_dispatched must reject a 'running' row",
+        )
+
+        row = self.db.get_job(jid)
+        assert row is not None
+        self.assertEqual(row["status"], "running", "status must stay 'running'")
+        self.assertEqual(row["prompt_id"], "p-run", "prompt_id must not be clobbered")
+        self.assertIsNotNone(row["started_at"], "started_at must survive")
+
+    def test_mark_dispatched_refuses_failed_and_cancelled_rows(self):
+        """Terminal / cancelled rows are also out of scope for a late ack:
+        the job already left the live queue, and re-flipping it to
+        'dispatched' would resurrect a zombie row."""
+        for terminal in ("failed", "cancelled"):
+            with self.subTest(terminal=terminal):
+                jid = self.db.add_job(payload={}, scheduled_at=1.0)
+                self.db.update_job(jid, status=terminal)
+                self.assertFalse(
+                    self.db.mark_dispatched(jid, "p-late"),
+                    f"mark_dispatched must reject a '{terminal}' row",
+                )
+                row = self.db.get_job(jid)
+                if row is not None:
+                    self.assertEqual(row["status"], terminal)
+
+    def test_mark_dispatched_still_works_on_scheduled_and_dispatched(self):
+        """The guard must not break the happy paths."""
+        # 'scheduled' -- e.g. a job dispatched directly without claim.
+        jid_a = self.db.add_job(payload={}, scheduled_at=1.0)
+        self.assertTrue(self.db.mark_dispatched(jid_a, "p-a"))
+        self.assertEqual(self.db.get_job(jid_a)["status"], "dispatched")
+
+        # 'dispatched' -- the normal claim-then-POST ordering (re-stamp).
+        jid_b = self.db.add_job(payload={}, scheduled_at=1.0)
+        self.assertIsNotNone(self.db.claim_next_due_job())
+        self.assertTrue(self.db.mark_dispatched(jid_b, "p-b"))
+        row = self.db.get_job(jid_b)
+        assert row is not None
+        self.assertEqual(row["status"], "dispatched")
+        self.assertEqual(row["prompt_id"], "p-b")
+
+    def test_mark_dispatched_returns_false_for_unknown_job(self):
+        self.assertFalse(self.db.mark_dispatched("no-such-id", "p-x"))
+
+    # ---- B: claim -> mark_dispatched rollback ------------------------
+
+    def test_requeue_after_aborted_post_restores_scheduled_state(self):
+        """2026-09-24 defect B: after claim flips the row to
+        'dispatched' with prompt_id=NULL, a failed POST must be able to
+        roll it back into the due queue instead of leaving a stuck row."""
+        jid = self.db.add_job(payload={}, scheduled_at=1.0)
+        claimed = self.db.claim_next_due_job()
+        assert claimed is not None
+        self.assertEqual(claimed["status"], "dispatched")
+        self.assertIsNone(claimed["prompt_id"], "claim leaves prompt_id NULL")
+
+        rolled = self.db.requeue_dispatched_after_aborted_post(jid)
+        self.assertTrue(rolled, "the rollback must reach the row")
+
+        row = self.db.get_job(jid)
+        assert row is not None
+        self.assertEqual(row["status"], "scheduled", "row is due again")
+        self.assertIsNone(row["prompt_id"])
+        self.assertIsNone(row["dispatched_at"])
+        self.assertIsNone(row["started_at"])
+        # And it is claimable again -- previously impossible.
+        self.assertIsNotNone(self.db.claim_next_due_job())
+
+    def test_requeue_after_aborted_post_is_idempotent_and_status_guarded(self):
+        """Calling it twice must not double-roll a row, and it must not
+        touch a row that a concurrent pause-all / run-now already moved
+        to 'scheduled' or 'interrupted'."""
+        jid = self.db.add_job(payload={}, scheduled_at=1.0)
+        self.db.claim_next_due_job()
+        self.assertTrue(self.db.mark_dispatched(jid, "p-ok"))
+
+        # Row already has a prompt_id and was legitimately dispatched.
+        self.assertFalse(
+            self.db.requeue_dispatched_after_aborted_post(jid),
+            "a row with a prompt_id (already POSTed) must not be rolled back "
+            "into the due queue -- it would double-dispatch",
+        )
+        row = self.db.get_job(jid)
+        assert row is not None
+        self.assertEqual(row["status"], "dispatched")
+        self.assertEqual(row["prompt_id"], "p-ok")
+
+        # A plain rollback, once, then a second call is a no-op.
+        jid_b = self.db.add_job(payload={}, scheduled_at=1.0)
+        self.db.claim_next_due_job()
+        self.assertTrue(self.db.requeue_dispatched_after_aborted_post(jid_b))
+        self.assertFalse(self.db.requeue_dispatched_after_aborted_post(jid_b))
+
+    def test_requeue_after_aborted_post_wont_steal_a_running_row(self):
+        jid = self.db.add_job(payload={}, scheduled_at=1.0)
+        self.db.claim_next_due_job()
+        self.assertTrue(self.db.mark_dispatched(jid, "p-run"))
+        self.assertTrue(self.db.mark_running(jid, "p-run"))
+        self.assertFalse(
+            self.db.requeue_dispatched_after_aborted_post(jid),
+            "a running row must never be dragged back to the due queue",
+        )
+        self.assertEqual(self.db.get_job(jid)["status"], "running")
+
+
 class TestUpdateGuards(unittest.TestCase):
     def setUp(self):
         self.db, self.path = _fresh_db()

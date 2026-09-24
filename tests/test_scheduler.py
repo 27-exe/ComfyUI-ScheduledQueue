@@ -868,5 +868,374 @@ class TestPreDispatchHooks(unittest.TestCase):
                          "tick POST 2xx must clear the backoff counter")
 
 
-if __name__ == "__main__":
-    unittest.main(verbosity=2)
+
+# ---------------------------------------------------------------------------
+# 2026-09-24 fix (P2, dispatch state machine)
+# ---------------------------------------------------------------------------
+
+
+class TestDispatchStateMachineP2(unittest.TestCase):
+    """Regression tests for the three dispatch-state-machine defects.
+
+    A) ``mark_dispatched`` had no status guard, so a slow POST ack
+       landing after pause-all / run-now advanced the row would clobber
+       it back to 'dispatched' and wipe ``started_at``.
+    B) ``claim`` -> ``mark_dispatched`` had no rollback, so any exception
+       in between left a ``status='dispatched'`` / ``prompt_id=NULL``
+       row that no recovery path could ever reap.
+    C) A POST ACK read-timeout was treated as a plain failure, so the
+       job was re-POSTed and executed twice (ComfyUI had already
+       accepted the prompt).
+    """
+
+    def setUp(self):
+        self.db, self.path = _fresh_db()
+        _pf = patch.object(scheduler, "_preflight_prompt", return_value=(True, []))
+        _pf.start()
+        self.addCleanup(_pf.stop)
+
+    def tearDown(self):
+        self.db.close()
+        try:
+            os.unlink(self.path)
+        except OSError:
+            pass
+
+    @staticmethod
+    def _queue_entry(prompt_id, marker):
+        # ComfyUI's /queue entry is the 5-tuple it put()s:
+        #   (number, prompt_id, prompt, extra_data, outputs_to_execute)
+        # and /queue strips only the 6th (sensitive) element, so our
+        # extra_data marker comes back verbatim at index 3.
+        return [1, prompt_id, {}, {"sq_dispatch_id": marker}, []]
+
+    # ---- A: status guard on the late POST ack -------------------------
+
+    def test_late_post_ack_cannot_downgrade_running_row(self):
+        """2026-09-24 defect A. Simulate the race: claim -> POST starts
+        -> pause-all promotes/reclaims the row -> the POST ack arrives
+        with a prompt_id. The ack must not rewrite the newer state."""
+        self.db.set_state("paused", "0")
+        jid = self.db.add_job(payload={"x": 1}, scheduled_at=0.0)
+        self.db.claim_next_due_job()
+
+        # Concurrent pause-running-all: mark the row running now.
+        self.assertTrue(self.db.mark_dispatched(jid, "p-already-running"))
+        self.assertTrue(self.db.mark_running(jid, "p-already-running"))
+
+        w = scheduler.SchedulerThread(self.db, comfyui_url="http://fake-comfyui/")
+        with patch.object(scheduler.urllib.request, "urlopen") as u:
+            u.return_value = _FakeResponse(200, json.dumps({"prompt_id": "p-late-ack"}))
+            w.tick()
+
+        row = self.db.get_job(jid)
+        assert row is not None
+        self.assertEqual(row["status"], "running",
+                         "a late POST ack must not drag a running row back")
+        self.assertEqual(row["prompt_id"], "p-already-running")
+        self.assertIsNotNone(row["started_at"])
+        w.stop()
+
+    def test_mark_dispatched_guard_rejects_cancelled_row(self):
+        """A row that already left the live queue (cancelled / failed) must
+        refuse a late POST ack -- resurrecting it would create a zombie
+        'dispatched' row that ComfyUI has already finished."""
+        self.db.set_state("paused", "0")
+        jid = self.db.add_job(payload={"x": 1}, scheduled_at=0.0)
+        self.db.claim_next_due_job()
+        self.db.update_job(jid, status="cancelled")
+
+        w = scheduler.SchedulerThread(self.db, comfyui_url="http://fake-comfyui/")
+        with patch.object(scheduler.urllib.request, "urlopen") as u:
+            u.return_value = _FakeResponse(200, json.dumps({"prompt_id": "p-late"}))
+            # The DB-level contract tick() now depends on.
+            self.assertFalse(self.db.mark_dispatched(jid, "p-late"))
+        row = self.db.get_job(jid)
+        if row is not None:
+            self.assertEqual(row["status"], "cancelled")
+        w.stop()
+
+    # ---- B: claim -> mark_dispatched rollback ------------------------
+
+    def test_post_failure_rolls_claim_back_to_scheduled(self):
+        """2026-09-24 defect B. A 5xx between claim and mark_dispatched
+        must leave a claimable 'scheduled' row, not a zombie
+        'dispatched' row with prompt_id=NULL."""
+        self.db.set_state("paused", "0")
+        jid = self.db.add_job(payload={"x": 1}, scheduled_at=0.0)
+        w = scheduler.SchedulerThread(self.db, comfyui_url="http://fake-comfyui/")
+        with patch.object(scheduler.urllib.request, "urlopen") as u:
+            u.return_value = _FakeResponse(500, "boom")
+            w.tick()
+
+        row = self.db.get_job(jid)
+        assert row is not None
+        self.assertEqual(row["status"], "scheduled",
+                         "the claimed row must be rolled back into the due queue")
+        self.assertIsNone(row["prompt_id"])
+        self.assertEqual(row["retry_count"], 1)
+        w.stop()
+
+    def test_network_error_rolls_back_and_keeps_row_reclaimable(self):
+        """A pre-mark_dispatched connection error must not strand the
+        row: claim_next_due_job has to be able to pick it up again."""
+        self.db.set_state("paused", "0")
+        jid = self.db.add_job(payload={"x": 1}, scheduled_at=0.0)
+        w = scheduler.SchedulerThread(self.db, comfyui_url="http://fake-comfyui/")
+        with patch.object(scheduler.urllib.request, "urlopen") as u:
+            u.side_effect = OSError("connection refused")
+            w.tick()
+
+        row = self.db.get_job(jid)
+        assert row is not None
+        self.assertEqual(row["status"], "scheduled")
+        self.assertIsNone(row["prompt_id"])
+        self.assertIsNone(row["dispatched_at"])
+        # Emergency recovery: the row must be visible to a manual requeue.
+        self.db.update_job(jid, scheduled_at=0.0)
+        self.assertIsNotNone(self.db.claim_next_due_job(),
+                             "the row must be claimable again after a failed POST")
+        w.stop()
+
+    def test_4xx_still_fails_fast_without_retry(self):
+        """The rollback must NOT weaken the existing 4xx no-retry
+        contract (2026-09-13 incident). A rejected payload still goes
+        straight to failed."""
+        self.db.set_state("paused", "0")
+        jid = self.db.add_job(payload={"x": 1}, scheduled_at=0.0)
+        w = scheduler.SchedulerThread(self.db, comfyui_url="http://fake-comfyui/")
+        with patch.object(scheduler.urllib.request, "urlopen") as u:
+            u.return_value = _FakeResponse(400, "bad payload")
+            w.tick()
+        self.assertEqual(u.call_count, 1)
+        row = self.db.get_job(jid)
+        # 4xx fast-fail moves the row out of the live table entirely.
+        self.assertIsNone(row)
+        hist = self.db.list_history()
+        self.assertEqual(len(hist), 1)
+        self.assertEqual(hist[0]["status"], "failed")
+        self.assertIn("no retry", hist[0]["error"])
+        w.stop()
+
+    def test_preflight_failure_still_fails_fast_without_retry(self):
+        """Same contract for the preflight rejection path."""
+        self.db.set_state("paused", "0")
+        jid = self.db.add_job(payload={"x": 1}, scheduled_at=0.0)
+        w = scheduler.SchedulerThread(self.db, comfyui_url="http://fake-comfyui/")
+        from comfyui_scheduled_queue.preflight import PreflightError
+        err = PreflightError(type="not_api_format", node_id=None,
+                             field=None, message="bad payload")
+        with patch.object(scheduler, "_preflight_prompt", return_value=(False, [err])):
+            with patch.object(scheduler.urllib.request, "urlopen") as u:
+                w.tick()
+        self.assertEqual(u.call_count, 0, "rejected payload must not be POSTed")
+        hist = self.db.list_history()
+        self.assertEqual(hist[0]["status"], "failed")
+        self.assertIn("no retry", hist[0]["error"])
+        w.stop()
+
+    def test_failure_after_mark_dispatched_does_not_rollback(self):
+        """A failure landing AFTER mark_dispatched must leave the
+        dispatched row alone -- ComfyUI already holds the prompt, and
+        rolling it back would double-dispatch."""
+        self.db.set_state("paused", "0")
+        jid = self.db.add_job(payload={"x": 1}, scheduled_at=0.0)
+
+        def boom_urlopen(req, timeout=None):
+            # Emulate: POST succeeds (200 + prompt_id) but the very next
+            # state write raises.
+            return _FakeResponse(200, json.dumps({"prompt_id": "p-ok"}))
+
+        w = scheduler.SchedulerThread(self.db, comfyui_url="http://fake-comfyui/")
+        with patch.object(scheduler.urllib.request, "urlopen",
+                          side_effect=boom_urlopen):
+            with patch.object(w.db, "set_state", side_effect=RuntimeError("boom")):
+                w.tick()
+
+        row = self.db.get_job(jid)
+        assert row is not None, "the dispatched row must survive"
+        self.assertEqual(row["status"], "dispatched")
+        self.assertEqual(row["prompt_id"], "p-ok")
+        self.assertNotEqual(row["status"], "scheduled",
+                            "must not roll back a row that has a prompt_id")
+        w.stop()
+
+    # ---- C: POST ack timeout is not a failure ------------------------
+
+    def test_post_timeout_with_prompt_in_queue_is_treated_as_dispatched(self):
+        """2026-09-24 defect C. When the POST ACK times out but the
+        prompt turns up in ComfyUI's /queue, the job must NOT be
+        re-POSTed: record the prompt_id and mark it dispatched."""
+        self.db.set_state("paused", "0")
+        jid = self.db.add_job(payload={"x": 1}, scheduled_at=0.0)
+        w = scheduler.SchedulerThread(self.db, comfyui_url="http://fake-comfyui/")
+
+        calls = {"post": 0, "queue": 0}
+
+        def fake_urlopen(req, timeout=None):
+            url = req.full_url
+            if url.endswith("/prompt"):
+                calls["post"] += 1
+                # ComfyUI accepted the prompt but the reply never made it.
+                raise TimeoutError("read timed out")
+            if url.endswith("/queue"):
+                calls["queue"] += 1
+                return _FakeResponse(
+                    200,
+                    json.dumps({
+                        "queue_running": [],
+                        "queue_pending": [self._queue_entry("p-accepted", jid)],
+                    }),
+                )
+            raise AssertionError(f"unexpected url {url}")
+
+        with patch.object(scheduler.urllib.request, "urlopen",
+                          side_effect=fake_urlopen):
+            dispatched = w.tick()
+
+        self.assertTrue(dispatched, "a timeout + queue hit must count as dispatched")
+        self.assertEqual(calls["post"], 1, "the job must be POSTed exactly once")
+        self.assertEqual(calls["queue"], 1, "the /queue probe must run once")
+        row = self.db.get_job(jid)
+        assert row is not None
+        self.assertEqual(row["status"], "dispatched")
+        self.assertEqual(row["prompt_id"], "p-accepted",
+                         "the prompt_id recovered from /queue must be recorded")
+        self.assertEqual(row["retry_count"], 0,
+                         "a successful dispatch must not burn a retry")
+        w.stop()
+
+    def test_post_timeout_with_prompt_in_queue_running_slot(self):
+        """Same as above, but the prompt already moved to the running
+        slot (ComfyUI started executing before we re-checked)."""
+        self.db.set_state("paused", "0")
+        jid = self.db.add_job(payload={"x": 1}, scheduled_at=0.0)
+        w = scheduler.SchedulerThread(self.db, comfyui_url="http://fake-comfyui/")
+
+        def fake_urlopen(req, timeout=None):
+            if req.full_url.endswith("/prompt"):
+                raise TimeoutError("read timed out")
+            return _FakeResponse(
+                200,
+                json.dumps({
+                    "queue_running": [self._queue_entry("p-running", jid)],
+                    "queue_pending": [],
+                }),
+            )
+
+        with patch.object(scheduler.urllib.request, "urlopen",
+                          side_effect=fake_urlopen):
+            self.assertTrue(w.tick())
+
+        row = self.db.get_job(jid)
+        assert row is not None
+        self.assertEqual(row["status"], "dispatched")
+        self.assertEqual(row["prompt_id"], "p-running")
+        w.stop()
+
+    def test_post_timeout_without_queue_hit_takes_the_retry_ladder(self):
+        """A timeout where the prompt is NOT in the queue is a genuine
+        network failure: the normal retry ladder still applies."""
+        self.db.set_state("paused", "0")
+        jid = self.db.add_job(payload={"x": 1}, scheduled_at=0.0)
+        w = scheduler.SchedulerThread(self.db, comfyui_url="http://fake-comfyui/")
+
+        def fake_urlopen(req, timeout=None):
+            if req.full_url.endswith("/prompt"):
+                raise TimeoutError("read timed out")
+            return _FakeResponse(200, json.dumps({
+                "queue_running": [], "queue_pending": [],
+            }))
+
+        with patch.object(scheduler.urllib.request, "urlopen",
+                          side_effect=fake_urlopen):
+            self.assertFalse(w.tick(), "no queue hit means the POST failed")
+
+        row = self.db.get_job(jid)
+        assert row is not None
+        self.assertEqual(row["status"], "scheduled", "back on the retry ladder")
+        self.assertEqual(row["retry_count"], 1)
+        self.assertIsNone(row["prompt_id"])
+        self.assertIn("timed out", row["error"])
+        w.stop()
+
+    def test_post_timeout_with_unreadable_queue_takes_the_retry_ladder(self):
+        """If /queue itself is unreachable we cannot prove success, so
+        fall back to the retry ladder rather than guessing."""
+        self.db.set_state("paused", "0")
+        jid = self.db.add_job(payload={"x": 1}, scheduled_at=0.0)
+        w = scheduler.SchedulerThread(self.db, comfyui_url="http://fake-comfyui/")
+
+        def fake_urlopen(req, timeout=None):
+            if req.full_url.endswith("/prompt"):
+                raise TimeoutError("read timed out")
+            raise OSError("connection refused")
+
+        with patch.object(scheduler.urllib.request, "urlopen",
+                          side_effect=fake_urlopen):
+            self.assertFalse(w.tick())
+
+        row = self.db.get_job(jid)
+        assert row is not None
+        self.assertEqual(row["status"], "scheduled")
+        self.assertEqual(row["retry_count"], 1)
+        w.stop()
+
+    def test_post_timeout_does_not_duplicate_on_retry_ticks(self):
+        """End-to-end: three consecutive timing-out ticks must POST only
+        three times (one per tick) when each is confirmed queued, and
+        the row must stay at 'dispatched' with a prompt_id after the
+        first one -- the scheduler can never re-claim it."""
+        self.db.set_state("paused", "0")
+        jid = self.db.add_job(payload={"x": 1}, scheduled_at=0.0)
+        w = scheduler.SchedulerThread(self.db, comfyui_url="http://fake-comfyui/")
+
+        def fake_urlopen(req, timeout=None):
+            if req.full_url.endswith("/prompt"):
+                return _FakeResponse(200, json.dumps({"prompt_id": "p-once"}))
+            return _FakeResponse(200, json.dumps({"queue_running": [],
+                                                  "queue_pending": []}))
+
+        # Sanity: the normal path POSTs once and lands on dispatched.
+        with patch.object(scheduler.urllib.request, "urlopen",
+                          side_effect=fake_urlopen):
+            self.assertTrue(w.tick())
+        row = self.db.get_job(jid)
+        assert row is not None
+        self.assertEqual(row["status"], "dispatched")
+
+        # Subsequent ticks must find nothing due and POST nothing.
+        with patch.object(scheduler.urllib.request, "urlopen",
+                          side_effect=fake_urlopen) as u:
+            self.assertFalse(w.tick())
+            self.assertFalse(w.tick())
+        self.assertEqual(u.call_count, 0,
+                         "a dispatched job must never be re-claimed/re-POSTed")
+        self.assertEqual(self.db.get_job(jid)["status"], "dispatched")
+        w.stop()
+
+    def test_ambiguous_queue_match_does_not_attach_wrong_prompt(self):
+        """If /queue shows two entries carrying our marker, treat the
+        POST as failed rather than attaching the job to one of them."""
+        self.db.set_state("paused", "0")
+        jid = self.db.add_job(payload={"x": 1}, scheduled_at=0.0)
+        w = scheduler.SchedulerThread(self.db, comfyui_url="http://fake-comfyui/")
+
+        def fake_urlopen(req, timeout=None):
+            if req.full_url.endswith("/prompt"):
+                raise TimeoutError("read timed out")
+            return _FakeResponse(200, json.dumps({
+                "queue_running": [self._queue_entry("p-a", jid)],
+                "queue_pending": [self._queue_entry("p-b", jid)],
+            }))
+
+        with patch.object(scheduler.urllib.request, "urlopen",
+                          side_effect=fake_urlopen):
+            self.assertFalse(w.tick(),
+                             "an ambiguous match must not be treated as success")
+        row = self.db.get_job(jid)
+        assert row is not None
+        self.assertEqual(row["status"], "scheduled")
+        self.assertIsNone(row["prompt_id"])
+        w.stop()
+
