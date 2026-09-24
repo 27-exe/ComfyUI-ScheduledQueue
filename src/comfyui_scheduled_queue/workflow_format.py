@@ -216,7 +216,15 @@ def _build_node_inputs(node: dict, link_map: dict[int, tuple[int, int]]) -> dict
             log.warning("convert_ui_to_api: node id=%s input %r has dangling link %r",
                         node.get("id"), name, link_id)
             continue
-        inputs[name] = [src[0], src[1]]
+        # The link target MUST be a string: `api` keys are stringified node
+        # ids (see the `api[str(node_id)]` assignment above), and ComfyUI's
+        # execution engine resolves a link with `prompt[o_id]` -- a str key
+        # lookup. Emitting an int here produced payloads that every
+        # downstream consumer rejected:
+        #   * preflight.check_link_targets_exist  -> bad_linked_input
+        #   * ComfyUI execution.py                -> KeyError -> HTTP 400
+        # so a converted UI workflow could never dispatch at all.
+        inputs[name] = [str(src[0]), src[1]]
 
     # 2) Handle widget-driven inputs via widgets_values_named (preferred)
     #    or via INPUT_TYPES() schema fallback.

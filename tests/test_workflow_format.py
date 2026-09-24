@@ -198,7 +198,11 @@ class TestConvertMinimal(unittest.TestCase):
     def test_link_converted_to_source_array(self):
         out = convert_ui_to_api(_ui_format_minimal())
         # KSampler node 4's "model" input was sourced from node 2 output 0.
-        self.assertEqual(out["4"]["inputs"]["model"], [2, 0])
+        # The target id is a STRING: `api` keys are str (see convert_ui_to_api's
+        # `api[str(node_id)]`), ComfyUI resolves links with `prompt[o_id]`, and
+        # preflight.check_link_targets_exist compares against str keys. An int
+        # target here is what made every converted UI workflow undispatchable.
+        self.assertEqual(out["4"]["inputs"]["model"], ["2", 0])
 
     def test_widget_value_used_when_no_link(self):
         # KSampler has cfg=6 in widgets; positive/negative/latent_image are
@@ -219,7 +223,7 @@ class TestConvertMinimal(unittest.TestCase):
         self.assertIn("9", out)
         self.assertEqual(out["9"]["class_type"], "PreviewImage")
         # PreviewImage has only a link-driven images input.
-        self.assertEqual(out["9"]["inputs"]["images"], [5, 0])
+        self.assertEqual(out["9"]["inputs"]["images"], ["5", 0])
         self.assertEqual(set(out["9"]["inputs"].keys()), {"images"})
 
 
@@ -331,7 +335,7 @@ class TestUserWorkflow(unittest.TestCase):
         self.assertIsInstance(ks["inputs"]["cfg"], list)
         self.assertEqual(len(ks["inputs"]["steps"]), 2)
         # The model input was link-driven -- source is node 117 (FreeU_V2).
-        self.assertEqual(ks["inputs"]["model"], [117, 0])
+        self.assertEqual(ks["inputs"]["model"], ["117", 0])
 
     def test_user_workflow_controlnet_apply_advanced_widgets_extracted(self):
         """ControlNetApplyAdvanced has 3 widgets (strength, start_percent,
