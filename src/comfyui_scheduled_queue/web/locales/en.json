@@ -146,5 +146,6 @@
     "sched_pause.bad_format": "Use YYYY-MM-DD HH:MM",
     "sched_pause.saved": "Saved",
     "sched_pause.cleared": "Cleared",
-    "sched_pause.hint": "Fires once at the set time, with the same effect as the manual buttons."
+    "sched_pause.hint": "Fires once at the set time, with the same effect as the manual buttons.",
+    "sched_pause.in_past": "must be in the future"
 }

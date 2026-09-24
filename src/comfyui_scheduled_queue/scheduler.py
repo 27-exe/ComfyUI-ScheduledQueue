@@ -61,6 +61,48 @@ del _il_util, _os, _sys, _wf_spec, _wf_mod
 # importable in contexts where only the trigger logic is wanted.
 
 
+def _load_routes_module():
+    """Return the sibling ``routes`` module, importable in BOTH worlds.
+
+    Two ways this code gets loaded:
+
+      * **As a real package** (tests, CLI, anything with ``src/`` on
+        ``sys.path``) -- ``from comfyui_scheduled_queue import routes`` works.
+      * **Flat, by ComfyUI itself** -- every custom_node file is mounted via
+        ``importlib.util.spec_from_file_location`` under the dotted name
+        ``ComfyUI-ScheduledQueue.<mod>``. There is NO ``comfyui_scheduled_queue``
+        package in ``sys.modules``, so a plain absolute import raises
+        ``ModuleNotFoundError``.
+
+    The flat path is the one that matters in production, and it is exactly
+    the trap that made the first version of this function fail silently:
+    ``except Exception: return None`` turned ``ModuleNotFoundError`` into
+    "scheduled pause never happens", with only an error log line as evidence.
+
+    Mirrors ``routes``' own self-load of ``preflight``.
+    """
+    try:
+        from comfyui_scheduled_queue import routes
+        return routes
+    except ImportError:
+        pass
+    import importlib.util
+    import os
+    import sys
+    path = os.path.join(os.path.dirname(__file__), 'routes.py')
+    spec = importlib.util.spec_from_file_location(
+        'ComfyUI-ScheduledQueue.routes', path,
+    )
+    if spec is None or spec.loader is None:
+        raise ImportError('[ScheduledQueue] cannot self-load routes.py')
+    mod = sys.modules.get('ComfyUI-ScheduledQueue.routes')
+    if mod is None:
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules['ComfyUI-ScheduledQueue.routes'] = mod
+        spec.loader.exec_module(mod)
+    return mod
+
+
 def _parse_wallclock(value):
     """Parse a ``YYYY-MM-DDTHH:MM`` string into a POSIX timestamp.
 
@@ -502,7 +544,7 @@ class SchedulerThread:
                 # the next tick to hammer a rule we already attempted.
                 self.db.clear_pause_at()
                 try:
-                    from comfyui_scheduled_queue import routes as _routes
+                    _routes = _load_routes_module()
                     _routes._pause_all_blocking(self.db, self.comfyui_url)
                     log.info(
                         'scheduled pause fired at %s', time.strftime('%F %T'),

@@ -79,10 +79,16 @@ for (let i = start; i < source.length; i++) {
 }
 const fnSrc = source.slice(start, end);
 
-const elA = { attrs: {}, getAttribute(k) { return this.attrs[k] ?? null; },
-              setAttribute(k, v) { this.attrs[k] = v; } };
-const elB = { attrs: {}, getAttribute(k) { return this.attrs[k] ?? null; },
-              setAttribute(k, v) { this.attrs[k] = v; } };
+const elA = { attrs: { type: "datetime-local" },
+              getAttribute(k) { return this.attrs[k] ?? null; },
+              setAttribute(k, v) { this.attrs[k] = String(v); },
+              removeAttribute(k) { delete this.attrs[k]; },
+              hasAttribute(k) { return k in this.attrs; } };
+const elB = { attrs: { type: "datetime-local" },
+              getAttribute(k) { return this.attrs[k] ?? null; },
+              setAttribute(k, v) { this.attrs[k] = String(v); },
+              removeAttribute(k) { delete this.attrs[k]; },
+              hasAttribute(k) { return k in this.attrs; } };
 
 let healed = null;
 // Re-wrap the extracted body as a standalone function: `fnSrc` is the inner

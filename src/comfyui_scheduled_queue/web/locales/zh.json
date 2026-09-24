@@ -146,5 +146,6 @@
     "sched_pause.bad_format": "格式应为 年-月-日 时:分",
     "sched_pause.saved": "已保存",
     "sched_pause.cleared": "已清除",
-    "sched_pause.hint": "到点后自动暂停/恢复，语义与手动操作一致；规则触发一次后自动失效。"
+    "sched_pause.hint": "到点后自动暂停/恢复，语义与手动操作一致；规则触发一次后自动失效。",
+    "sched_pause.in_past": "必须在未来时间"
 }

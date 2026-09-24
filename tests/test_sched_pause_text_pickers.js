@@ -94,3 +94,39 @@ check("heal leaves an already-correct node alone",
             whole("_healSchedPausePlaceholders") +
             "\nreturn _healSchedPausePlaceholders;")(() => "YYYY-MM-DD HH:MM", null, b, null)();
         return JSON.stringify(b._a) === before; })());
+
+// ---- 4. nudges and saves must refuse a past timestamp ----------------
+check("the nudge handler clamps to the next whole minute",
+    /Math\.max\(raw, floor\)/.test(source),
+    "a -1h on a near-future value would otherwise round-trip into the past");
+check("the nudge handler computes a floor",
+    /const floor = _spNextWholeMinute\(\);/.test(source));
+check("saveSchedPause pre-checks for a past value",
+    /ts < floor/.test(source));
+check("the in-past message key exists in both locales",
+    (function () {
+        ["zh", "en"].forEach(function (l) {
+            var d = JSON.parse(fs.readFileSync(
+                path.join(__dirname, "..", "src", "comfyui_scheduled_queue",
+                    "web", "locales", l + ".json"), "utf8"));
+            if (!d["sched_pause.in_past"]) throw new Error("missing in_past in " + l);
+        });
+        return true;
+    })());
+
+// ---- 5. the flat-load trap must not reappear -------------------------
+var schedSrc = fs.readFileSync(
+    path.join(__dirname, "..", "src", "comfyui_scheduled_queue", "scheduler.py"),
+    "utf8");
+check("scheduler loads routes through a loader helper",
+    /def _load_routes_module\(/.test(schedSrc) &&
+    /_routes = _load_routes_module\(\)/.test(schedSrc),
+    "a bare absolute import raises ModuleNotFoundError under ComfyUI's flat load");
+check("the loader falls back to spec_from_file_location",
+    /spec_from_file_location/.test(schedSrc));
+check("no bare absolute routes import remains in scheduler",
+    !/from comfyui_scheduled_queue import routes as _routes/.test(schedSrc));
+
+
+if (failures) { console.log("\n" + failures + " FAILURE(S)"); process.exit(1); }
+console.log("\nALL PASS");

@@ -812,6 +812,21 @@ function buildPanel() {
             _schedPauseMsg(t("sched_pause.bad_format", "Use YYYY-MM-DD HH:MM"), false);
             return;
         }
+        // A past time is rejected server-side too, but intercepting it here
+        // names the problem instead of surfacing an opaque 400.
+        const floor = _spNextWholeMinute();
+        for (const [field, raw] of [["pause_at", pauseIn], ["resume_at", resumeIn]]) {
+            if (!raw) continue;
+            const ts = _spParse(raw);
+            if (ts != null && ts < floor) {
+                _schedPauseMsg(
+                    `${t("sched_pause." + field.slice(0, -3), field)}: ` +
+                    t("sched_pause.in_past", "must be in the future"),
+                    false,
+                );
+                return;
+            }
+        }
         const body = {
             pause_at: pauseIn ? _spNormalise(pauseIn) : "",
             resume_at: resumeIn ? _spNormalise(resumeIn) : "",
@@ -1288,7 +1303,13 @@ function buildPanel() {
             const el = role === "resume-at" ? resumeAtInput : pauseAtInput;
             if (!el || !Number.isFinite(delta)) return;
             const base = _spParse(el.value);
-            el.value = _spFormat((base == null ? _spNextWholeMinute() : base) + delta);
+            // Clamp to the nearest moment the backend will still accept.
+            // -1h / -10m on a near-future time would otherwise land in the
+            // past, and the POST would come back 400 "must be in the future"
+            // with no hint that the offending click was the nudge.
+            const floor = _spNextWholeMinute();
+            const raw = (base == null ? floor : base) + delta;
+            el.value = _spFormat(Math.max(raw, floor));
             _renderSchedPausePreview();
         });
     });
