@@ -13,9 +13,7 @@
     "sidebar.lang.en": "EN",
     "sidebar.lang.switch_to_zh": "切换为中文",
     "sidebar.lang.switch_to_en": "Switch to English",
-
     "topbar.schedule_tooltip": "调度当前工作流 (发送到 ScheduledQueue,不是 ComfyUI 原生队列)",
-
     "filter.all": "全部",
     "filter.scheduled": "待执行",
     "filter.running": "执行中",
@@ -24,7 +22,6 @@
     "filter.cancelled": "已取消",
     "filter.interrupted": "已中断",
     "filter.dispatched": "已投递",
-
     "status.scheduled": "等待中",
     "status.running": "运行中",
     "status.dispatched": "已投递",
@@ -32,7 +29,6 @@
     "status.failed": "失败",
     "status.cancelled": "已取消",
     "status.interrupted": "已中断",
-
     "status_bar.paused": "已暂停",
     "status_bar.paused_yes": "是",
     "status_bar.paused_no": "否",
@@ -43,7 +39,6 @@
     "status_bar.label.done": "成功",
     "status_bar.label.fail": "失败",
     "status_bar.label.cncl": "取消",
-
     "job.completed_at": "完成于",
     "job.failed_at": "失败于",
     "job.cancelled_at": "取消于",
@@ -55,14 +50,12 @@
     "job.paused": "暂停中",
     "job.no_preview": "无预览",
     "job.untitled": "未命名",
-
     "job.time.now": "立即",
     "job.time.in_past_seconds": "{0} 秒前",
     "job.time.in_future_seconds": "{0} 秒后",
     "job.time.in_hms": "{0} 小时 {1} 分 {2} 秒后",
     "job.time.in_hm": "{0} 小时 {1} 分后",
     "job.time.in_h": "{0} 小时后",
-
     "action.up": "上移",
     "action.up_title": "上移 (提高优先级)",
     "action.down": "下移",
@@ -85,25 +78,20 @@
     "action.export_title": "导出此任务 (下载 JSON)",
     "action.submit": "提交",
     "action.schedule": "调度",
-
     "sidebar.pause_title": "暂停调度器 (只影响已投递的任务;运行中的任务不受影响)",
     "sidebar.resume_title": "恢复调度器 (把中断的任务翻回待执行)",
-
     "confirm.requeue": "把已投递的这行退回待执行?ComfyUI 队列里该 prompt 也会被移除。",
-    "confirm.cancel_running": "中断 ComfyUI 中的 prompt 并把该行标记为失败?ComfyUI 的 worker 可能还会再跑几秒。",
+    "confirm.cancel_running": "取消正在执行的任务?该 prompt 在 ComfyUI 中会继续执行,本行将标记为已取消。",
     "confirm.row_pause": "全局暂停调度器?新任务不会再被投递,所有已投递的任务会收回为待执行;运行中的任务不受影响。",
     "confirm.row_resume": "全局恢复调度器?所有中断的任务会翻回待执行并在下一个 tick 重新投递。",
-
     "clear.toggle": "清除...",
     "clear.execute": "清除所选",
     "clear.empty": "请先选择要清除的状态",
     "clear.failed": "操作失败",
     "clear.alert": "清除失败",
-
     "pager.prev": "上一页",
     "pager.next": "下一页",
     "pager.page_of": "第 {0} 页 (共 {1} 条)",
-
     "error.network": "网络错误",
     "error.invalid_time": "无效的时间格式",
     "error.empty_workflow": "当前工作流为空",
@@ -114,9 +102,7 @@
     "error.network_full": "网络错误",
     "error.scheduled_in_past": "调度时间必须在未来",
     "error.serialize_workflow": "无法序列化工作流",
-
     "time.left": "{0} 后投递",
-
     "dialog.title": "调度当前工作流",
     "dialog.schedule_title": "调度当前工作流",
     "dialog.when_label": "执行时间 (本地时间)",
@@ -129,14 +115,12 @@
     "dialog.note_placeholder": "例如:早晨批次 / 变体 3",
     "dialog.submit": "提交",
     "dialog.cancel": "取消",
-
     "dialog.preset.now": "立即",
     "dialog.preset.30s": "30 秒后",
     "dialog.preset.5min": "5 分钟后",
     "dialog.preset.30min": "30 分钟后",
     "dialog.preset.2hours": "2 小时后",
     "dialog.preset.next7": "下一个 7 点",
-
     "dialog.delta.dec_1h": "-1 小时",
     "dialog.delta.dec_10m": "-10 分",
     "dialog.delta.dec_1m": "-1 分",
@@ -147,10 +131,17 @@
     "dialog.delta.inc_1m": "+1 分",
     "dialog.delta.inc_10m": "+10 分",
     "dialog.delta.inc_1h": "+1 小时",
-
     "confirm.cancel": "确定要取消这个任务?",
     "confirm.cancel_dispatched": "此任务已投递到 ComfyUI 队列,取消会将其从队列中取出。继续?",
-    "confirm.cancel_running": "取消正在执行的任务?该 prompt 在 ComfyUI 中会继续执行,本行将标记为已取消。",
-
-    "preview.no_preview": "无预览"
+    "preview.no_preview": "无预览",
+    "sched_pause.title": "定时暂停",
+    "sched_pause.pause_at": "暂停于",
+    "sched_pause.resume_at": "恢复于",
+    "sched_pause.save": "保存",
+    "sched_pause.clear": "清除",
+    "sched_pause.armed": "已设定",
+    "sched_pause.not_armed": "未设定",
+    "sched_pause.saved": "已保存",
+    "sched_pause.cleared": "已清除",
+    "sched_pause.hint": "到点后自动暂停/恢复，语义与手动操作一致；规则触发一次后自动失效。"
 }

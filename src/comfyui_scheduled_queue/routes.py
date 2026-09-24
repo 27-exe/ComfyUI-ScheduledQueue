@@ -1653,6 +1653,118 @@ async def resume_all_handler(request) -> "web.Response":  # type: ignore[name-de
     return _json_response({"paused": False, "resumed_count": int(resumed_count)})
 
 
+def _parse_wallclock_value(text):
+    """Parse ``YYYY-MM-DDTHH:MM`` into a POSIX timestamp, or ``None``.
+
+    Delegates to ``scheduler._parse_wallclock`` so the value the HTTP layer
+    accepts and the value the scheduler loop understands are produced by
+    exactly one implementation. A second copy here could drift and let the
+    API store a rule the loop silently ignores.
+    """
+    try:
+        from comfyui_scheduled_queue.scheduler import _parse_wallclock
+        return _parse_wallclock(text)
+    except Exception:
+        return None
+
+
+async def pause_schedule_handler(request) -> "web.Response":  # type: ignore[name-defined]
+    """GET/POST /api/schedule/pause-schedule
+
+    Read (GET) or write (POST) the one-shot scheduled-pause rule.
+
+    GET  -> 200 ``{"pause_at": "<YYYY-MM-DDTHH:MM>"|"", "resume_at": ...}``
+
+    POST accepts either field as a string or ``null``/``""`` to clear it.
+    A missing field leaves that rule untouched, so the frontend can update
+    one half of the pair without ever clearing the other by accident.
+
+    Validation is deliberately strict: the value MUST be a parseable
+    ``YYYY-MM-DDTHH:MM`` (or the ``:SS`` variant). Anything else is a 400
+    with a reason, because silently storing a value the scheduler can
+    never parse would leave the user believing a pause is armed when it
+    is not.
+
+    The scheduler fires the rule exactly once and then clears it, so a
+    rule read back after it fired is simply absent -- it never replays.
+    """
+    db = request.app.get("sq_db")
+    if db is None:
+        return _server_error("db not initialized")
+
+    if request.method == "GET":
+        try:
+            return _json_response({
+                "pause_at": db.get_pause_at() or "",
+                "resume_at": db.get_resume_at() or "",
+            })
+        except Exception:
+            _log.exception("pause_schedule: read failed")
+            return _server_error("database error")
+
+    try:
+        body = await request.json()
+    except Exception:
+        return _json_response(
+            {"error": "body must be a JSON object"}, status=400,
+        )
+
+    if not isinstance(body, dict):
+        return _json_response(
+            {"error": "body must be a JSON object"}, status=400,
+        )
+
+    # Validate BOTH fields before writing either one. Writing as we go
+    # would let a rejected ``resume_at`` leave an accepted ``pause_at``
+    # already committed — a half-applied rule the user never asked for.
+    # So: normalise everything first, bail out on the first problem, and
+    # only touch the database once the whole request is known good.
+    now = time.time()
+    pending = []                       # [(setter, value_to_store), ...]
+
+    for field, setter in (
+        ("pause_at", db.set_pause_at),
+        ("resume_at", db.set_resume_at),
+    ):
+        if field not in body:
+            continue
+        value = body[field]
+        if value is None:
+            pending.append((setter, ""))
+            continue
+        if not isinstance(value, str):
+            return _json_response(
+                {"error": f"{field} must be a string or null"}, status=400,
+            )
+        text = value.strip()
+        if not text:
+            pending.append((setter, ""))
+            continue
+        parsed = _parse_wallclock_value(text)
+        if parsed is None:
+            return _json_response(
+                {"error": f"{field} must be YYYY-MM-DDTHH:MM"}, status=400,
+            )
+        if parsed <= now:
+            return _json_response(
+                {"error": f"{field} must be in the future"}, status=400,
+            )
+        pending.append((setter, text))
+
+    # Every field validated — now the writes are guaranteed to succeed.
+    for setter, value in pending:
+        setter(value)
+
+    try:
+        return _json_response({
+            "pause_at": db.get_pause_at() or "",
+            "resume_at": db.get_resume_at() or "",
+        })
+    except Exception:
+        _log.exception("pause_schedule: read-back failed")
+        return _server_error("database error")
+
+
 async def run_now_handler(request) -> "web.Response":  # type: ignore[name-defined]
     """POST /api/schedule/run-now/{job_id}
 
@@ -2118,6 +2230,12 @@ def setup_routes(db, interceptor=None) -> bool:
     app.router.add_post("/api/schedule/pause-all", pause_all_handler)
     app.router.add_post("/api/schedule/pause-running-all", pause_running_all_handler)
     app.router.add_post("/api/schedule/resume-all", resume_all_handler)
+    app.router.add_route(
+        "GET", "/api/schedule/pause-schedule", pause_schedule_handler,
+    )
+    app.router.add_route(
+        "POST", "/api/schedule/pause-schedule", pause_schedule_handler,
+    )
     app.router.add_post("/api/schedule/run-now/{job_id}", run_now_handler)
     app.router.add_get("/api/schedule/orphan-status", orphan_status_handler)
 
