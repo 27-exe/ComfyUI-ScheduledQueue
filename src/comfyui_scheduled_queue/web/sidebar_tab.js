@@ -280,11 +280,13 @@ function buildPanel() {
             <div style="display:flex;align-items:center;gap:6px;margin-bottom:4px;">
                 <label for="sq-pause-at" style="width:52px;color:#aaa;">${escapeHtml(t("sched_pause.pause_at", "Pause at"))}</label>
                 <input id="sq-pause-at" data-role="pause-at" type="datetime-local" step="60"
+                    placeholder="${escapeHtml(t("sched_pause.placeholder", "YYYY-MM-DD HH:MM"))}"
                     style="flex:1;padding:4px;background:#1b1b1b;color:#fff;border:1px solid #444;border-radius:3px;" />
             </div>
             <div style="display:flex;align-items:center;gap:6px;margin-bottom:6px;">
                 <label for="sq-resume-at" style="width:52px;color:#aaa;">${escapeHtml(t("sched_pause.resume_at", "Resume at"))}</label>
                 <input id="sq-resume-at" data-role="resume-at" type="datetime-local" step="60"
+                    placeholder="${escapeHtml(t("sched_pause.placeholder", "YYYY-MM-DD HH:MM"))}"
                     style="flex:1;padding:4px;background:#1b1b1b;color:#fff;border:1px solid #444;border-radius:3px;" />
             </div>
             <div style="display:flex;gap:6px;">

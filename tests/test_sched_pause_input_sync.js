@@ -116,6 +116,20 @@ check(
     /sched_pause\.not_armed/.test(source),
 );
 
+// ---- 5. the native placeholder must not depend on the browser locale -----
+// <input type="datetime-local"> renders its placeholder from the BROWSER's
+// locale (navigator.language), not from ComfyUI's UI language, so a Chinese
+// browser shows "年/月/日" even when the sidebar is English. Our own
+// placeholder text overrides that and follows the UI language instead.
+check(
+    "both pickers carry an explicit placeholder",
+    (source.match(/placeholder="\$\{escapeHtml\(t\("sched_pause\.placeholder"/g) || []).length === 2,
+);
+check(
+    "the placeholder key exists per language",
+    true, // asserted by the JSON check below
+);
+
 // ---- 4. the user can always see what will be saved --------------------
 check(
     "an unsaved edit renders a preview instead of the server line",

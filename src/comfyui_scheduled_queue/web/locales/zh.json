@@ -141,6 +141,7 @@
     "sched_pause.clear": "清除",
     "sched_pause.armed": "已设定",
     "sched_pause.not_armed": "未设定",
+    "sched_pause.placeholder": "年-月-日 时:分",
     "sched_pause.preview": "未保存",
     "sched_pause.saved": "已保存",
     "sched_pause.cleared": "已清除",
