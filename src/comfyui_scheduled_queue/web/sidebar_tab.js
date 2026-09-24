@@ -279,15 +279,29 @@ function buildPanel() {
             </div>
             <div style="display:flex;align-items:center;gap:6px;margin-bottom:4px;">
                 <label for="sq-pause-at" style="width:52px;color:#aaa;">${escapeHtml(t("sched_pause.pause_at", "Pause at"))}</label>
-                <input id="sq-pause-at" data-role="pause-at" type="datetime-local" step="60"
+                <input id="sq-pause-at" data-role="pause-at" type="text" spellcheck="false" autocomplete="off"
                     placeholder="${escapeHtml(t("sched_pause.placeholder", "YYYY-MM-DD HH:MM"))}"
                     style="flex:1;padding:4px;background:#1b1b1b;color:#fff;border:1px solid #444;border-radius:3px;" />
             </div>
-            <div style="display:flex;align-items:center;gap:6px;margin-bottom:6px;">
+            <div data-role="sched-pause-nudge-pause" style="display:flex;flex-wrap:wrap;gap:2px;margin-bottom:6px;">
+                <button type="button" data-sched-delta="pause-at:-3600" style="padding:2px 6px;background:#333;color:#ccc;border:none;border-radius:3px;cursor:pointer;font-size:10px;">-1h</button>
+                <button type="button" data-sched-delta="pause-at:-600" style="padding:2px 6px;background:#333;color:#ccc;border:none;border-radius:3px;cursor:pointer;font-size:10px;">-10m</button>
+                <button type="button" data-sched-delta="pause-at:600" style="padding:2px 6px;background:#333;color:#ccc;border:none;border-radius:3px;cursor:pointer;font-size:10px;">+10m</button>
+                <button type="button" data-sched-delta="pause-at:3600" style="padding:2px 6px;background:#333;color:#ccc;border:none;border-radius:3px;cursor:pointer;font-size:10px;">+1h</button>
+                <button type="button" data-sched-delta="pause-at:86400" style="padding:2px 6px;background:#333;color:#ccc;border:none;border-radius:3px;cursor:pointer;font-size:10px;">+1d</button>
+            </div>
+            <div style="display:flex;align-items:center;gap:6px;margin-bottom:4px;">
                 <label for="sq-resume-at" style="width:52px;color:#aaa;">${escapeHtml(t("sched_pause.resume_at", "Resume at"))}</label>
-                <input id="sq-resume-at" data-role="resume-at" type="datetime-local" step="60"
+                <input id="sq-resume-at" data-role="resume-at" type="text" spellcheck="false" autocomplete="off"
                     placeholder="${escapeHtml(t("sched_pause.placeholder", "YYYY-MM-DD HH:MM"))}"
                     style="flex:1;padding:4px;background:#1b1b1b;color:#fff;border:1px solid #444;border-radius:3px;" />
+            </div>
+            <div data-role="sched-pause-nudge-resume" style="display:flex;flex-wrap:wrap;gap:2px;margin-bottom:6px;">
+                <button type="button" data-sched-delta="resume-at:-3600" style="padding:2px 6px;background:#333;color:#ccc;border:none;border-radius:3px;cursor:pointer;font-size:10px;">-1h</button>
+                <button type="button" data-sched-delta="resume-at:-600" style="padding:2px 6px;background:#333;color:#ccc;border:none;border-radius:3px;cursor:pointer;font-size:10px;">-10m</button>
+                <button type="button" data-sched-delta="resume-at:600" style="padding:2px 6px;background:#333;color:#ccc;border:none;border-radius:3px;cursor:pointer;font-size:10px;">+10m</button>
+                <button type="button" data-sched-delta="resume-at:3600" style="padding:2px 6px;background:#333;color:#ccc;border:none;border-radius:3px;cursor:pointer;font-size:10px;">+1h</button>
+                <button type="button" data-sched-delta="resume-at:86400" style="padding:2px 6px;background:#333;color:#ccc;border:none;border-radius:3px;cursor:pointer;font-size:10px;">+1d</button>
             </div>
             <div style="display:flex;gap:6px;">
                 <button data-act="save-sched-pause" style="padding:4px 10px;background:#0078d4;color:#fff;border:none;border-radius:3px;cursor:pointer;">${escapeHtml(t("sched_pause.save", "Save"))}</button>
@@ -622,6 +636,59 @@ function buildPanel() {
         return _dtLocalValue(d);
     }
 
+    // --- scheduled-pause text-input helpers -----------------------------
+    //
+    // The pickers are plain <input type="text"> on purpose:
+    // <input type="datetime-local"> renders its placeholder from the BROWSER
+    // locale (navigator.language), and Chrome ignores the HTML `placeholder`
+    // attribute for that type -- so a Chinese browser showed 年/月/日 even in
+    // an English UI, and no locale file or attribute overrode it. A text
+    // field plus explicit +/- buttons behaves the same in every browser and
+    // every UI language, which is what the add/edit job dialogs already do.
+
+    function _spPad2(n) { return String(n).padStart(2, "0"); }
+
+    // Seconds -> "YYYY-MM-DD HH:MM", local time. What the user sees/types.
+    function _spFormat(ts) {
+        const d = new Date(ts * 1000);
+        return `${d.getFullYear()}-${_spPad2(d.getMonth() + 1)}-${_spPad2(d.getDate())} `
+            + `${_spPad2(d.getHours())}:${_spPad2(d.getMinutes())}`;
+    }
+
+    // User entry -> seconds, or null. Accepts both " " and "T" separators
+    // and a trailing seconds field, because people type either.
+    function _spParse(text) {
+        if (typeof text !== "string") return null;
+        const m = text.trim().match(
+            /^(\d{4})[-/](\d{1,2})[-/](\d{1,2})[ T](\d{1,2}):(\d{1,2})(?::(\d{1,2}))?$/);
+        if (!m) return null;
+        const Y = parseInt(m[1], 10), Mo = parseInt(m[2], 10) - 1,
+            D = parseInt(m[3], 10), H = parseInt(m[4], 10),
+            Mi = parseInt(m[5], 10), S = m[6] == null ? 0 : parseInt(m[6], 10);
+        if (Mo < 0 || Mo > 11 || D < 1 || D > 31) return null;
+        if (H > 23 || Mi > 59 || S > 59) return null;
+        const dt = new Date(Y, Mo, D, H, Mi, S, 0);
+        if (isNaN(dt.getTime())) return null;
+        return Math.floor(dt.getTime() / 1000);
+    }
+
+    // Nudging an empty field must offer something usable, not NaN.
+    function _spNextWholeMinute() {
+        return Math.floor(Date.now() / 1000) + 60;
+    }
+
+    // Always hand the backend the "T" form its parser expects.
+    function _spNormalise(text) {
+        const ts = _spParse(text);
+        if (ts == null) return "";
+        // Rebuild from LOCAL components. toISOString() would emit UTC, which
+        // silently shifts the rule by the machine's UTC offset -- 8 hours
+        // early on this box (UTC+8).
+        const d = new Date(ts * 1000);
+        return `${d.getFullYear()}-${_spPad2(d.getMonth() + 1)}-${_spPad2(d.getDate())}`
+            + `T${_spPad2(d.getHours())}:${_spPad2(d.getMinutes())}`;
+    }
+
     async function loadSchedPause() {
         try {
             const data = await callApi("/pause-schedule");
@@ -665,9 +732,16 @@ function buildPanel() {
     function _healSchedPausePlaceholders() {
         const want = t("sched_pause.placeholder", "YYYY-MM-DD HH:MM");
         for (const el of [pauseAtInput, resumeAtInput]) {
-            if (el && el.getAttribute("placeholder") !== want) {
+            if (!el) continue;
+            // A node mounted by an OLDER version of this file is still a
+            // datetime-local, and Chrome then ignores every attribute we set
+            // on it. Flipping the type first makes the rest of the healing
+            // able to take effect.
+            if (el.getAttribute("type") !== "text") el.setAttribute("type", "text");
+            if (el.getAttribute("placeholder") !== want) {
                 el.setAttribute("placeholder", want);
             }
+            if (el.hasAttribute("step")) el.removeAttribute("step");
         }
     }
 
@@ -728,9 +802,19 @@ function buildPanel() {
         // read-back is guaranteed to match the inputs the user sees.
         // Omitting a key would leave the stored value untouched and the UI
         // could then display a rule the user just tried to clear.
+        // Send the backend's canonical "T" form, and refuse to send a rule we
+        // cannot parse. Silently dropping it would leave the user believing a
+        // pause is armed when nothing is stored.
+        const pauseIn = pauseAtInput.value.trim();
+        const resumeIn = resumeAtInput.value.trim();
+        if ((pauseIn && !_spNormalise(pauseIn)) ||
+            (resumeIn && !_spNormalise(resumeIn))) {
+            _schedPauseMsg(t("sched_pause.bad_format", "Use YYYY-MM-DD HH:MM"), false);
+            return;
+        }
         const body = {
-            pause_at: pauseAtInput.value || "",
-            resume_at: resumeAtInput.value || "",
+            pause_at: pauseIn ? _spNormalise(pauseIn) : "",
+            resume_at: resumeIn ? _spNormalise(resumeIn) : "",
         };
         try {
             const data = await callApi("/pause-schedule", {
@@ -1192,6 +1276,22 @@ function buildPanel() {
     if (resumeAtInput) resumeAtInput.addEventListener("input", _renderSchedPausePreview);
     if (saveSchedPauseBtn) saveSchedPauseBtn.addEventListener("click", () => saveSchedPause());
     if (clearSchedPauseBtn) clearSchedPauseBtn.addEventListener("click", () => clearSchedPause());
+    // +/- nudges for the text pickers. An empty field has no base, so it
+    // starts from the next whole minute -- the buttons stay useful on a
+    // fresh panel instead of doing nothing.
+    root.querySelectorAll("[data-sched-delta]").forEach((btn) => {
+        btn.addEventListener("click", () => {
+            const spec = String(btn.dataset.schedDelta || "");
+            const sep = spec.lastIndexOf(":");
+            const role = spec.slice(0, sep);
+            const delta = parseInt(spec.slice(sep + 1), 10);
+            const el = role === "resume-at" ? resumeAtInput : pauseAtInput;
+            if (!el || !Number.isFinite(delta)) return;
+            const base = _spParse(el.value);
+            el.value = _spFormat((base == null ? _spNextWholeMinute() : base) + delta);
+            _renderSchedPausePreview();
+        });
+    });
     pauseResumeBtn.addEventListener("click", async () => {
         // Use data-state (set in renderStatus) rather than localized button
         // text; this is the canonical scheduler state mirror and survives
