@@ -5,6 +5,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -221,6 +222,154 @@ class TestReconcile(unittest.TestCase):
         self.assertEqual(self.db.get_job(running)["status"], "running")
 
 
+# ---------------------------------------------------------------------------
+# 2026-09-24 fix (P2, dispatch state machine)
+# ---------------------------------------------------------------------------
+
+
+class TestDispatchStateMachineGuards(unittest.TestCase):
+    """Regression guards for the three defects that desynchronised the
+    scheduler's state machine from ComfyUI's real execution state.
+
+    A) mark_dispatched had no status guard, so a slow POST response
+       landing *after* a concurrent pause-all / run-now / requeue had
+       advanced the row would clobber it back to 'dispatched' and wipe
+       started_at.
+    B) claim_next_due_job -> mark_dispatched had no rollback, so any
+       exception in between left an unreapable 'dispatched'
+       prompt_id=NULL row.
+    """
+
+    def setUp(self):
+        self.db, self.path = _fresh_db()
+
+    def tearDown(self):
+        self.db.close()
+        try:
+            os.unlink(self.path)
+        except OSError:
+            pass
+
+    # ---- A: mark_dispatched status guard ------------------------------
+
+    def test_mark_dispatched_refuses_to_downgrade_running_row(self):
+        """2026-09-24 defect A: a POST ack that lands after the row was
+        promoted to 'running' must NOT rewrite it as 'dispatched'. The
+        prompt is already executing in ComfyUI, so the row is strictly
+        further along than this completion event."""
+        jid = self.db.add_job(payload={}, scheduled_at=1.0)
+        self.db.mark_dispatched(jid, "p-run")
+        self.assertTrue(self.db.mark_running(jid, "p-run"))
+
+        # Now a late POST ack arrives (race with a concurrent pause/run-now
+        # that had already advanced the row).
+        self.assertFalse(
+            self.db.mark_dispatched(jid, "p-late"),
+            "mark_dispatched must reject a 'running' row",
+        )
+
+        row = self.db.get_job(jid)
+        assert row is not None
+        self.assertEqual(row["status"], "running", "status must stay 'running'")
+        self.assertEqual(row["prompt_id"], "p-run", "prompt_id must not be clobbered")
+        self.assertIsNotNone(row["started_at"], "started_at must survive")
+
+    def test_mark_dispatched_refuses_failed_and_cancelled_rows(self):
+        """Terminal / cancelled rows are also out of scope for a late ack:
+        the job already left the live queue, and re-flipping it to
+        'dispatched' would resurrect a zombie row."""
+        for terminal in ("failed", "cancelled"):
+            with self.subTest(terminal=terminal):
+                jid = self.db.add_job(payload={}, scheduled_at=1.0)
+                self.db.update_job(jid, status=terminal)
+                self.assertFalse(
+                    self.db.mark_dispatched(jid, "p-late"),
+                    f"mark_dispatched must reject a '{terminal}' row",
+                )
+                row = self.db.get_job(jid)
+                if row is not None:
+                    self.assertEqual(row["status"], terminal)
+
+    def test_mark_dispatched_still_works_on_scheduled_and_dispatched(self):
+        """The guard must not break the happy paths."""
+        # 'scheduled' -- e.g. a job dispatched directly without claim.
+        jid_a = self.db.add_job(payload={}, scheduled_at=1.0)
+        self.assertTrue(self.db.mark_dispatched(jid_a, "p-a"))
+        self.assertEqual(self.db.get_job(jid_a)["status"], "dispatched")
+
+        # 'dispatched' -- the normal claim-then-POST ordering (re-stamp).
+        jid_b = self.db.add_job(payload={}, scheduled_at=1.0)
+        self.assertIsNotNone(self.db.claim_next_due_job())
+        self.assertTrue(self.db.mark_dispatched(jid_b, "p-b"))
+        row = self.db.get_job(jid_b)
+        assert row is not None
+        self.assertEqual(row["status"], "dispatched")
+        self.assertEqual(row["prompt_id"], "p-b")
+
+    def test_mark_dispatched_returns_false_for_unknown_job(self):
+        self.assertFalse(self.db.mark_dispatched("no-such-id", "p-x"))
+
+    # ---- B: claim -> mark_dispatched rollback ------------------------
+
+    def test_requeue_after_aborted_post_restores_scheduled_state(self):
+        """2026-09-24 defect B: after claim flips the row to
+        'dispatched' with prompt_id=NULL, a failed POST must be able to
+        roll it back into the due queue instead of leaving a stuck row."""
+        jid = self.db.add_job(payload={}, scheduled_at=1.0)
+        claimed = self.db.claim_next_due_job()
+        assert claimed is not None
+        self.assertEqual(claimed["status"], "dispatched")
+        self.assertIsNone(claimed["prompt_id"], "claim leaves prompt_id NULL")
+
+        rolled = self.db.requeue_dispatched_after_aborted_post(jid)
+        self.assertTrue(rolled, "the rollback must reach the row")
+
+        row = self.db.get_job(jid)
+        assert row is not None
+        self.assertEqual(row["status"], "scheduled", "row is due again")
+        self.assertIsNone(row["prompt_id"])
+        self.assertIsNone(row["dispatched_at"])
+        self.assertIsNone(row["started_at"])
+        # And it is claimable again -- previously impossible.
+        self.assertIsNotNone(self.db.claim_next_due_job())
+
+    def test_requeue_after_aborted_post_is_idempotent_and_status_guarded(self):
+        """Calling it twice must not double-roll a row, and it must not
+        touch a row that a concurrent pause-all / run-now already moved
+        to 'scheduled' or 'interrupted'."""
+        jid = self.db.add_job(payload={}, scheduled_at=1.0)
+        self.db.claim_next_due_job()
+        self.assertTrue(self.db.mark_dispatched(jid, "p-ok"))
+
+        # Row already has a prompt_id and was legitimately dispatched.
+        self.assertFalse(
+            self.db.requeue_dispatched_after_aborted_post(jid),
+            "a row with a prompt_id (already POSTed) must not be rolled back "
+            "into the due queue -- it would double-dispatch",
+        )
+        row = self.db.get_job(jid)
+        assert row is not None
+        self.assertEqual(row["status"], "dispatched")
+        self.assertEqual(row["prompt_id"], "p-ok")
+
+        # A plain rollback, once, then a second call is a no-op.
+        jid_b = self.db.add_job(payload={}, scheduled_at=1.0)
+        self.db.claim_next_due_job()
+        self.assertTrue(self.db.requeue_dispatched_after_aborted_post(jid_b))
+        self.assertFalse(self.db.requeue_dispatched_after_aborted_post(jid_b))
+
+    def test_requeue_after_aborted_post_wont_steal_a_running_row(self):
+        jid = self.db.add_job(payload={}, scheduled_at=1.0)
+        self.db.claim_next_due_job()
+        self.assertTrue(self.db.mark_dispatched(jid, "p-run"))
+        self.assertTrue(self.db.mark_running(jid, "p-run"))
+        self.assertFalse(
+            self.db.requeue_dispatched_after_aborted_post(jid),
+            "a running row must never be dragged back to the due queue",
+        )
+        self.assertEqual(self.db.get_job(jid)["status"], "running")
+
+
 class TestUpdateGuards(unittest.TestCase):
     def setUp(self):
         self.db, self.path = _fresh_db()
@@ -237,8 +386,283 @@ class TestUpdateGuards(unittest.TestCase):
         self.assertRaises(ValueError, self.db.update_job, jid, payload={"b": 2})
 
     def test_update_unknown_field_rejected(self):
-        jid = self.db.add_job(payload={}, scheduled_at=10.0)
+        jid = self.db.add_job(payload={"a": 1}, scheduled_at=10.0)
         self.assertRaises(ValueError, self.db.update_job, jid, garbage=1)
+
+
+# ---------------------------------------------------------------------------
+# Regression tests for the P2/P3 ordering-and-uniqueness defects.
+# ---------------------------------------------------------------------------
+
+class TestPriorityDominatesQueueOrder(unittest.TestCase):
+    """Defect A: ``claim_next_due_job`` used to sort by ``queue_order``
+    first, which made the frontend's priority field a no-op — a
+    low-priority job that happened to be earlier in the queue always
+    won, and the comment claiming "Priority must dominate
+    scheduled_at" described a precedence the SQL never implemented.
+
+    The documented contract (docs/USER_GUIDE.md: 同一时刻到期的多个
+    任务里高 priority 优先派发；同 priority 时按 queue_order 排序) is
+    now enforced by ``ORDER BY priority DESC, queue_order, ...``.
+    ``queue_order`` still breaks ties INSIDE a priority band so manual
+    reorder keeps working among equal-priority jobs.
+    """
+
+    def setUp(self):
+        self.db, self.path = _fresh_db()
+
+    def tearDown(self):
+        self.db.close()
+        try:
+            os.unlink(self.path)
+        except OSError:
+            pass
+
+    def test_high_priority_jumps_ahead_of_lower_queue_order(self):
+        # 'low' is added first, so it gets the smaller queue_order. With the
+        # old ordering that was enough to win the claim outright.
+        low = self.db.add_job(payload={}, scheduled_at=0.0, priority=100)
+        high = self.db.add_job(payload={}, scheduled_at=0.0, priority=200)
+        self.assertLess(
+            self.db.get_job(low)["queue_order"],
+            self.db.get_job(high)["queue_order"],
+            "precondition: the low-priority job really does hold the smaller "
+            "queue_order, so only priority can reorder them",
+        )
+
+        claimed = self.db.claim_next_due_job()
+        self.assertIsNotNone(claimed)
+        self.assertEqual(claimed["id"], high)
+        self.assertEqual(claimed["priority"], 200)
+
+    def test_high_priority_jumps_ahead_even_when_due_later(self):
+        # Mirrors the comment's own wording: the high-priority job is due
+        # LATER in wall-clock time, but because both are already due it must
+        # still be claimed first. ('scheduled_at' only orders within a
+        # priority band; the due filter is what excludes future jobs.)
+        early_low = self.db.add_job(payload={}, scheduled_at=1.0, priority=100)
+        later_high = self.db.add_job(payload={}, scheduled_at=2.0, priority=500)
+        claimed = self.db.claim_next_due_job()
+        self.assertIsNotNone(claimed)
+        self.assertEqual(claimed["id"], later_high)
+
+    def test_future_job_is_never_claimed_regardless_of_priority(self):
+        # Priority must NOT promote a not-yet-due job above a due one —
+        # the WHERE scheduled_at<=now filter is what keeps that true.
+        due = self.db.add_job(payload={}, scheduled_at=0.0, priority=1)
+        future = self.db.add_job(payload={}, scheduled_at=time.time() + 3600, priority=1000)
+        claimed = self.db.claim_next_due_job()
+        self.assertIsNotNone(claimed)
+        self.assertEqual(claimed["id"], due)
+        self.assertEqual(self.db.get_job(future)["status"], "scheduled")
+
+    def test_queue_order_still_breaks_ties_within_a_priority_band(self):
+        # Equal priority -> queue_order decides, preserving manual reorder.
+        a = self.db.add_job(payload={}, scheduled_at=0.0, priority=100)
+        b = self.db.add_job(payload={}, scheduled_at=0.0, priority=100)
+        c = self.db.add_job(payload={}, scheduled_at=0.0, priority=100)
+        self.db.reorder_job(c, -1)  # visual order becomes a, c, b
+        claimed = self.db.claim_next_due_job()
+        self.assertIsNotNone(claimed)
+        self.assertEqual(claimed["id"], a)
+
+    def test_update_can_raise_priority_to_take_the_queue(self):
+        # The exact user story behind the bug: the sidebar's priority editor
+        # POSTs /api/schedule/update/{id}; that write must change which job
+        # the scheduler claims next, not just the number on the row.
+        first = self.db.add_job(payload={}, scheduled_at=0.0, priority=100)
+        second = self.db.add_job(payload={}, scheduled_at=0.0, priority=100)
+        self.assertEqual(self.db.claim_next_due_job()["id"], first)
+        # Re-queue both and boost the previously-second job.
+        self.db.requeue_dispatched_job(first)
+        self.assertTrue(self.db.update_job(second, priority=700))
+        claimed = self.db.claim_next_due_job()
+        self.assertIsNotNone(claimed)
+        self.assertEqual(claimed["id"], second)
+
+
+class TestQueueOrderUniqueness(unittest.TestCase):
+    """Defect B: ``add_job`` computed the next ``queue_order`` with a
+    ``MAX()`` restricted to ``status IN ('scheduled','interrupted')``.
+    A claimed job keeps its ``queue_order`` while sitting in
+    ``'dispatched'``, so it became invisible to that MAX() and the next
+    ``add_job`` handed out the very same number. Once the dispatched job
+    was requeued, two pending rows shared one order and
+    ``reorder_job`` swapped a row with itself: it returned ``True``
+    while the visible order never moved (a silent no-op the UI
+    reported as success).
+    """
+
+    def setUp(self):
+        self.db, self.path = _fresh_db()
+
+    def tearDown(self):
+        self.db.close()
+        try:
+            os.unlink(self.path)
+        except OSError:
+            pass
+
+    def _pending_orders(self):
+        rows = self.db._conn.execute(
+            "SELECT id, queue_order FROM scheduled_jobs "
+            "WHERE status IN ('scheduled','interrupted') ORDER BY queue_order, id",
+        ).fetchall()
+        return [r[1] for r in rows]
+
+    def test_claimed_job_does_not_release_its_queue_order(self):
+        # Reproduces the collision path end-to-end: claim j1 (it stays in
+        # the table with status='dispatched' and its queue_order intact),
+        # add j2, then requeue j1. No two pending rows may share an order.
+        j1 = self.db.add_job(payload={}, scheduled_at=0.0, priority=100)
+        claimed = self.db.claim_next_due_job()
+        assert claimed is not None
+        self.assertEqual(claimed["id"], j1)
+        self.assertEqual(self.db.get_job(j1)["status"], "dispatched")
+
+        j2 = self.db.add_job(payload={}, scheduled_at=0.0, priority=100)
+        self.assertTrue(self.db.requeue_dispatched_job(j1))
+        self.assertEqual(self.db.get_job(j1)["status"], "scheduled")
+
+        orders = self._pending_orders()
+        self.assertEqual(len(orders), 2)
+        self.assertNotEqual(
+            orders[0], orders[1],
+            "two pending rows must never share a queue_order, otherwise "
+            "reorder_job swaps a row with itself and lies about success",
+        )
+
+    def test_history_rows_do_not_hand_their_queue_order_back_out(self):
+        # mark_failed/mark_done DELETE from scheduled_jobs, but interrupted /
+        # cancelled / requeued rows all linger with their order. Guard the
+        # general invariant: whatever a row's status, a newly added job
+        # always receives an order strictly greater than every existing one.
+        j1 = self.db.add_job(payload={}, scheduled_at=0.0, priority=100)
+        self.db.claim_next_due_job()
+        o1 = self.db.get_job(j1)["queue_order"]
+        self.assertTrue(self.db.update_job(j1, status="interrupted"))
+        o1_interrupted = self.db.get_job(j1)["queue_order"]
+
+        j2 = self.db.add_job(payload={}, scheduled_at=0.0, priority=100)
+        o2 = self.db.get_job(j2)["queue_order"]
+        self.assertGreater(o2, o1)
+        self.assertGreater(o2, o1_interrupted or o1)
+
+    def test_reorder_moves_when_orders_would_have_collided(self):
+        # The silent no-op itself: with the old collision, j1 (requeued) and
+        # j2 shared one order, so swap-with-neighbour became swap-with-self.
+        j1 = self.db.add_job(payload={"n": 1}, scheduled_at=0.0, priority=100)
+        self.db.claim_next_due_job()
+        j2 = self.db.add_job(payload={"n": 2}, scheduled_at=0.0, priority=100)
+        self.db.requeue_dispatched_job(j1)
+
+        before = [r["id"] for r in self.db.list_jobs()]
+        self.assertTrue(self.db.reorder_job(j2, -1))
+        after = [r["id"] for r in self.db.list_jobs()]
+        self.assertNotEqual(before, after, "reorder must actually move rows")
+        self.assertEqual(after, [j2, j1])
+
+    def test_bulk_adds_stay_distinct_across_claim_cycles(self):
+        # Interleave adds with claims so a dispatched row is always present
+        # while the next order is being picked.
+        ids = []
+        for i in range(6):
+            ids.append(self.db.add_job(payload={"i": i}, scheduled_at=0.0, priority=100))
+            if i % 2 == 0:
+                self.db.claim_next_due_job()
+        orders = [
+            r[0] for r in self.db._conn.execute(
+                "SELECT queue_order FROM scheduled_jobs "
+                "WHERE queue_order IS NOT NULL ORDER BY queue_order",
+            ).fetchall()
+        ]
+        self.assertEqual(len(orders), len(set(orders)), "no duplicate orders")
+
+
+class TestQueueOrderBackfillScope(unittest.TestCase):
+    """Defect C: the legacy ``UPDATE ... SET queue_order=rowid*1000 WHERE
+    queue_order IS NULL`` backfill sat OUTSIDE the ``if "queue_order" not in
+    cols`` guard, so it executed on every single ``__init__``. A migration
+    step belongs exactly once per database — when the column is born and
+    every legacy row is still NULL — not on every restart.
+    """
+
+    def setUp(self):
+        self.db, self.path = _fresh_db()
+
+    def tearDown(self):
+        self.db.close()
+        try:
+            os.unlink(self.path)
+        except OSError:
+            pass
+
+    def test_backfill_runs_once_when_column_is_added(self):
+        # Simulate a pre-queue_order DB: the table exists WITHOUT the column.
+        legacy = database.ScheduledQueueDB(db_path=self.path)
+        try:
+            legacy._conn.executescript("""
+                DROP TABLE scheduled_jobs;
+                CREATE TABLE scheduled_jobs (
+                  id TEXT PRIMARY KEY, prompt_id TEXT, payload TEXT NOT NULL,
+                  client_id TEXT, note TEXT, priority INTEGER NOT NULL DEFAULT 100,
+                  scheduled_at REAL NOT NULL, created_at REAL NOT NULL,
+                  dispatched_at REAL, finished_at REAL, status TEXT NOT NULL DEFAULT 'scheduled',
+                  error TEXT, retry_count INTEGER NOT NULL DEFAULT 0,
+                  auto_retry INTEGER NOT NULL DEFAULT 0, workflow_title TEXT
+                );
+                INSERT INTO scheduled_jobs (id,payload,scheduled_at,created_at,status)
+                  VALUES ('legacy-1','{}',10.0,10.0,'scheduled'),
+                         ('legacy-2','{}',20.0,20.0,'scheduled');
+            """)
+            legacy._conn.commit()
+            legacy.close()
+
+            # Re-open: migration adds the column and backfills it in one shot.
+            migrated = database.ScheduledQueueDB(db_path=self.path)
+            try:
+                orders = {
+                    r[0]: r[1] for r in migrated._conn.execute(
+                        "SELECT id, queue_order FROM scheduled_jobs ORDER BY id",
+                    ).fetchall()
+                }
+                self.assertIsNotNone(orders["legacy-1"])
+                self.assertIsNotNone(orders["legacy-2"])
+                self.assertNotEqual(orders["legacy-1"], orders["legacy-2"])
+
+                # And a subsequent boot must NOT touch rows again.
+                with migrated._conn:
+                    migrated._conn.execute(
+                        "UPDATE scheduled_jobs SET queue_order=NULL WHERE id='legacy-1'")
+            finally:
+                migrated.close()
+
+            reopened = database.ScheduledQueueDB(db_path=self.path)
+            try:
+                row = reopened._conn.execute(
+                    "SELECT queue_order FROM scheduled_jobs WHERE id='legacy-1'",
+                ).fetchone()
+                # Left as-is: the backfill already had its one turn, so a NULL
+                # written after the migration is not silently rewritten.
+                self.assertIsNone(row[0])
+            finally:
+                reopened.close()
+        finally:
+            try:
+                legacy.close()
+            except Exception:
+                pass
+
+    def test_migration_is_idempotent_across_reopens(self):
+        # No second ALTER, no exception, schema stable.
+        for _ in range(3):
+            db = database.ScheduledQueueDB(db_path=self.path)
+            try:
+                cols = {r[1] for r in db._conn.execute(
+                    "PRAGMA table_info(scheduled_jobs)").fetchall()}
+                self.assertIn("queue_order", cols)
+            finally:
+                db.close()
 
 
 # ---------------------------------------------------------------------------

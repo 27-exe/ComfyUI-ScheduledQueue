@@ -7,6 +7,7 @@ import json
 import logging
 import os as _os
 import secrets
+import socket
 import sys as _sys
 import threading
 import time
@@ -459,6 +460,15 @@ class SchedulerThread:
         except Exception as exc:
             log.warning('[SQ-DEBUG] raw payload inspection failed: %s', exc)
 
+        # 2026-09-24 fix (claim -> mark_dispatched rollback): once the
+        # POST has been acked and mark_dispatched has recorded the
+        # prompt_id, the prompt lives inside ComfyUI and NO failure
+        # afterwards may requeue the row -- that would double-dispatch.
+        # The flag lets the except handler tell apart "the POST never
+        # landed" (roll back + retry) from "the POST landed but a later
+        # bookkeeping step raised" (the job is dispatched; reconcile
+        # will finalise it).
+        posted = False
         try:
             prompt = _apply_pre_dispatch_hooks(json.loads(job['payload']))
 
@@ -505,6 +515,15 @@ class SchedulerThread:
             body = {
                 'prompt': prompt,
                 'client_id': job.get('client_id') or 'scheduled_queue',
+                # 2026-09-24 fix (defect C): tag every POST with a marker
+                # that /queue echoes back verbatim in each entry's
+                # ``extra_data`` (ComfyUI server.py /prompt handler stores
+                # ``json_data['extra_data']`` on the queue item as-is).
+                # This is what makes a read-timeout recovery possible:
+                # when the POST's ACK times out we can still prove *this*
+                # exact prompt reached ComfyUI's queue instead of
+                # blindly re-sending it and double-dispatching.
+                'extra_data': {'sq_dispatch_id': job['id']},
             }
             log.info(
                 '[SQ-DEBUG] POST /prompt job=%s client_id=%s prompt_node_count=%s',
@@ -540,6 +559,28 @@ class SchedulerThread:
                 if 500 <= getattr(exc, 'code', 0) < 600:
                     self._record_comfyui_5xx('tick POST')
                 raise RuntimeError(f'HTTP {exc.code}') from exc
+            except (TimeoutError, socket.timeout) as exc:
+                # 2026-09-24 fix: a read/ACK timeout is NOT proof of
+                # failure. ComfyUI processes the prompt *before* it
+                # builds the response, so the prompt is very likely
+                # already queued even though we never got the ack.
+                # Blindly re-POSTing would run the job twice (routes.py's
+                # ``_comfyui_post_json`` already treats 'timeout' as an
+                # assumed success for the same reason). Probe /queue
+                # once: if this job's prompt is in there, treat the
+                # dispatch as successful and record the prompt_id;
+                # otherwise it was a genuine network failure and the
+                # normal retry ladder applies.
+                prompt_id = self._find_prompt_id_in_queue(job['id'])
+                if prompt_id:
+                    log.warning(
+                        'POST /prompt timed out for %s but the prompt was '
+                        'found in ComfyUI /queue as %s — treating as '
+                        'dispatched (no duplicate POST)', job['id'], prompt_id,
+                    )
+                    result = {'prompt_id': prompt_id}
+                else:
+                    raise RuntimeError(f'POST timed out: {exc}') from exc
             prompt_id = result.get('prompt_id')
             log.info('[SQ-DEBUG] POST /prompt response prompt_id=%s full=%s', prompt_id, result)
             if not prompt_id:
@@ -550,13 +591,113 @@ class SchedulerThread:
             # which observes ComfyUI's /queue to decide when execution
             # actually starts. See reconcile() below.
             self.db.mark_dispatched(job['id'], prompt_id)
+            posted = True
             self.db.set_state('last_dispatch_at', str(time.time()))
             log.info('dispatched %s as %s', job['id'], prompt_id)
             return True
         except Exception as exc:
             log.exception('[SQ-DEBUG] dispatch failed: %s', exc)
-            self._dispatch_failure(job['id'], str(exc))
-            return False
+            # 2026-09-24 fix (claim -> mark_dispatched rollback): the row is
+            # sitting in 'dispatched' with prompt_id=NULL right now because
+            # claim_next_due_job flipped it before the POST. If we do not
+            # undo that, no recovery path can ever reap it — reconcile skips
+            # NULL prompt_id, claim only accepts 'scheduled', cancel_job only
+            # accepts scheduled/interrupted, reset_for_reschedule only
+            # accepts 'interrupted'. The job would be stuck until a ComfyUI
+            # restart ran recover_orphans. Roll it back to 'scheduled' first
+            # so the row is reclaimable, then let the normal retry ladder
+            # (or _dispatch_failure's 4xx fast-fail) decide what happens.
+            if not posted:
+                self._rollback_claim(job['id'])
+                self._dispatch_failure(job['id'], str(exc))
+                return False
+            # The POST already reached ComfyUI (mark_dispatched recorded
+            # the prompt_id) and only a later step raised. Leaving the row
+            # 'dispatched' is the truthful state; requeueing it would run
+            # the job a second time.
+            log.warning(
+                'dispatch of %s succeeded but bookkeeping failed (%s); '
+                'leaving the row dispatched for reconcile', job['id'], exc,
+            )
+            return True
+
+    def _rollback_claim(self, job_id):
+        """Undo claim_next_due_job's 'dispatched' flip after a failed POST.
+
+        2026-09-24 fix. Only rolls the row back when the DB still has it in
+        ``'dispatched'``: if a concurrent pause-all / run-now / requeue
+        already advanced it, their newer state wins and we leave it alone.
+        Best-effort by design — the caller has already lost the POST, so a
+        rollback failure is logged rather than raised.
+        """
+        try:
+            rolled = self.db.requeue_dispatched_after_aborted_post(job_id)
+        except Exception:
+            log.exception(
+                '[SQ-DEBUG] claim rollback failed for %s; the row stays '
+                "'dispatched' with no prompt_id until a restart recovers it",
+                job_id,
+            )
+            return
+        if rolled:
+            log.warning(
+                'rolled %s back to scheduled after an aborted dispatch', job_id,
+            )
+
+    def _find_prompt_id_in_queue(self, job_id):
+        """Return the prompt_id ComfyUI assigned to *job_id*, or ``None``.
+
+        2026-09-24 fix (POST ack timeout). When ``POST /prompt`` times out we
+        cannot tell from the transport alone whether ComfyUI accepted the
+        prompt: it processes the work *before* serialising the response, so a
+        read timeout usually means "done, but the reply was slow". ``/queue``
+        is the authoritative answer — if the prompt is in ``queue_running``
+        or ``queue_pending`` it was accepted.
+
+        Matching is by the ``sq_dispatch_id`` marker that tick() puts in
+        every POST's ``extra_data``, because the prompt_id we would
+        otherwise compare against is exactly the value we never received.
+        ComfyUI echoes that marker back at ``entry[3]`` of each /queue
+        item, so the job is identified positively rather than by guessing
+        at a payload shape. Only a unique hit is accepted: an ambiguous
+        match returns ``None`` so the caller falls back to the retry
+        ladder instead of silently attaching the job to another prompt.
+
+        Never raises: any failure returns ``None`` so the caller falls back
+        to the normal retry ladder.
+        """
+        try:
+            data = self._queue()
+        except Exception:
+            return None
+        if not isinstance(data, dict):
+            return None
+        hits = set()
+        for slot in ('queue_running', 'queue_pending'):
+            for entry in data.get(slot) or []:
+                if not isinstance(entry, (list, tuple)) or len(entry) < 5:
+                    continue
+                prompt_id = entry[1]
+                # entry[3] is ``extra_data`` -- ComfyUI's /prompt handler
+                # stores json_data['extra_data'] on the queue item verbatim
+                # (server.py: `self.prompt_queue.put((number, prompt_id,
+                # prompt, extra_data, outputs_to_execute, sensitive))`), and
+                # /queue serialises it back to us after only stripping the
+                # 6th (sensitive) element. So the marker we attached to the
+                # POST in tick() is directly observable here.
+                extra = entry[3]
+                if not isinstance(prompt_id, str):
+                    continue
+                if isinstance(extra, dict) and extra.get('sq_dispatch_id') == job_id:
+                    hits.add(prompt_id)
+        if len(hits) == 1:
+            return next(iter(hits))
+        if len(hits) > 1:
+            log.warning(
+                'ambiguous /queue match for %s (%d candidates); treating the '
+                'POST as failed rather than guessing', job_id, len(hits),
+            )
+        return None
 
     def _dispatch_failure(self, job_id, error):
         # 4xx is the client payload's fault: retrying the same payload three

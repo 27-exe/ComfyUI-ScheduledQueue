@@ -585,6 +585,20 @@ class ScheduledQueueDB:
 
         ``prompt_id`` is the value ComfyUI returned; we trust it (ComfyUI
         is the source of truth for prompt identity).
+
+        Status guard (2026-09-24 fix): the UPDATE is restricted to rows
+        still in a dispatchable state (``'scheduled'`` or ``'dispatched'``).
+        Without it, a POST response that lands *after* a concurrent
+        pause-all (``reclaim_dispatched`` snapshot), run-now, or
+        pause-running-all already advanced the row would clobber it back
+        to ``'dispatched'`` — wiping ``started_at`` and desynchronising
+        the scheduler's state machine from ComfyUI's real execution
+        state. A ``running`` row must never be rewritten as
+        ``'dispatched'``: ComfyUI is already executing that prompt, so
+        the row is strictly further along than this POST-completion event.
+
+        Returns ``False`` when the guard rejects the write, so the caller
+        can detect the race rather than silently corrupting the row.
         """
         with self._IO_LOCK:
             now = time.time()
@@ -592,8 +606,55 @@ class ScheduledQueueDB:
                 cur = self._conn.execute(
                     "UPDATE scheduled_jobs "
                     "SET status='dispatched', prompt_id=?, dispatched_at=? "
-                    "WHERE id=?",
+                    "WHERE id=? AND status IN ('scheduled','dispatched')",
                     (prompt_id, now, job_id),
+                )
+            return cur.rowcount > 0
+
+    def requeue_dispatched_after_aborted_post(self, job_id):
+        """Roll a row back to ``'scheduled'`` after an aborted POST.
+
+        2026-09-24 fix for the claim -> mark_dispatched gap.
+        ``claim_next_due_job`` flips the row to ``'dispatched'`` and
+        stamps ``dispatched_at`` *before* the POST is attempted, so any
+        exception raised between claim and ``mark_dispatched`` (urlopen
+        timeout, a pre-dispatch hook blowing up, an unserialisable
+        payload) leaves a ``status='dispatched'`` row with
+        ``prompt_id=NULL``. None of the recovery paths could ever reap
+        that row: ``reconcile`` skips rows with no ``prompt_id``,
+        ``claim_next_due_job`` only accepts ``'scheduled'``,
+        ``cancel_job`` only accepts scheduled/interrupted, and
+        ``reset_for_reschedule`` only accepts ``'interrupted'``. The row
+        was stuck until a ComfyUI restart ran ``recover_orphans``.
+
+        The guard is deliberately narrow -- ``status='dispatched' AND
+        prompt_id IS NULL`` -- for two independent reasons:
+
+          * ``status='dispatched'``: if a concurrent pause-all / run-now
+            has already moved the row on, our POST outcome is stale news
+            and must not overwrite the newer state.
+          * ``prompt_id IS NULL``: a row that already carries a prompt_id
+            has completed ``mark_dispatched``, so ComfyUI already holds
+            the prompt and re-queueing it would double-dispatch. The only
+            exception we may roll back is raised between claim and
+            mark_dispatched, which by construction still has prompt_id
+            NULL. Failures landing *after* mark_dispatched must leave the
+            dispatched row alone for reconcile to handle.
+
+        ``dispatched_at`` / ``started_at`` are cleared alongside the
+        status so the row re-enters the due queue exactly as a fresh job.
+
+        Returns ``True`` when this call actually performed the rollback.
+        """
+        with self._IO_LOCK:
+            with self._conn:
+                cur = self._conn.execute(
+                    "UPDATE scheduled_jobs "
+                    "SET status='scheduled', prompt_id=NULL, dispatched_at=NULL, "
+                    "started_at=NULL, error=? "
+                    "WHERE id=? AND status='dispatched' AND prompt_id IS NULL",
+                    ("dispatch aborted before prompt_id was recorded",
+                     job_id),
                 )
             return cur.rowcount > 0
 
