@@ -45,6 +45,54 @@ convert_ui_to_api = _wf_mod.convert_ui_to_api
 is_api_format = _wf_mod.is_api_format
 del _il_util, _os, _sys, _wf_spec, _wf_mod
 
+# ---------------------------------------------------------------------------
+# Scheduled pause / resume
+# ---------------------------------------------------------------------------
+#
+# ``routes._pause_all_blocking`` is the single implementation of "pause" --
+# it sets the paused flag, snapshots the dispatched rows, pulls those
+# prompts out of ComfyUI's queue, and reclaims them. The scheduled pause
+# MUST call that same function rather than reimplement the sequence, so a
+# bug fixed in one place is fixed in both.
+#
+# routes.py imports aiohttp lazily (every ``from aiohttp import web`` sits
+# inside a function), so importing it here for the helper is safe. The
+# import is deferred to call time anyway, to keep ``scheduler.py``
+# importable in contexts where only the trigger logic is wanted.
+
+
+def _parse_wallclock(value):
+    """Parse a ``YYYY-MM-DDTHH:MM`` string into a POSIX timestamp.
+
+    Accepts the exact shape ``<input type="datetime-local">`` produces,
+    plus a few tolerant variants (an optional ``:SS`` seconds field, a
+    space instead of ``T``). Returns ``None`` when the value is missing,
+    empty, or unparseable -- callers treat that as "no schedule armed"
+    rather than raising, so one malformed value can never crash the
+    scheduler loop.
+
+    Local time is used throughout: the value comes from a date picker in
+    the user's browser, which renders and returns browser-local time.
+    """
+    if not value:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    text = text.replace(' ', 'T')
+    if len(text) == 16:            # YYYY-MM-DDTHH:MM
+        fmt = '%Y-%m-%dT%H:%M'
+    elif len(text) == 19:          # YYYY-MM-DDTHH:MM:SS
+        fmt = '%Y-%m-%dT%H:%M:%S'
+    else:
+        return None
+    try:
+        import datetime as _dt
+        naive = _dt.datetime.strptime(text, fmt)
+        return naive.timestamp()
+    except (ValueError, OverflowError, OSError):
+        return None
+
 # Same loader caveat as above applies to preflight.py: a relative import
 # fails under ComfyUI's loader and any surrounding try/except silently
 # skips validation (the 2026-09-21 incident — the validator never ran).
@@ -316,6 +364,11 @@ class SchedulerThread:
             except Exception:
                 log.exception('scheduler tick failed')
 
+            # Scheduled pause / resume live on the same loop, so they need
+            # no timer of their own and stay in sync with the paused flag
+            # the tick just observed.
+            self._check_scheduled_pause_resume()
+
             now = time.monotonic()
             # Lazy reconcile: only sweep /history if there are jobs that
             # might have transitioned to a terminal state in ComfyUI.
@@ -420,6 +473,56 @@ class SchedulerThread:
             min(self.BACKOFF_BASE * (2 ** min(self._consecutive_5xx, 20)),
                 self.BACKOFF_MAX),
         )
+
+    def _check_scheduled_pause_resume(self):
+        """Fire any armed scheduled pause / resume whose time has come.
+
+        Called from the scheduler loop once per iteration, so granularity
+        is whatever the loop interval already is (1-5s) -- comfortably
+        inside the minute-level precision the UI offers.
+
+        Both rules are one-shot: a rule that fires is cleared immediately,
+        so it never replays and a scheduler restart cannot re-trigger it.
+
+        The pause branch delegates to ``routes._pause_all_blocking`` so the
+        scheduled action is bit-for-bit the manual action (flag flip, queue
+        delete, reclaim, prompt_id cleanup, race guards). The resume branch
+        mirrors ``resume_all_handler`` (clear the flag, reset interrupted).
+
+        Everything here is defensive: a DB error, a missing routes module,
+        or a malformed timestamp must never kill the loop.
+        """
+        try:
+            pause_at = _parse_wallclock(self.db.get_pause_at())
+            resume_at = _parse_wallclock(self.db.get_resume_at())
+            now = time.time()
+
+            if pause_at is not None and now >= pause_at:
+                # Clear first: if the pause below raises, we do not want
+                # the next tick to hammer a rule we already attempted.
+                self.db.clear_pause_at()
+                try:
+                    from comfyui_scheduled_queue import routes as _routes
+                    _routes._pause_all_blocking(self.db, self.comfyui_url)
+                    log.info(
+                        'scheduled pause fired at %s', time.strftime('%F %T'),
+                    )
+                except Exception:
+                    log.exception('scheduled pause failed')
+
+            if resume_at is not None and now >= resume_at:
+                self.db.clear_resume_at()
+                try:
+                    self.db.set_state('paused', '0')
+                    resumed = self.db.reset_all_interrupted()
+                    log.info(
+                        'scheduled resume fired at %s (reset %d row(s))',
+                        time.strftime('%F %T'), resumed,
+                    )
+                except Exception:
+                    log.exception('scheduled resume failed')
+        except Exception:
+            log.exception('scheduled pause/resume check failed')
 
     def tick(self):
         """Dispatch at most one due job. Returns ``True`` if a job was

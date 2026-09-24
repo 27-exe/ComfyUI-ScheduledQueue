@@ -521,6 +521,39 @@ class ScheduledQueueDB:
         with self._IO_LOCK:
             with self._conn:self._conn.execute("INSERT INTO scheduler_state(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(key,str(value)))
 
+    # --- Scheduled pause / resume -----------------------------------------
+    #
+    # A scheduled pause is stored as a pair of wall-clock strings in
+    # scheduler_state, using the exact format ``datetime-local`` produces
+    # (``YYYY-MM-DDTHH:MM``). Both are one-shot: the scheduler fires the
+    # action and clears the key, so a missed trigger never replays.
+    #
+    # Storing them in scheduler_state (rather than a new table) means a
+    # database created by an older version keeps working unchanged, and
+    # the read/write path is the already-tested get_state/set_state pair.
+
+    def get_pause_at(self):
+        """Return the scheduled pause timestamp string, or ``None``."""
+        return self.get_state('pause_at')
+
+    def get_resume_at(self):
+        """Return the scheduled resume timestamp string, or ``None``."""
+        return self.get_state('resume_at')
+
+    def set_pause_at(self,value):
+        """Persist the scheduled pause timestamp (``YYYY-MM-DDTHH:MM``)."""
+        self.set_state('pause_at',value)
+
+    def set_resume_at(self,value):
+        """Persist the scheduled resume timestamp (``YYYY-MM-DDTHH:MM``)."""
+        self.set_state('resume_at',value)
+
+    def clear_pause_at(self):
+        self.set_state('pause_at','')
+
+    def clear_resume_at(self):
+        self.set_state('resume_at','')
+
     def recover_orphans(self):
         with self._IO_LOCK:
             with self._conn:
