@@ -1,6 +1,6 @@
 # ComfyUI-ScheduledQueue
 
-**Status:** under development (v0.3.10). CLI and HTTP API are production-ready; the bundled sidebar UI is stable against ComfyUI ≥ 1.49.6.
+**Status:** under development (v0.3.15). CLI and HTTP API are production-ready; the bundled sidebar UI is stable against ComfyUI ≥ 1.49.6.
 
 [English](README.md) · [简体中文](README.zh.md)
 
@@ -165,9 +165,25 @@ comfy-schedule run-now <job_id>
 python -m unittest discover tests -v
 ```
 
-当前 **133 / 133 通过**（不需要 `aiohttp`，也不需要运行中的 ComfyUI）。
+当前 **264 / 264 通过**，覆盖 Python 3.10–3.14（不需要 `aiohttp`，也不需要运行中的 ComfyUI）。两种 runner 均验证过：
 
-> 注：本仓库当前在 Python 3.14 下会跑 207 个测试，其中 `test_routes.TestRoutes` / `TestWorkflowTitleRoutes` 下有 33 个 error 是预先存在的 `asyncio.get_event_loop()` 弃用导致的失败，与本次 README 拆分无关。
+```bash
+python -m unittest discover tests        # Ran 264 tests ... OK
+python -m pytest -q                      # 264 passed, 3 subtests passed
+```
+
+JS 测试用 node 单独跑，不计入上面的 264：
+
+```bash
+node tests/test_dialog_prefs.js          # 36 条断言
+node tests/test_sidebar_thumb_sanity.js  # 9 条断言
+node tests/test_sidebar_actions.js       # 2 条源码检查，无输出
+```
+
+> 版本号写在**三处**，三处必须同步修改：`pyproject.toml` 的 `version`、
+> `src/comfyui_scheduled_queue/web/sidebar_tab.js` 里的 `SQ_VERSION`、以及
+> 本文件的 `Status:` 行（英文 README 同步）。`CHANGELOG.md` 记录每个版本
+> 改了什么，是唯一的发布历史。
 
 ---
 

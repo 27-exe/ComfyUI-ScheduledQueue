@@ -66,6 +66,31 @@ _CONTROL_AFTER_GENERATE_SENTINELS = frozenset({
 })
 
 
+# How to read a node's INPUT_TYPES() schema. These two sets are what tell a
+# *widget* input apart from a *socket* input, which is the whole difference
+# between "this slot holds a value" and "this slot is wired to another node".
+#
+# Socket types are open-ended -- custom nodes register their own -- so these
+# lists are a heuristic, not a registry: a type not in either set falls through
+# to the isinstance(list/tuple) combo check in _widget_names_from_schema. The
+# point is that sockets must be recognised *explicitly*, never inferred from
+# capitalisation.
+_SOCKET_TYPES = frozenset({
+    "MODEL", "CLIP", "VAE", "CONDITIONING", "LATENT", "IMAGE", "MASK",
+    "CONTROL_NET", "CLIP_VISION", "CLIP_VISION_OUTPUT", "STYLE_MODEL",
+    "GLIGEN", "UPSCALE_MODEL", "SAMPLER", "SIGMAS", "NOISE", "GUIDER",
+    "PHOTOMAKER", "INSTANTID", "AUDIO", "VIDEO", "WEBCAM", "BBOX",
+    "SEGS", "BASIC_PIPE", "FACE_ANALYSIS", "TIMESTEPS",
+})
+
+_WIDGET_TYPES = frozenset({
+    "INT", "FLOAT", "STRING", "BOOLEAN",
+})
+
+# Type names some nodes use for a dropdown in place of an inline option list.
+_COMBO_TYPES = frozenset({"COMBO"})
+
+
 # ---------------------------------------------------------------------------
 # Public entry points
 # ---------------------------------------------------------------------------
@@ -344,10 +369,29 @@ def _widget_names_from_schema(class_type: Any) -> list[str] | None:
             if not isinstance(spec, (list, tuple)) or not spec:
                 continue
             head = spec[0]
-            # Widgets have a primitive type as their first spec element.
-            # Sockets like ("MODEL",), ("CLIP",), ("LATENT",), ("IMAGE",)
-            # are connections, not widgets. STRING/INT/FLOAT/BOOLEAN/COMBO
-            # etc. are widgets.
-            if isinstance(head, str) and head.isupper():
+            # A widget is declared with a *value* type: INT / FLOAT / STRING /
+            # BOOLEAN, or a list for a combo. A socket is declared with a
+            # connection type: MODEL / CLIP / VAE / LATENT / IMAGE / ... and
+            # never carries a widget value.
+            #
+            # Do NOT try to tell them apart with `head.isupper()` -- every
+            # socket type is uppercase too, so that test admits *all*
+            # sockets and rejects nothing. Getting this wrong poisons the
+            # positional fallback below: sockets land in the widget list,
+            # widgets_values then zip one slot off, and seed / steps / cfg
+            # are silently mapped onto model / positive / negative.
+            if not isinstance(head, (str, list, tuple)):
+                continue
+            if isinstance(head, (list, tuple)):
+                # Combo: the schema's first element IS the option list.
                 widget_names.append(name)
+                continue
+            if head in _WIDGET_TYPES or head in _COMBO_TYPES:
+                widget_names.append(name)
+                continue
+            # Anything else is an unrecognised *connection* type (a custom
+            # socket we have no reason to believe carries a value). Sockets
+            # outnumber widget types in practice, and misreading one as a
+            # widget is what corrupts the positional fallback -- so the
+            # default is to treat unknown types as sockets, not widgets.
     return widget_names or None

@@ -1,6 +1,6 @@
 # ComfyUI-ScheduledQueue
 
-**Status:** under development (v0.3.10). CLI and HTTP API are production-ready; the bundled sidebar UI is stable against ComfyUI ≥ 1.49.6.
+**Status:** under development (v0.3.15). CLI and HTTP API are production-ready; the bundled sidebar UI is stable against ComfyUI ≥ 1.49.6.
 
 [简体中文](README.zh.md)
 
@@ -166,9 +166,27 @@ Backend requires **Python ≥ 3.10**. There are **no third-party Python dependen
 python -m unittest discover tests -v
 ```
 
-Currently **133 / 133 pass** (no `aiohttp` / no running ComfyUI required).
+Currently **264 / 264 pass** on Python 3.10–3.14 (no `aiohttp` / no running
+ComfyUI required). Verified with both runners:
 
-> Note: this repo currently runs 207 tests on Python 3.14. The 33 errors under `test_routes.TestRoutes` / `TestWorkflowTitleRoutes` are pre-existing `asyncio.get_event_loop()` deprecation failures, not regressions from this README split.
+```bash
+python -m unittest discover tests        # Ran 264 tests ... OK
+python -m pytest -q                      # 264 passed, 3 subtests passed
+```
+
+JS suites run standalone with node (not part of the 264):
+
+```bash
+node tests/test_dialog_prefs.js          # 36 assertions
+node tests/test_sidebar_thumb_sanity.js  # 9 assertions
+node tests/test_sidebar_actions.js       # 2 source-grep checks, no output
+```
+
+> The version string is declared in **three** places and all three must move
+> together: `pyproject.toml` (`version`), `SQ_VERSION` in
+> `src/comfyui_scheduled_queue/web/sidebar_tab.js`, and the `Status:` line in
+> this file (mirrored in `README.zh.md`). `CHANGELOG.md` records what each
+> release changed; the number above it is the only release history.
 
 ---
 

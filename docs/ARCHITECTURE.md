@@ -70,7 +70,7 @@ For installation see [INSTALL.md](INSTALL.md); for usage see
                        ├─ tick() every 1.0 s (default; shortened to IDLE_DISPATCH
                        │       right after a dispatch so reconcile catches it fast)
                        │   ├─ read paused state from scheduler_state
-                       │   ├─ claim_next_due_job()  (UPDATE … RETURNING)
+                       │   ├─ claim_next_due_job()  (SELECT + guarded UPDATE, one txn)
                        │   ├─ apply pre-dispatch hooks
                        │   │     - UI→API format conversion (workflow_format.py)
                        │   │     - control_after_generate → seed randomization
@@ -186,7 +186,7 @@ migration.
 | Status transition | Writer | Code |
 |---|---|---|
 | (none) → `scheduled` | `/api/schedule/add`, `/add-batch` | `database.add_job` |
-| `scheduled` → `dispatched` | scheduler daemon, atomic `UPDATE … RETURNING` | `claim_next_due_job` |
+| `scheduled` → `dispatched` | scheduler daemon, `SELECT` + guarded `UPDATE` inside one `with self._conn` transaction (see §5.1) | `claim_next_due_job` |
 | `dispatched` → `running` | scheduler after `/prompt` returns 200 | `mark_running` |
 | `*` → `done` / `failed` | reconcile loop after `/history` returns a definitive status | `_finish` |
 | `scheduled` → `cancelled` | `/api/schedule/cancel/{id}` | `cancel_job` |
@@ -263,23 +263,31 @@ noted; responses use `_json_response()` which sets
 | `GET /job/{id}/export` | `export_handler` | raw JSON download of one job |
 | `POST /update/{id}` | `update_handler` | patch whitelisted fields on a `scheduled` job |
 | `POST /reorder/{id}` | `reorder_handler` | bump `queue_order` up / down |
-| `POST /cancel/{id}` | `cancel_handler` | mark a `scheduled` row `cancelled` (running rows 409) |
+| `POST /cancel/{id}` | `cancel_handler` | soft-delete a `scheduled` / `interrupted` row; unknown id → 404, any other status → 409 |
 | `POST /run-now/{id}` | `run_now_handler` | move a `scheduled` row to due-now |
 | `POST /repeat/{id}` | `repeat_handler` | clone a `done` / `cancelled` job back into `scheduled` |
 | `POST /clear` | `clear_handler` | delete jobs by status (whitelisted) |
 | `GET /status` | `status_handler` | paused flag + per-status counts + version |
 | `POST /pause-all` | `pause_all_handler` | set scheduler_state.paused = "1" |
 | `POST /resume-all` | `resume_all_handler` | set scheduler_state.paused = "0" |
-| `POST /orphans/recover` | `orphan_status_handler` | startup orphan sweep, idempotent |
+| `GET /orphan-status` | `orphan_status_handler` | interrupted-job inventory (read-only; the sweep itself is `recover_orphans()`, run at startup) |
 
 Code reference: `src/comfyui_scheduled_queue/routes.py`.
 
 ### 7.1 Whitelist enforcement
 
-- `/add` validates every item through `_validate_add_item` (422 on bad type).
+- `/add` and `/add-batch` validate every item through `_validate_add_item`
+  (HTTP 400 on a bad type; a bad item inside a batch is skipped, its siblings
+  still land). The numeric range guards — finite and in-range `scheduled_at`,
+  bounded `priority` / `auto_retry` / `note` — are shared by `/add`,
+  `/add-batch` and `/update` so the three entry points cannot drift apart.
 - `/update` rejects any field outside `{scheduled_at, priority, note, auto_retry, workflow_title}`.
 - `/list` strips `payload` from rows before sending, so workflow JSON never echoes back over the wire.
-- `/cancel` returns 409 when the row is `running` or `done` (truthful 4xx contract).
+- Known gap: `clear_handler` and `list_handler` do not share one status
+  tokeniser. `/clear` rejects an unknown status with 400; `/list` silently
+  drops unknown tokens, which degrades to *no filter* and returns every row.
+  Treat `/list?status=` values as coming from the UI's fixed tab set only.
+- `/cancel` returns 409 when the row exists but is not cancellable (anything other than `scheduled` / `interrupted`), and 404 only when the id is genuinely unknown (truthful 4xx contract).
 
 ---
 
