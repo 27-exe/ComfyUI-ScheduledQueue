@@ -1662,8 +1662,39 @@ def _parse_wallclock_value(text):
     API store a rule the loop silently ignores.
     """
     try:
+        # Preferred: the real package import (unit tests, CLI, anything that
+        # has src/ on sys.path). ComfyUI itself loads custom_nodes flat, so
+        # this raises ModuleNotFoundError there and we fall back below.
         from comfyui_scheduled_queue.scheduler import _parse_wallclock
         return _parse_wallclock(text)
+    except ImportError:
+        pass
+    except Exception:
+        # The function exists but blew up on a weird value; treat any
+        # failure as "unparseable" so the caller rejects the input.
+        return None
+
+    # ComfyUI's loader mounts this file as "ComfyUI-ScheduledQueue.routes"
+    # with no parent package, so the dotted import above cannot resolve.
+    # Mirror the self-load scheduler.py uses for workflow_format (and
+    # routes.py itself for preflight) against the loader's dotted name.
+    try:
+        import importlib.util as _ilu
+        import os as _osp
+        import sys as _sysp
+        _mod_name = "ComfyUI-ScheduledQueue.scheduler"
+        _mod = _sysp.modules.get(_mod_name)
+        if _mod is None:
+            _spec = _ilu.spec_from_file_location(
+                _mod_name,
+                _osp.path.join(_osp.path.dirname(__file__), "scheduler.py"),
+            )
+            if _spec is None or _spec.loader is None:
+                return None
+            _mod = _ilu.module_from_spec(_spec)
+            _sysp.modules[_mod_name] = _mod
+            _spec.loader.exec_module(_mod)
+        return _mod._parse_wallclock(text)
     except Exception:
         return None
 
