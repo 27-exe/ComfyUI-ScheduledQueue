@@ -147,5 +147,6 @@
     "sched_pause.saved": "Saved",
     "sched_pause.cleared": "Cleared",
     "sched_pause.hint": "Fires once at the set time, with the same effect as the manual buttons.",
-    "sched_pause.in_past": "must be in the future"
+    "sched_pause.in_past": "must be in the future",
+    "sched_pause.resume_before_pause": "Resume time must be after the pause time"
 }

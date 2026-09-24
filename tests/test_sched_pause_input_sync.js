@@ -134,7 +134,8 @@ check(
 check(
     "an unsaved edit renders a preview instead of the server line",
     /function _renderSchedPausePreview/.test(source) &&
-    /hasPending/.test(source),
+    /_schedPauseEdited\(\)/.test(source) &&
+    !/hasPending/.test(source),   // the old non-empty predicate mislabelled saved rules
 );
 check(
     "the preview is recomputed on every input event",

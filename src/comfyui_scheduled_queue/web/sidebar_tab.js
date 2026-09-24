@@ -341,6 +341,12 @@ function buildPanel() {
     const resumeAtInput = root.querySelector('[data-role="resume-at"]');
     const schedPauseStateEl = root.querySelector('[data-role="sched-pause-state"]');
     const schedPauseMsgEl = root.querySelector('[data-role="sched-pause-msg"]');
+    // Last values the server reported. "Input non-empty" cannot distinguish a
+    // saved rule from an edit in progress -- after a successful save the inputs
+    // legitimately hold the saved value. Only a MISMATCH against this snapshot
+    // means "unsaved edit", which is what the preview branch keys off.
+    let SERVER_PAUSE_AT = "";
+    let SERVER_RESUME_AT = "";
 
     let _refreshTimer = null;
     let _inFlight = null; // promise of current refresh
@@ -692,12 +698,16 @@ function buildPanel() {
     async function loadSchedPause() {
         try {
             const data = await callApi("/pause-schedule");
+            // Remember the server snapshot -- the only reference the
+            // saved-vs-unsaved decision can be made against.
+            SERVER_PAUSE_AT = data.pause_at || "";
+            SERVER_RESUME_AT = data.resume_at || "";
             // Only write back when the value actually changed. The 5s
             // poll re-reads these inputs; overwriting them unconditionally
             // would clobber a half-typed date while the user is still in
             // the picker.
-            const nextPause = data.pause_at || "";
-            const nextResume = data.resume_at || "";
+            const nextPause = SERVER_PAUSE_AT;
+            const nextResume = SERVER_RESUME_AT;
             _syncSchedPauseInput(pauseAtInput, nextPause);
             _syncSchedPauseInput(resumeAtInput, nextResume);
             _renderSchedPauseState(data);
@@ -757,6 +767,26 @@ function buildPanel() {
     // until they press Save there is no visible confirmation of what will
     // be stored. Recomputed on every input event so the text tracks the
     // picker live, and prefixed to distinguish it from a saved rule.
+    // Mirror the armed-state line for UNSAVED edits -- and ONLY genuine ones.
+    //
+    // "Input is non-empty" is NOT a usable signal: after a successful save
+    // the inputs hold the very value the server returned, so they are
+    // non-empty forever and a naive non-empty check re-labels the saved rule
+    // as "Unsaved" on the next 5s poll. The only signal that means anything
+    // is a MISMATCH between what the inputs hold and what the server holds.
+    //
+    // Normalisation matters: the user types "2026-09-24 22:04" while the
+    // server echoes "2026-09-24T22:04". A raw string compare would call an
+    // unchanged, saved value "edited", so both sides go through _spNormalise.
+    function _schedPauseEdited() {
+        const inputs = [
+            _spNormalise(pauseAtInput ? pauseAtInput.value : ""),
+            _spNormalise(resumeAtInput ? resumeAtInput.value : ""),
+        ];
+        return inputs[0] !== _spNormalise(SERVER_PAUSE_AT)
+            || inputs[1] !== _spNormalise(SERVER_RESUME_AT);
+    }
+
     function _renderSchedPausePreview() {
         if (!schedPauseStateEl) return;
         const picked = [];
@@ -772,14 +802,10 @@ function buildPanel() {
     }
 
     function _renderSchedPauseState(data) {
-        // Unsaved edits win over the server snapshot: the 5s poll lands here
-        // too, and overwriting a live preview with "Not scheduled" would
-        // make a just-picked time look rejected. The preview is recomputed
-        // from the inputs, so it always tracks what they currently hold.
-        const hasPending =
-            (pauseAtInput && pauseAtInput.value) ||
-            (resumeAtInput && resumeAtInput.value);
-        if (hasPending) {
+        // A live mismatch wins over the server snapshot: the 5s poll lands
+        // here too, and overwriting a real edit with "Armed: ..." would
+        // make the user think their change took effect before pressing Save.
+        if (_schedPauseEdited()) {
             _renderSchedPausePreview();
             return;
         }
@@ -827,6 +853,16 @@ function buildPanel() {
                 return;
             }
         }
+        // resume_at before pause_at would pause and instantly un-pause. The
+        // server accepts it (both are individually future), so the panel has
+        // to catch it or the user gets a rule that silently does nothing.
+        const pauseTs = _spParse(pauseIn);
+        const resumeTs = _spParse(resumeIn);
+        if (pauseTs != null && resumeTs != null && resumeTs < pauseTs) {
+            _schedPauseMsg(t("sched_pause.resume_before_pause",
+                "Resume time must be after the pause time"), false);
+            return;
+        }
         const body = {
             pause_at: pauseIn ? _spNormalise(pauseIn) : "",
             resume_at: resumeIn ? _spNormalise(resumeIn) : "",
@@ -837,8 +873,13 @@ function buildPanel() {
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify(body),
             });
-            _syncSchedPauseInput(pauseAtInput, data.pause_at || "");
-            _syncSchedPauseInput(resumeAtInput, data.resume_at || "");
+            // Adopt the server snapshot as the new baseline. Without this the
+            // inputs would still mismatch the old baseline and the next poll
+            // would immediately relabel the just-saved rule as "Unsaved".
+            SERVER_PAUSE_AT = data.pause_at || "";
+            SERVER_RESUME_AT = data.resume_at || "";
+            _syncSchedPauseInput(pauseAtInput, SERVER_PAUSE_AT);
+            _syncSchedPauseInput(resumeAtInput, SERVER_RESUME_AT);
             _renderSchedPauseState(data);
             const any = data.pause_at || data.resume_at;
             _schedPauseMsg(
