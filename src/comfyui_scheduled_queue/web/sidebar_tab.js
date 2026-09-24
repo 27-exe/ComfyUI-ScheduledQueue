@@ -272,6 +272,28 @@ function buildPanel() {
             <button data-act="pause-resume" data-state="running" title="${escapeHtml(t("sidebar.pause_title"))}" style="padding:6px 8px;background:#444;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:11px;">${escapeHtml(t("sidebar.pause"))}</button>
         </div>
 
+        <div data-role="sched-pause" style="margin-bottom:10px;font-size:11px;color:#aaa;padding:8px;background:#252525;border:1px solid #383838;border-radius:4px;">
+            <div style="display:flex;align-items:center;gap:6px;margin-bottom:6px;">
+                <strong style="color:#ddd;">${escapeHtml(t("sched_pause.title", "Scheduled pause"))}</strong>
+                <span data-role="sched-pause-state" style="color:#888;"></span>
+            </div>
+            <div style="display:flex;align-items:center;gap:6px;margin-bottom:4px;">
+                <label for="sq-pause-at" style="width:52px;color:#aaa;">${escapeHtml(t("sched_pause.pause_at", "Pause at"))}</label>
+                <input id="sq-pause-at" data-role="pause-at" type="datetime-local" step="60"
+                    style="flex:1;padding:4px;background:#1b1b1b;color:#fff;border:1px solid #444;border-radius:3px;" />
+            </div>
+            <div style="display:flex;align-items:center;gap:6px;margin-bottom:6px;">
+                <label for="sq-resume-at" style="width:52px;color:#aaa;">${escapeHtml(t("sched_pause.resume_at", "Resume at"))}</label>
+                <input id="sq-resume-at" data-role="resume-at" type="datetime-local" step="60"
+                    style="flex:1;padding:4px;background:#1b1b1b;color:#fff;border:1px solid #444;border-radius:3px;" />
+            </div>
+            <div style="display:flex;gap:6px;">
+                <button data-act="save-sched-pause" style="padding:4px 10px;background:#0078d4;color:#fff;border:none;border-radius:3px;cursor:pointer;">${escapeHtml(t("sched_pause.save", "Save"))}</button>
+                <button data-act="clear-sched-pause" style="padding:4px 10px;background:#444;color:#fff;border:none;border-radius:3px;cursor:pointer;">${escapeHtml(t("sched_pause.clear", "Clear"))}</button>
+                <span data-role="sched-pause-msg" style="align-self:center;"></span>
+            </div>
+        </div>
+
         <div data-role="status" style="margin-bottom:10px;font-size:11px;color:#aaa;padding:8px;background:#252525;border-radius:4px;">${escapeHtml(t("sidebar.loading_jobs"))}</div>
 
         <div data-role="jobs" style="font-size:11px;"></div>
@@ -298,6 +320,11 @@ function buildPanel() {
     const nextBtn = root.querySelector('[data-role="next"]');
     const pageInfoEl = root.querySelector('[data-role="page-info"]');
     const langBtnEl = root.querySelector('[data-role="lang-switch"]');
+    const schedPauseEl = root.querySelector('[data-role="sched-pause"]');
+    const pauseAtInput = root.querySelector('[data-role="pause-at"]');
+    const resumeAtInput = root.querySelector('[data-role="resume-at"]');
+    const schedPauseStateEl = root.querySelector('[data-role="sched-pause-state"]');
+    const schedPauseMsgEl = root.querySelector('[data-role="sched-pause-msg"]');
 
     let _refreshTimer = null;
     let _inFlight = null; // promise of current refresh
@@ -569,6 +596,94 @@ function buildPanel() {
         pauseResumeBtn.dataset.state = status.paused ? "paused" : "running";
         pauseResumeBtn.title = status.paused ? t("sidebar.resume_title") : t("sidebar.pause_title");
         pauseResumeBtn.style.background = status.paused ? "#2d8f3e" : "#666";
+    }
+
+    // ---- Scheduled pause / resume -------------------------------------
+    //
+    // The backend stores two one-shot rules as wall-clock strings in the
+    // exact ``datetime-local`` shape (YYYY-MM-DDTHH:MM). We read them back
+    // into the inputs verbatim -- no timestamp round-trip -- so what the
+    // user sees is byte-for-byte what the scheduler will fire.
+
+    function _dtLocalValue(d) {
+        const pad = (n) => String(n).padStart(2, "0");
+        return d.getFullYear() + "-" + pad(d.getMonth() + 1) + "-" + pad(d.getDate())
+            + "T" + pad(d.getHours()) + ":" + pad(d.getMinutes());
+    }
+
+    // Default for an empty input: the next whole minute. ``datetime-local``
+    // with step=60 has no seconds field, so a value carrying seconds would
+    // be rejected by the browser; rounding to the next minute also keeps
+    // the "must be in the future" contract satisfied by default.
+    function _defaultDtLocalValue() {
+        const d = new Date(Math.floor(Date.now() / 60000) * 60000 + 60000);
+        return _dtLocalValue(d);
+    }
+
+    async function loadSchedPause() {
+        try {
+            const data = await callApi("/pause-schedule");
+            // Only write back when the value actually changed. The 5s
+            // poll re-reads these inputs; overwriting them unconditionally
+            // would clobber a half-typed date while the user is still in
+            // the picker.
+            const nextPause = data.pause_at || "";
+            const nextResume = data.resume_at || "";
+            if (pauseAtInput.value !== nextPause) pauseAtInput.value = nextPause;
+            if (resumeAtInput.value !== nextResume) resumeAtInput.value = nextResume;
+            _renderSchedPauseState(data);
+        } catch (e) {
+            console.warn("[ScheduledQueue] load pause-schedule failed", e);
+        }
+    }
+
+    function _renderSchedPauseState(data) {
+        const armed = [];
+        if (data && data.pause_at) armed.push(`${t("sched_pause.pause_at", "Pause at")} ${data.pause_at.replace("T", " ")}`);
+        if (data && data.resume_at) armed.push(`${t("sched_pause.resume_at", "Resume at")} ${data.resume_at.replace("T", " ")}`);
+        schedPauseStateEl.textContent = armed.length
+            ? `${t("sched_pause.armed", "Armed")}: ${armed.join(" · ")}`
+            : t("sched_pause.not_armed", "Not scheduled");
+    }
+
+    function _schedPauseMsg(text, ok) {
+        if (!schedPauseMsgEl) return;
+        schedPauseMsgEl.textContent = text || "";
+        schedPauseMsgEl.style.color = ok ? "#5a8" : "#f66";
+    }
+
+    async function saveSchedPause() {
+        // Send BOTH fields explicitly (using "" for an empty input) so the
+        // read-back is guaranteed to match the inputs the user sees.
+        // Omitting a key would leave the stored value untouched and the UI
+        // could then display a rule the user just tried to clear.
+        const body = {
+            pause_at: pauseAtInput.value || "",
+            resume_at: resumeAtInput.value || "",
+        };
+        try {
+            const data = await callApi("/pause-schedule", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify(body),
+            });
+            pauseAtInput.value = data.pause_at || "";
+            resumeAtInput.value = data.resume_at || "";
+            _renderSchedPauseState(data);
+            const any = data.pause_at || data.resume_at;
+            _schedPauseMsg(
+                any ? t("sched_pause.saved", "Saved") : t("sched_pause.cleared", "Cleared"),
+                true,
+            );
+        } catch (e) {
+            _schedPauseMsg(e && e.message ? e.message : String(e), false);
+        }
+    }
+
+    function clearSchedPause() {
+        pauseAtInput.value = "";
+        resumeAtInput.value = "";
+        saveSchedPause();
     }
 
     // Format a duration in seconds as a short human-readable string.
@@ -998,6 +1113,12 @@ function buildPanel() {
 
     // Top-level action buttons. Each calls the API and immediately re-renders.
     refreshBtn.addEventListener("click", () => refresh());
+    // Scheduled pause: save / clear act on both inputs at once, so there
+    // is no ambiguity about which half of the pair the user meant.
+    const saveSchedPauseBtn = root.querySelector('[data-act="save-sched-pause"]');
+    const clearSchedPauseBtn = root.querySelector('[data-act="clear-sched-pause"]');
+    if (saveSchedPauseBtn) saveSchedPauseBtn.addEventListener("click", () => saveSchedPause());
+    if (clearSchedPauseBtn) clearSchedPauseBtn.addEventListener("click", () => clearSchedPause());
     pauseResumeBtn.addEventListener("click", async () => {
         // Use data-state (set in renderStatus) rather than localized button
         // text; this is the canonical scheduler state mirror and survives
@@ -1497,7 +1618,14 @@ function buildPanel() {
     // and unmounts the returned root when the user switches tabs. We attach
     // the timer and cleanup observer INSIDE the panel so they live with it.
     refresh();
-    _refreshTimer = setInterval(() => refresh({ silent: true }), 5000);
+    loadSchedPause();
+    // The scheduler clears a rule the moment it fires, so re-reading it on
+    // the same cadence keeps the inputs and the "armed" line honest without
+    // a dedicated timer.
+    _refreshTimer = setInterval(() => {
+        refresh({ silent: true });
+        loadSchedPause();
+    }, 5000);
 
     // Expose refresh on the root so the framework render() can call it
     // immediately after mount. When the panel unmounts, the interval is

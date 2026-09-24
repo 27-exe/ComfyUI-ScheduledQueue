@@ -13,9 +13,7 @@
     "sidebar.lang.en": "EN",
     "sidebar.lang.switch_to_zh": "Switch to Chinese",
     "sidebar.lang.switch_to_en": "Switch to English",
-
     "topbar.schedule_tooltip": "Schedule current workflow (sends to ScheduledQueue, not ComfyUI native queue)",
-
     "filter.all": "All",
     "filter.scheduled": "Scheduled",
     "filter.running": "Running",
@@ -24,7 +22,6 @@
     "filter.cancelled": "Cancelled",
     "filter.interrupted": "Interrupted",
     "filter.dispatched": "Dispatched",
-
     "status.scheduled": "Scheduled",
     "status.running": "Running",
     "status.dispatched": "Dispatched",
@@ -32,7 +29,6 @@
     "status.failed": "Failed",
     "status.cancelled": "Cancelled",
     "status.interrupted": "Interrupted",
-
     "status_bar.paused": "paused",
     "status_bar.paused_yes": "yes",
     "status_bar.paused_no": "no",
@@ -43,7 +39,6 @@
     "status_bar.label.done": "done",
     "status_bar.label.fail": "fail",
     "status_bar.label.cncl": "cncl",
-
     "job.completed_at": "completed at",
     "job.failed_at": "failed at",
     "job.cancelled_at": "cancelled at",
@@ -55,14 +50,12 @@
     "job.paused": "Paused",
     "job.no_preview": "no preview",
     "job.untitled": "untitled",
-
     "job.time.now": "now",
     "job.time.in_past_seconds": "{0}s ago",
     "job.time.in_future_seconds": "in {0}s",
     "job.time.in_hms": "in {0}:{1}:{2}",
     "job.time.in_hm": "in {0}h {1}m",
     "job.time.in_h": "in {0}h",
-
     "action.up": "Up",
     "action.up_title": "Move up (higher priority)",
     "action.down": "Down",
@@ -85,25 +78,20 @@
     "action.export_title": "Export this job (download JSON)",
     "action.submit": "Submit",
     "action.schedule": "Schedule",
-
     "sidebar.pause_title": "Pause scheduler (only affects dispatched rows; running rows continue)",
     "sidebar.resume_title": "Resume scheduler (flips interrupted rows back to scheduled)",
-
     "confirm.requeue": "Pull this dispatched row back to scheduled? ComfyUI's queued copy of this prompt will be removed.",
-    "confirm.cancel_running": "Interrupt this prompt in ComfyUI and mark the row as failed? ComfyUI's worker may keep running for a few more seconds.",
+    "confirm.cancel_running": "Cancel a running job? The prompt will continue in ComfyUI; the row will be marked cancelled locally.",
     "confirm.row_pause": "Pause the scheduler globally? New jobs won't be dispatched and all currently-dispatched rows will be reclaimed back to scheduled. Running rows will keep running.",
     "confirm.row_resume": "Resume the scheduler globally? Any 'interrupted' rows will be flipped back to 'scheduled' and re-dispatched at the next tick.",
-
     "clear.toggle": "Clear...",
     "clear.execute": "Clear selected",
     "clear.empty": "No statuses selected to clear.",
     "clear.failed": "Clear failed",
     "clear.alert": "Clear failed",
-
     "pager.prev": "Prev",
     "pager.next": "Next",
     "pager.page_of": "Page {0} ({1}-{2} of {3})",
-
     "error.network": "Network error",
     "error.invalid_time": "Invalid time",
     "error.empty_workflow": "Current workflow is empty",
@@ -114,9 +102,7 @@
     "error.network_full": "Network error",
     "error.scheduled_in_past": "Scheduled time must be in the future",
     "error.serialize_workflow": "Could not serialize workflow",
-
     "time.left": "dispatch in {0}",
-
     "dialog.title": "Schedule current workflow",
     "dialog.schedule_title": "Schedule current workflow",
     "dialog.when_label": "When (local time)",
@@ -129,14 +115,12 @@
     "dialog.note_placeholder": "e.g. morning batch / variant 3",
     "dialog.submit": "Schedule",
     "dialog.cancel": "Cancel",
-
     "dialog.preset.now": "now",
     "dialog.preset.30s": "in 30s",
     "dialog.preset.5min": "in 5 min",
     "dialog.preset.30min": "in 30 min",
     "dialog.preset.2hours": "in 2 hours",
     "dialog.preset.next7": "next 7am",
-
     "dialog.delta.dec_1h": "-1h",
     "dialog.delta.dec_10m": "-10m",
     "dialog.delta.dec_1m": "-1m",
@@ -147,10 +131,17 @@
     "dialog.delta.inc_1m": "+1m",
     "dialog.delta.inc_10m": "+10m",
     "dialog.delta.inc_1h": "+1h",
-
     "confirm.cancel": "Are you sure you want to cancel this job?",
     "confirm.cancel_dispatched": "This job is queued in ComfyUI's queue. Cancel will pull it out. Continue?",
-    "confirm.cancel_running": "Cancel a running job? The prompt will continue in ComfyUI; the row will be marked cancelled locally.",
-
-    "preview.no_preview": "no preview"
+    "preview.no_preview": "no preview",
+    "sched_pause.title": "Scheduled pause",
+    "sched_pause.pause_at": "Pause at",
+    "sched_pause.resume_at": "Resume at",
+    "sched_pause.save": "Save",
+    "sched_pause.clear": "Clear",
+    "sched_pause.armed": "Armed",
+    "sched_pause.not_armed": "Not scheduled",
+    "sched_pause.saved": "Saved",
+    "sched_pause.cleared": "Cleared",
+    "sched_pause.hint": "Fires once at the set time, with the same effect as the manual buttons."
 }
