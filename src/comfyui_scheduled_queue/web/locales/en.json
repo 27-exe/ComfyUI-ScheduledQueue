@@ -141,6 +141,7 @@
     "sched_pause.clear": "Clear",
     "sched_pause.armed": "Armed",
     "sched_pause.not_armed": "Not scheduled",
+    "sched_pause.preview": "Unsaved",
     "sched_pause.saved": "Saved",
     "sched_pause.cleared": "Cleared",
     "sched_pause.hint": "Fires once at the set time, with the same effect as the manual buttons."

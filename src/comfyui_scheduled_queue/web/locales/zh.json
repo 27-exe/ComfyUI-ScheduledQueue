@@ -141,6 +141,7 @@
     "sched_pause.clear": "清除",
     "sched_pause.armed": "已设定",
     "sched_pause.not_armed": "未设定",
+    "sched_pause.preview": "未保存",
     "sched_pause.saved": "已保存",
     "sched_pause.cleared": "已清除",
     "sched_pause.hint": "到点后自动暂停/恢复，语义与手动操作一致；规则触发一次后自动失效。"

@@ -629,15 +629,64 @@ function buildPanel() {
             // the picker.
             const nextPause = data.pause_at || "";
             const nextResume = data.resume_at || "";
-            if (pauseAtInput.value !== nextPause) pauseAtInput.value = nextPause;
-            if (resumeAtInput.value !== nextResume) resumeAtInput.value = nextResume;
+            _syncSchedPauseInput(pauseAtInput, nextPause);
+            _syncSchedPauseInput(resumeAtInput, nextResume);
             _renderSchedPauseState(data);
         } catch (e) {
             console.warn("[ScheduledQueue] load pause-schedule failed", e);
         }
     }
 
+    // Write a server value back into a datetime-local input WITHOUT ever
+    // destroying work in progress. Two guards, both necessary:
+    //
+    //   1. Focus guard -- while the picker owns the element, its .value can
+    //      read back "" during the open/close transition even though the
+    //      user already chose a time. Blindly re-assigning it there wipes
+    //      the selection with no visible cause ("the time vanished").
+    //   2. Content guard -- never replace a non-empty local value with an
+    //      empty server value. An empty server value means "no rule armed";
+    //      it must not erase a time the user picked but has not saved yet.
+    //      The armed-state line always shows the SERVER truth, so the user
+    //      can tell saved from unsaved at a glance.
+    function _syncSchedPauseInput(el, nextValue) {
+        if (!el) return;
+        if (el === document.activeElement) return;
+        if (!nextValue && el.value) return;
+        if (el.value !== nextValue) el.value = nextValue;
+    }
+
+    // Mirror the armed-state line for UNSAVED edits. The server line alone
+    // cannot answer "what did I just pick?" -- the user picks a time, and
+    // until they press Save there is no visible confirmation of what will
+    // be stored. Recomputed on every input event so the text tracks the
+    // picker live, and prefixed to distinguish it from a saved rule.
+    function _renderSchedPausePreview() {
+        if (!schedPauseStateEl) return;
+        const picked = [];
+        if (pauseAtInput && pauseAtInput.value) {
+            picked.push(`${t("sched_pause.pause_at", "Pause at")} ${pauseAtInput.value.replace("T", " ")}`);
+        }
+        if (resumeAtInput && resumeAtInput.value) {
+            picked.push(`${t("sched_pause.resume_at", "Resume at")} ${resumeAtInput.value.replace("T", " ")}`);
+        }
+        if (!picked.length) return;    // nothing typed yet: keep the server line
+        schedPauseStateEl.textContent =
+            `${t("sched_pause.preview", "Unsaved")}: ${picked.join(" · ")}`;
+    }
+
     function _renderSchedPauseState(data) {
+        // Unsaved edits win over the server snapshot: the 5s poll lands here
+        // too, and overwriting a live preview with "Not scheduled" would
+        // make a just-picked time look rejected. The preview is recomputed
+        // from the inputs, so it always tracks what they currently hold.
+        const hasPending =
+            (pauseAtInput && pauseAtInput.value) ||
+            (resumeAtInput && resumeAtInput.value);
+        if (hasPending) {
+            _renderSchedPausePreview();
+            return;
+        }
         const armed = [];
         if (data && data.pause_at) armed.push(`${t("sched_pause.pause_at", "Pause at")} ${data.pause_at.replace("T", " ")}`);
         if (data && data.resume_at) armed.push(`${t("sched_pause.resume_at", "Resume at")} ${data.resume_at.replace("T", " ")}`);
@@ -667,8 +716,8 @@ function buildPanel() {
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify(body),
             });
-            pauseAtInput.value = data.pause_at || "";
-            resumeAtInput.value = data.resume_at || "";
+            _syncSchedPauseInput(pauseAtInput, data.pause_at || "");
+            _syncSchedPauseInput(resumeAtInput, data.resume_at || "");
             _renderSchedPauseState(data);
             const any = data.pause_at || data.resume_at;
             _schedPauseMsg(
@@ -1117,6 +1166,8 @@ function buildPanel() {
     // is no ambiguity about which half of the pair the user meant.
     const saveSchedPauseBtn = root.querySelector('[data-act="save-sched-pause"]');
     const clearSchedPauseBtn = root.querySelector('[data-act="clear-sched-pause"]');
+    if (pauseAtInput) pauseAtInput.addEventListener("input", _renderSchedPausePreview);
+    if (resumeAtInput) resumeAtInput.addEventListener("input", _renderSchedPausePreview);
     if (saveSchedPauseBtn) saveSchedPauseBtn.addEventListener("click", () => saveSchedPause());
     if (clearSchedPauseBtn) clearSchedPauseBtn.addEventListener("click", () => clearSchedPause());
     pauseResumeBtn.addEventListener("click", async () => {
