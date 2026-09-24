@@ -4,6 +4,85 @@ All notable changes to **ComfyUI-ScheduledQueue** are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.3.15] - 2026-09-24
+
+Patch release: two functional blockers and a documentation-correction sweep.
+The UI-format feature the README advertised could not dispatch *any* workflow,
+and the CLI's `add` rejected every file carrying a `{"prompt": ...}` envelope.
+
+### Fixed
+
+- **UI-format workflows could never dispatch.** `convert_ui_to_api` emitted
+  link targets as `int` while the payload's node keys are `str`
+  (`api[str(node_id)]`). Every link therefore failed
+  `check_link_targets_exist` (`bad_linked_input`) at add-time, and would have
+  raised `KeyError` inside ComfyUI's executor at dispatch-time. Targets are
+  now stringified, and `check_link_targets_exist` normalises both sides so the
+  same class of mismatch cannot reappear through a different entry point.
+- **CLI `add` broke the documented "add from a file" workflow.**
+  `_read_payload` kept the `{"prompt": ...}` envelope produced by ComfyUI's
+  Export (API), which the server then rejected as `not_api_format`. It now
+  unwraps to the bare node dict that `/prompt` expects.
+- **`scheduled_at: Infinity` was accepted as a permanent zombie.** It passed
+  `isinstance(float)` and both comparisons in `_check_future_scheduled_at`,
+  landed with 201, and never matched `scheduled_at <= now` again. It also made
+  the 201 body a non-standard JSON literal that `JSON.parse` rejects.
+- **A 400-digit `scheduled_at` crashed instead of being rejected.**
+  `float()` raised `OverflowError` outside every existing `try`, so `/add`
+  returned 500 and `/add-batch` lost the whole batch — two innocent siblings
+  died with the bad item, defeating the documented per-item skip contract.
+- **Unbounded `priority` and `note`.** `priority: 10**30` overflowed SQLite
+  INTEGER (500 "database error"); `priority: -9999` was accepted and disturbed
+  `ORDER BY priority DESC`; `note` had no length cap at all, so a 2 MB note was
+  echoed back on every `/list` the 5-second sidebar poll makes.
+- **`/cancel/{id}` lied about why it failed.** It returned 404 "job not found"
+  for `running`, `done` *and* `dispatched` rows, contradicting
+  docs/ARCHITECTURE.md. A dispatched row's Cancel button is rendered with
+  "Cancel will pull it out" copy, so that button could only ever error. It now
+  reads the row first: unknown id → 404, known-but-not-cancellable → 409
+  naming the status.
+- **`/api/schedule/status` silently capped every count at 200.** It counted via
+  `list_jobs(limit=200)` then `len()`. It now uses the unbounded
+  `db.count_jobs()`.
+- **`setup_routes()` could double-register all 18 routes** (verified 18 → 36),
+  and aiohttp accepts that silently. An idempotency guard now makes a second
+  call a no-op.
+
+### Changed
+
+- Version numbers were forked across four files (`pyproject.toml` 0.3.10,
+  `SQ_VERSION` 0.3.10, README 0.3.10, CHANGELOG already at 0.3.14) while the
+  comments cited 0.3.14. All live version strings now read 0.3.15; comments
+  that cite a version as *history* (e.g. "added in v0.3.11") are left alone.
+- README claimed **133/133 pass** and, in the next paragraph, "207 tests with
+  33 pre-existing `asyncio.get_event_loop()` errors". Both were wrong: the
+  suite runs 264 tests and is fully green on Python 3.10–3.14 under both
+  `unittest` and `pytest`. The JS suites (36 + 9 assertions, plus one
+  no-output source-grep file) are now listed separately rather than folded
+  into an unstated total.
+- docs/ARCHITECTURE.md described `claim_next_due_job` as an atomic
+  `UPDATE … RETURNING`. It is a `SELECT` plus a status-guarded `UPDATE` inside
+  one transaction; the doc now says so (the real mechanism is safe in the
+  single-instance case, it just is not what was written down).
+- docs/ARCHITECTURE.md listed a `POST /api/schedule/orphans/recover` route that
+  does not exist; replaced with the real `GET /api/schedule/orphan-status`.
+- docs/ARCHITECTURE.md claimed `/add` answers 422 on a bad type; it answers
+  400. The known `/list` status-tokeniser gap (unknown token silently disables
+  the filter) is now documented instead of implied-safe.
+
+### Tests
+
+- `tests/test_workflow_format.py` — three assertions pinned the old `int`
+  link-target shape (`[2, 0]`, `[5, 0]`, `[117, 0]`); they now expect the
+  string form and state why, so the contract is locked rather than re-broken.
+
+Known gaps deliberately **not** addressed in this release, all documented in
+docs/ARCHITECTURE.md where relevant: `claim_next_due_job`'s priority ordering
+contradicts its own comment (`queue_order` dominates `priority`), `queue_order`
+can collide so `reorder` reports success without moving anything,
+`mark_dispatched` has no status guard, and a failure between claim and
+dispatch leaves a row no recovery path can reach.
+
 ## [0.3.14] - 2026-09-12
 
 Patch release: reject past-time `scheduled_at` in both the CLI and the HTTP
