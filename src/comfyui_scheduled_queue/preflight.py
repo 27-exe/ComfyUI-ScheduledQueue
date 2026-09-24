@@ -182,7 +182,15 @@ def check_at_least_one_output(payload, object_info=None):
 def check_link_targets_exist(payload):
     """E4: every ``[node_id, slot_index]`` references an existing node."""
     errors = []
-    known = set(payload.keys())
+    # Normalise both sides to str before comparing. Node keys are str
+    # (`api[str(node_id)]` in workflow_format.convert_ui_to_api) and ComfyUI
+    # itself documents link targets as strings, but a hand-written or
+    # externally-produced payload may still carry an int target. Comparing
+    # raw values here would reject every such link as `bad_linked_input`
+    # even though it resolves correctly once normalised.
+    known = {
+        str(k) for k in payload.keys()
+    }
     for node_id, node in payload.items():
         if not isinstance(node, dict):
             continue
@@ -198,7 +206,7 @@ def check_link_targets_exist(payload):
                     ))
                     continue
                 target_id, slot_index = value
-                if target_id not in known:
+                if str(target_id) not in known:
                     errors.append(PreflightError(
                         type="bad_linked_input", node_id=node_id, field=field_name,
                         message=f"link target node #{target_id} not present in payload",

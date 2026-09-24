@@ -102,9 +102,17 @@ def _read_payload(arg):
     except json.JSONDecodeError as e:
         print(f"comfy-schedule: invalid JSON in {arg}: {e}", file=sys.stderr)
         sys.exit(2)
-    if "prompt" in obj and isinstance(obj["prompt"], dict):
-        return obj
-    return {"prompt": obj}
+    if isinstance(obj, dict) and "prompt" in obj and isinstance(obj["prompt"], dict):
+        # The user handed us an already-wrapped workflow -- exactly what
+        # ComfyUI's "Export (API)" button produces:
+        #     {"prompt": {"1": {...}, "2": {...}}}
+        # Unwrap it: /api/schedule/add expects the bare node dict, because
+        # that is also what gets POSTed to ComfyUI's /prompt endpoint.
+        # Keeping the envelope here made every such call fail preflight
+        # with `not_api_format`, i.e. the documented "add from a file"
+        # workflow was broken for every exported file.
+        obj = obj["prompt"]
+    return obj
 
 
 # Minimum seconds in the future a --in value must resolve to. Matches the
